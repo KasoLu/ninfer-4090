@@ -14,15 +14,16 @@ Qwen3.6-35B-A3B target are inherited but untested on the RTX 4090.
 ## Measured results on the RTX 4090
 
 Conditions: single request, greedy decoding, CUDA Graphs on, INT8 KV, `--prefill-chunk 1024`,
-`ninfer` CLI with the official 16.96 GiB Qwen3.8-27B artifact.
+official 16.96 GiB Qwen3.8-27B artifact. Decode rows use the `ninfer` CLI; prefill rows are
+measured from the `ninfer-serve` `/metrics` counters, which count computed prefill only.
 
 | Test | Result |
 |---|---|
 | Decode, code prompt, MTP3 | **106.5 tok/s** at 48.7% acceptance |
 | Decode, no speculation | 50.5 tok/s |
 | Decode at 128K depth, no speculation | 39.6 tok/s |
-| 64K needle-in-a-haystack | exact answer, 1,794 tok/s prefill |
-| 128K needle-in-a-haystack | exact answer, 1,483 tok/s prefill, 20.5 GiB peak |
+| 64K needle-in-a-haystack | exact answer, 1,849 tok/s prefill |
+| 128K needle-in-a-haystack | exact answer, 1,561 tok/s prefill |
 | Vision, chart reading | 3 of 3 oracle facts, 22 ms vision tower |
 | Ops test suite | 78 of 78 runnable tests pass on `sm_89` |
 
@@ -94,8 +95,16 @@ GCC 13, and CMake 3.28 or newer; the Docker image builds with CUDA 13.1.
 ## What this fork changes
 
 - **`sm_89` retarget.** The CMake architecture pin, the runtime compute-capability check, and the
-  NVFP4 stub gate now select `sm_89`. The SM86 kernel schedules run unmodified on Ada; they are
-  correct but not yet retuned.
+  NVFP4 stub gate now select `sm_89`. Most SM86 kernel schedules run unmodified on Ada; the
+  INT8 attention prefill schedule is retuned (below).
+- **Ada-retuned INT8 attention prefill.** The SM120 schedule spills registers on Ada and pays the
+  consumer half-rate penalty for f32-accumulate HMMA. Arch-gated for `sm_89`: the full
+  128-register budget, eight paired producer warps over `Bc` column halves with one named-barrier
+  exchange per key tile, byte-permute V dequantization (bit-identical), and fp16-accumulated PV
+  tiles folded into the fp32 running accumulator each tile. The kernel gains 30% at 64K depth
+  (109 to 143 TFLOP/s on the `d256-h24-kv4` INT8 append shape); serve prefill gains 5-7% at
+  88K-128K. Needle-in-a-haystack retrieval stays exact at both depths and all 84 suite tests
+  pass, which bounds the fp16-accumulation numerics change.
 - **`/v1/models` reports `context_window`.** Clients without access to a llama.cpp `/props` or a
   vLLM `max_model_len` can size prompts from the models payload.
 - **`GET /metrics`.** Prometheus counters under llama.cpp-compatible names
@@ -113,10 +122,11 @@ GCC 13, and CMake 3.28 or newer; the Docker image builds with CUDA 13.1.
 
 ## Known limits on the RTX 4090
 
-- Prefill reaches 1.5-1.8k tok/s and trails llama.cpp (about 2.8k tok/s) on the same card. The
-  rate is flat across `--prefill-chunk` 1024 to 2688, so the chunk size is not the lever; the
-  schedules are inherited from SM86 tuning, and retuning them for Ada is the main open work.
-  Decode is where this engine leads.
+- Prefill reaches 1.55-1.85k tok/s at 64K-128K depth and trails llama.cpp by about 20% at
+  matched depth (2.33k tok/s at 64K on the same card; the often-quoted 2.8k is its shallow
+  rate). The rate is flat across `--prefill-chunk` 1024 to 2688, so the chunk size is not the
+  lever. With the attention schedule retuned, the remaining gap sits in the custom quantized
+  GEMMs, which run about 10% below cuBLAS on Ada. Decode is where this engine leads.
 - Keep `--prefill-chunk` at 2688 or below. This fork carries measured `sm_89` cooperative
   residency tables (the former hard abort above chunk 1024 is fixed), and chunks through 2688
   stay on split-K. Larger chunks route to the unsplit schedule, which is marginally less
