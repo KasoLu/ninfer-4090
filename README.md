@@ -14,12 +14,14 @@ Qwen3.6-35B-A3B target are inherited but untested on the RTX 4090.
 ## Measured results on the RTX 4090
 
 Conditions: single request, greedy decoding, CUDA Graphs on, INT8 KV, `--prefill-chunk 1024`,
-official 16.96 GiB Qwen3.8-27B artifact. Decode rows use the `ninfer` CLI; prefill rows are
-measured from the `ninfer-serve` `/metrics` counters, which count computed prefill only.
+official 16.96 GiB Qwen3.8-27B artifact. The code-generation decode row and the prefill rows
+are measured from the `ninfer-serve` `/metrics` counters (computed prefill only); the other
+decode rows use the `ninfer` CLI.
 
 | Test | Result |
 |---|---|
-| Decode, code prompt, MTP3 | **106.5 tok/s** at 48.7% acceptance |
+| Decode, code generation, MTP3 | **148.6 tok/s** at 81.0% draft acceptance |
+| Decode, bench corpus, MTP3 | 106.5 tok/s at 48.7% acceptance |
 | Decode, no speculation | 50.5 tok/s |
 | Decode at 128K depth, no speculation | 39.6 tok/s |
 | 64K needle-in-a-haystack | exact answer, 1,849 tok/s prefill |
@@ -27,9 +29,13 @@ measured from the `ninfer-serve` `/metrics` counters, which count computed prefi
 | Vision, chart reading | 3 of 3 oracle facts, 22 ms vision tower |
 | Ops test suite | 78 of 78 runnable tests pass on `sm_89` |
 
+MTP acceptance, and with it the decoded rate, tracks how predictable the output is: structured
+code accepts about 81% of draft tokens, the mixed bench corpus about 49%.
+
 For scale: llama.cpp on the same card decodes the Qwen3.8-27B `UD-Q4_K_XL` GGUF at about
 46 tok/s in a 144K-context configuration where the MTP buffers do not fit. The upstream engine
-on an RTX 5090 reaches about 200 tok/s.
+on an RTX 5090 measures 172 tok/s on the same code-generation prompts with a 400 W power cap
+(the upstream README quotes about 200), so this card lands within 14% of it under MTP.
 
 ## Quick start (Linux)
 
