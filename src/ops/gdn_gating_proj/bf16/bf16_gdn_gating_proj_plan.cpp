@@ -29,24 +29,27 @@ struct RouteSpec {
 constexpr std::array<RouteSpec, 5> k27Routes{{
     {{1, 1}, Bf16GdnGatingScheduleId::GemvPairedRows},
     {{2, 8}, Bf16GdnGatingScheduleId::SmallTSplit10},
-    // sm_86 has 82 SMs. Split8 (256 threads, 65 regs) admits 2 CTAs/SM -> 164 device-wide;
-    // split4/2 (512 threads, 74 regs) admit 1 CTA/SM -> 82. Grid is ceil(T/128)*3*SplitK, so
-    // split8 is legal to T<=768 and split2 to T<=1664. Split4 reaches the same 768 ceiling as
-    // split8 while doing less work per launch, so it is unreachable on this target.
-    {{9, 768}, Bf16GdnGatingScheduleId::MmaCooperativeSplit8},
-    {{769, 1664}, Bf16GdnGatingScheduleId::MmaCooperativeSplit2},
-    {{1665, kAnyCols}, Bf16GdnGatingScheduleId::MmaUnsplit},
+    // sm_89 has 128 SMs. The cuobjdump -res-usage figures on the sm_89 objects match the sm_86
+    // measurements exactly - split8 (256 threads, 65 regs) admits 2 CTAs/SM -> 256 device-wide;
+    // split4/2 (512 threads, 74 regs) admit 1 CTA/SM -> 128 - and sm_89 shares the sm_86
+    // register file, thread, and shared-memory limits per SM, so only the SM count changes.
+    // Grid is ceil(T/128)*3*SplitK, so split8 is legal to T<=1280 and split2 to T<=2688. Split4
+    // reaches the same 1280 ceiling as split8 while doing less work per launch, so it is
+    // unreachable on this target.
+    {{9, 1280}, Bf16GdnGatingScheduleId::MmaCooperativeSplit8},
+    {{1281, 2688}, Bf16GdnGatingScheduleId::MmaCooperativeSplit2},
+    {{2689, kAnyCols}, Bf16GdnGatingScheduleId::MmaUnsplit},
 }};
 
 constexpr std::array<RouteSpec, 5> k35Routes{{
-    // Same progression, clamped to the sm_86 residency ceilings. Grid is ceil(T/64)*2*SplitK, so
-    // with 328 CTAs for split16 and 246 for split8/4/2 the legal ends are 640 / 960 / 1920 / 3904.
-    // The upstream bounds (1024 / 2048 / 4096) each land on 256 CTAs and exceed the 246 limit.
+    // Same progression. Grid is ceil(T/64)*2*SplitK; the sm_89 budgets (512 CTAs for split16,
+    // 384 for split8/4/2) make the upstream perf-chosen bounds of 1024 / 2048 / 4096 legal again
+    // on this target, so they are restored unchanged.
     {{1, 127}, Bf16GdnGatingScheduleId::MmaCooperativeSplit16},
-    {{128, 960}, Bf16GdnGatingScheduleId::MmaCooperativeSplit8},
-    {{961, 1920}, Bf16GdnGatingScheduleId::MmaCooperativeSplit4},
-    {{1921, 3904}, Bf16GdnGatingScheduleId::MmaCooperativeSplit2},
-    {{3905, kAnyCols}, Bf16GdnGatingScheduleId::MmaUnsplit},
+    {{128, 1024}, Bf16GdnGatingScheduleId::MmaCooperativeSplit8},
+    {{1025, 2048}, Bf16GdnGatingScheduleId::MmaCooperativeSplit4},
+    {{2049, 4096}, Bf16GdnGatingScheduleId::MmaCooperativeSplit2},
+    {{4097, kAnyCols}, Bf16GdnGatingScheduleId::MmaUnsplit},
 }};
 
 template <std::size_t N>
@@ -63,17 +66,19 @@ constexpr bool catalog_is_closed(const std::array<RouteSpec, N>& routes,
 static_assert(catalog_is_closed(k27Routes, kAnyCols));
 static_assert(catalog_is_closed(k35Routes, kAnyCols));
 
-// Device-wide resident-CTA budgets, measured on the sm_86 build. These are the single source of
-// truth: both the runtime residency predicates and the compile-time catalog guard below read them,
-// so a retuned constant cannot silently disagree with the route table it is meant to bound.
+// Device-wide resident-CTA budgets for the sm_89 build: the per-SM occupancy measured on sm_86
+// carries over unchanged (identical register counts and per-SM limits), scaled from 82 to the
+// RTX 4090's 128 SMs. These are the single source of truth: both the runtime residency
+// predicates and the compile-time catalog guard below read them, so a retuned constant cannot
+// silently disagree with the route table it is meant to bound.
 constexpr std::int32_t resident_ctas_27(Bf16GdnGatingScheduleId schedule) noexcept {
-    return schedule == Bf16GdnGatingScheduleId::MmaCooperativeSplit8 ? 164 : 82;
+    return schedule == Bf16GdnGatingScheduleId::MmaCooperativeSplit8 ? 256 : 128;
 }
 
 constexpr std::int32_t resident_ctas_35(Bf16GdnGatingScheduleId schedule) noexcept {
-    if (schedule == Bf16GdnGatingScheduleId::MmaCooperativeSplit32) { return 164; }
-    if (schedule == Bf16GdnGatingScheduleId::MmaCooperativeSplit16) { return 328; }
-    return 246;
+    if (schedule == Bf16GdnGatingScheduleId::MmaCooperativeSplit32) { return 256; }
+    if (schedule == Bf16GdnGatingScheduleId::MmaCooperativeSplit16) { return 512; }
+    return 384;
 }
 
 // Zero marks a schedule that is not launched cooperatively and therefore carries no residency
@@ -113,9 +118,9 @@ constexpr bool catalog_is_resident(const std::array<RouteSpec, N>& routes, std::
 }
 
 static_assert(catalog_is_resident(k27Routes, 128, 3, resident_ctas_27),
-              "a 27B cooperative route exceeds the sm_86 resident-CTA budget at its upper bound");
+              "a 27B cooperative route exceeds the sm_89 resident-CTA budget at its upper bound");
 static_assert(catalog_is_resident(k35Routes, 64, 2, resident_ctas_35),
-              "a 35B cooperative route exceeds the sm_86 resident-CTA budget at its upper bound");
+              "a 35B cooperative route exceeds the sm_89 resident-CTA budget at its upper bound");
 
 bool is_27(const Bf16GdnGatingProblem& problem) noexcept {
     return problem.heads == 48 && problem.input_rows == 5120;
