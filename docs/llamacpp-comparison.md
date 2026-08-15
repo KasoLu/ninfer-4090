@@ -116,12 +116,20 @@ Marginal band rates from finite differences: 2,010 tok/s across 2K-32K, 1,714 ac
 | Workload | llama.cpp `draft-mtp` | NInfer MTP3 |
 |---|---:|---:|
 | Code, shallow | 118.8 tok/s, 85.9% acceptance | 148.6 tok/s, 81.0% acceptance |
+| Code, 128K depth | 63.5 tok/s, 85.0% | 104.0 tok/s, 72.9% |
 | Prose, 64K depth | 55.5 tok/s, 45.3% | 85.9 tok/s, 44.6% |
 | Prose, 128K depth | 42.3 tok/s, 45.4% | 77.1 tok/s, 45.6% |
 
-Acceptance is per drafted token. The llama.cpp code row drafted 5,031 tokens over 1,678
-steps for 6,000 decoded tokens; the NInfer code row drafted 5,241 over 1,747 steps for the
-same 6,000.
+Acceptance is per drafted token. The llama.cpp shallow code row drafted 5,031 tokens over
+1,678 steps for 6,000 decoded tokens; the NInfer row drafted 5,241 over 1,747 steps for the
+same 6,000. The 128K code rows use one identical request: the 128K journal followed by a Go
+code task, 1,200 generated tokens. On that request llama.cpp held 85.0% acceptance against
+72.9% for NInfer, and NInfer still decoded 64% faster - the strongest evidence that the gap
+is verify-step time rather than draft quality.
+
+The matching sweep on the RTX 5090 lives in the
+[ninfer-5090 repository](https://github.com/sergiuszm/ninfer-5090)
+(`docs/qwen38-rtx5090-vs-llamacpp.md`).
 
 ## Findings
 
