@@ -34,9 +34,18 @@ on an RTX 5090 reaches about 200 tok/s.
 
 Requirements: an RTX 4090, a recent NVIDIA driver, Docker with the NVIDIA Container Toolkit.
 
+Build the image and download the model once:
+
 ```bash
 docker build --tag ninfer-4090:sm89 .
 NINFER_MODEL_DIR="$PWD/models" bash scripts/download-qwen38.sh
+```
+
+Then start one of the two profiles. The API is available at `http://127.0.0.1:8080/v1`.
+
+### Text-only, 168K context
+
+```bash
 docker run --rm --gpus all --publish 8080:8080 \
   --volume "$PWD/models:/workspace/models:ro" \
   ninfer-4090:sm89 \
@@ -49,12 +58,28 @@ docker run --rm --gpus all --publish 8080:8080 \
   --preserve-thinking
 ```
 
-The API is then available at `http://127.0.0.1:8080/v1`. Vision and maximum context trade
-against each other on a 24 GB card:
+### With vision, 96K context
+
+```bash
+docker run --rm --gpus all --publish 8080:8080 \
+  --volume "$PWD/models:/workspace/models:ro" \
+  ninfer-4090:sm89 \
+  ninfer-serve models/qwen3_8_27b.ninfer \
+  --host 0.0.0.0 --port 8080 \
+  --max-context 98304 --kv-capacity 98304 \
+  --max-concurrency 1 --max-pending-requests 16 \
+  --prefill-chunk 1024 --kv-dtype int8 \
+  --spec mtp --draft-tokens 3 --lm-head-draft \
+  --vision --preserve-thinking
+```
+
+### The tradeoff
+
+Vision and maximum context trade against each other on a 24 GB card:
 
 | Profile | Context | Startup VRAM |
 |---|---:|---:|
-| Text-only, MTP3 (command above) | 172032 (168K) | 23.9 GiB |
+| Text-only, MTP3 | 172032 (168K) | 23.9 GiB |
 | With `--vision`, MTP3 | 98304 (96K) | 23.5 GiB |
 
 Dropping vision buys about 72K more tokens of context at INT8 KV. The text-only ceiling is near
