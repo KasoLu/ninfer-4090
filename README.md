@@ -64,11 +64,22 @@ measured):
 | 64K | 28.3 s (2,317 tok/s) | 34.4 s (1,849 tok/s) |
 | 128K | 70.4 s (1,862 tok/s) | 82.0 s (1,561 tok/s) |
 
-The llama.cpp prefill lead narrows with depth, from 24% on a 32K prompt to 16% on a 128K
-prompt. Decode inverts this: NInfer leads by 10% shallow and by 20% at 128K without
-speculation. With MTP3 the production gap widens further. NInfer decodes 148.6 tok/s on
-shallow code, 85.9 tok/s on prose at 64K, and 77.1 tok/s on prose at 128K, while the
-deployed llama.cpp configuration cannot fit its MTP buffers and stays at 33-46 tok/s.
+The llama.cpp prefill lead narrows with depth. Server-measured, it prefills a 64K prompt in
+28.7 s against 34.4 s (a 20% lead) and a 128K prompt in 71.6 s against 82.0 s (15%); the
+server path costs llama.cpp 2-4% over the bare-loop estimates above. Decode inverts this.
+NInfer leads by 10% shallow and by 20% at 128K without speculation, and the MTP3 gap grows
+with depth:
+
+| Workload | llama.cpp `draft-mtp` | NInfer MTP3 |
+|---|---:|---:|
+| Code, shallow | 118.8 tok/s at 85.9% acceptance | 148.6 tok/s at 81.0% |
+| Prose, 64K depth | 55.5 tok/s at 45.3% | 85.9 tok/s at 44.6% |
+| Prose, 128K depth | 42.3 tok/s at 45.4% | 77.1 tok/s at 45.6% |
+
+The llama.cpp MTP rows required a reduced 131,584-token context; the draft buffers push VRAM
+to 23.8 of 24 GiB, and the deployed 144K llama.cpp configuration cannot fit them at all.
+NInfer serves 172,032 tokens with MTP in the same VRAM. Acceptance matches per content type,
+so the decode gap is engine time, not draft quality.
 
 ## Quick start (Linux)
 
