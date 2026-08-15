@@ -81,6 +81,9 @@ to 23.8 of 24 GiB, and the deployed 144K llama.cpp configuration cannot fit them
 NInfer serves 172,032 tokens with MTP in the same VRAM. Acceptance matches per content type,
 so the decode gap is engine time, not draft quality.
 
+Full configurations, method, and raw numbers:
+[NInfer against llama.cpp](docs/llamacpp-comparison.md).
+
 ## Quick start (Linux)
 
 Requirements: an RTX 4090, a recent NVIDIA driver, Docker with the NVIDIA Container Toolkit.
