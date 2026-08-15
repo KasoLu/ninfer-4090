@@ -96,3 +96,5 @@ target_include_directories(ninfer_qwen3_6_35b_a3b_dflash_round_bench PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
 target_link_libraries(ninfer_qwen3_6_35b_a3b_dflash_round_bench PRIVATE
   ninfer_engine ninfer_core)
+
+ninfer_add_op_bench(ninfer_q4_linear_swiglu_variants_bench SOURCES ops/q4_linear_swiglu_variants_bench.cu)
