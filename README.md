@@ -37,6 +37,39 @@ For scale: llama.cpp on the same card decodes the Qwen3.8-27B `UD-Q4_K_XL` GGUF 
 on an RTX 5090 measures 172 tok/s on the same code-generation prompts with a 400 W power cap
 (the upstream README quotes about 200), so this card lands within 14% of it under MTP.
 
+### Depth sweep against llama.cpp
+
+Both engines were measured on the same card on 2026-08-15. llama.cpp build 10358 ran
+`llama bench` on the `UD-Q4_K_XL` GGUF (16.68 GiB) with q8_0 KV cache, flash attention, and
+`-ub 1024 -b 4096`, which matches its deployed configuration. NInfer ran the deployed 168K
+serve configuration and was measured through the `/metrics` counters. Two caveats: the
+artifacts differ by about 2% in size, and `llama bench` is a bare kernel loop while the
+NInfer numbers include the full server path.
+
+Marginal rates at depth:
+
+| Depth | llama.cpp pp2048 | llama.cpp tg32 | NInfer decode, no speculation |
+|---:|---:|---:|---:|
+| 0 | 3,024 tok/s | 45.9 tok/s | 50.5 tok/s |
+| 32K | 2,327 | 42.0 | - |
+| 64K | 1,866 | 38.6 | - |
+| 128K | 1,336 | 33.1 | 39.6 |
+
+Wall time to prefill one full prompt (llama.cpp integrated from the marginal rates, NInfer
+measured):
+
+| Prompt | llama.cpp | NInfer |
+|---:|---:|---:|
+| 32K | 12.5 s (2,630 tok/s) | 15.5 s (2,012 tok/s) |
+| 64K | 28.3 s (2,317 tok/s) | 34.4 s (1,849 tok/s) |
+| 128K | 70.4 s (1,862 tok/s) | 82.0 s (1,561 tok/s) |
+
+The llama.cpp prefill lead narrows with depth, from 24% on a 32K prompt to 16% on a 128K
+prompt. Decode inverts this: NInfer leads by 10% shallow and by 20% at 128K without
+speculation. With MTP3 the production gap widens further. NInfer decodes 148.6 tok/s on
+shallow code, 85.9 tok/s on prose at 64K, and 77.1 tok/s on prose at 128K, while the
+deployed llama.cpp configuration cannot fit its MTP buffers and stays at 33-46 tok/s.
+
 ## Quick start (Linux)
 
 Requirements: an RTX 4090, a recent NVIDIA driver, Docker with the NVIDIA Container Toolkit.
@@ -128,11 +161,11 @@ GCC 13, and CMake 3.28 or newer; the Docker image builds with CUDA 13.1.
 
 ## Known limits on the RTX 4090
 
-- Prefill reaches 1.55-1.85k tok/s at 64K-128K depth and trails llama.cpp by about 20% at
-  matched depth (2.33k tok/s at 64K on the same card; the often-quoted 2.8k is its shallow
-  rate). The rate is flat across `--prefill-chunk` 1024 to 2688, so the chunk size is not the
-  lever. With the attention schedule retuned, the remaining gap sits in the custom quantized
-  GEMMs, which run about 10% below cuBLAS on Ada. Decode is where this engine leads.
+- Prefill trails llama.cpp by 16-24% on full 32K-128K prompts under matched conditions (see
+  the depth sweep above). The rate is flat across `--prefill-chunk` 1024 to 2688, so the
+  chunk size is not the lever. With the attention schedule retuned, the remaining gap sits in
+  the custom quantized GEMMs, which run about 10% below cuBLAS on Ada. Decode is where this
+  engine leads.
 - Keep `--prefill-chunk` at 2688 or below. This fork carries measured `sm_89` cooperative
   residency tables (the former hard abort above chunk 1024 is fixed), and chunks through 2688
   stay on split-K. Larger chunks route to the unsplit schedule, which is marginally less
