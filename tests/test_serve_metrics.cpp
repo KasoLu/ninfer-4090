@@ -49,6 +49,9 @@ int main() {
     ServeMetrics metrics;
     const auto empty = parse(metrics.render(1));
     failures += check(empty.at("llamacpp:prompt_tokens_total") == 0.0, "starts at zero");
+    const auto never = metrics.last_completed();
+    failures += check(never.prompt_tokens == 0 && never.cached_tokens == 0,
+                      "last completed starts at zero");
     failures += check(empty.at("ninfer:requests_total") == 0.0, "requests start at zero");
     failures += check(empty.at("llamacpp:requests_processing") == 0.0, "idle processing");
     failures += check(empty.at("llamacpp:requests_deferred") == 0.0, "idle deferred");
@@ -72,9 +75,15 @@ int main() {
 
     // Cold request: whole prompt computed.
     metrics.record(outcome(1000, 0, 200, 0.5, 4.0, 300, 150));
+    const auto cold = metrics.last_completed();
+    failures += check(cold.prompt_tokens == 1000 && cold.cached_tokens == 0,
+                      "last completed after cold request");
     // Warm request: 900 of 1200 prompt tokens served from the prefix cache -
     // only the 300 computed tokens may count toward the prompt counter.
     metrics.record(outcome(1200, 900, 100, 0.1, 2.0, 150, 75));
+    const auto warm = metrics.last_completed();
+    failures += check(warm.prompt_tokens == 1200 && warm.cached_tokens == 900,
+                      "last completed after warm request");
 
     const auto values = parse(metrics.render(1));
     failures += check(values.at("llamacpp:prompt_tokens_total") == 1300.0, "computed prefill sum");
@@ -91,6 +100,9 @@ int main() {
     metrics.record(outcome(10, 50, 1, 0.0, 0.1, 0, 0));
     const auto clamped = parse(metrics.render(1));
     failures += check(clamped.at("llamacpp:prompt_tokens_total") == 1300.0, "underflow clamped");
+    const auto residue = metrics.last_completed();
+    failures += check(residue.prompt_tokens == 10 && residue.cached_tokens == 10,
+                      "last completed cache clamped to prompt");
 
     std::printf("%s serve metrics\n", failures == 0 ? "OK" : "FAIL");
     return failures == 0 ? 0 : 1;

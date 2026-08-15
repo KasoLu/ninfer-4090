@@ -263,19 +263,28 @@ void HttpServer::register_routes() {
     // llama.cpp-shaped slot detail. The Engine has no exposed slot table, so
     // the first `max_concurrency` in-flight requests (FIFO order) count as
     // processing and the rest of the table reads idle; per-slot cache detail
-    // is unknown mid-flight and reported as zero.
+    // is unknown mid-flight and reported as zero. A fully idle table keeps
+    // the last completed request's counts on slot 0 - llama.cpp retains slot
+    // state the same way, and scrapers read it as the resident session
+    // depth, which the prefix cache genuinely still holds. With requests in
+    // flight the retained figure is suppressed: it may describe the same
+    // session a busy slot is already reporting, and per-slot attribution is
+    // unknowable without an engine slot table.
     server_.Get("/slots", [this](const httplib::Request&, httplib::Response& res) {
         const auto active = metrics_.active_snapshot();
+        const auto last   = metrics_.last_completed();
         const bool speculative =
             options_.speculative.backend != ninfer::SpeculativeBackend::None;
         nlohmann::json slots = nlohmann::json::array();
         for (std::uint32_t i = 0; i < options_.max_concurrency; ++i) {
-            const bool busy = i < active.size();
+            const bool busy    = i < active.size();
+            const bool retains = active.empty() && i == 0;
             slots.push_back({{"id", i},
                              {"is_processing", busy},
                              {"n_ctx", options_.max_context},
-                             {"n_prompt_tokens", busy ? active[i].second : 0},
-                             {"n_prompt_tokens_cache", 0},
+                             {"n_prompt_tokens",
+                              busy ? active[i].second : (retains ? last.prompt_tokens : 0)},
+                             {"n_prompt_tokens_cache", retains ? last.cached_tokens : 0},
                              {"speculative", speculative}});
         }
         res.set_content(slots.dump(), "application/json");

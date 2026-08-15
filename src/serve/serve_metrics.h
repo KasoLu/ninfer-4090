@@ -39,6 +39,17 @@ public:
     // request-done log line, so every protocol and both streaming modes count.
     void record(const GenerationOutcome& outcome);
 
+    // Prompt/cache sizes of the most recent completed request, retained for
+    // /slots. llama.cpp keeps the last request's counts on an idle slot and
+    // scrapers (the fleet dashboard) read them as the resident session
+    // depth; the prefix cache genuinely still holds that session, so the
+    // retained figure stays truthful until the next completion replaces it.
+    struct LastCompleted {
+        int prompt_tokens = 0;
+        int cached_tokens = 0;
+    };
+    [[nodiscard]] LastCompleted last_completed() const;
+
     // One complete Prometheus text body, without HTTP framing. In-flight
     // requests are split into processing/deferred against `max_concurrency`,
     // matching the FIFO scheduler's work-conserving behavior.
@@ -54,6 +65,7 @@ private:
     std::uint64_t prefix_cache_hit_tokens_total_     = 0;
     std::uint64_t speculative_draft_tokens_total_    = 0;
     std::uint64_t speculative_accepted_tokens_total_ = 0;
+    LastCompleted last_completed_;
     std::map<std::uint64_t, int> active_;
 };
 

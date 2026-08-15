@@ -55,6 +55,15 @@ void ServeMetrics::record(const GenerationOutcome& outcome) {
     prefix_cache_hit_tokens_total_ += cached;
     speculative_draft_tokens_total_ += m.speculative_draft_tokens;
     speculative_accepted_tokens_total_ += m.speculative_accepted_tokens;
+    last_completed_.prompt_tokens = static_cast<int>(prompt);
+    // Clamped like computed_prefill above: a cache figure reported larger
+    // than the prompt must not advertise more resident tokens than exist.
+    last_completed_.cached_tokens = static_cast<int>(std::min(cached, prompt));
+}
+
+ServeMetrics::LastCompleted ServeMetrics::last_completed() const {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    return last_completed_;
 }
 
 std::string ServeMetrics::render(std::uint32_t max_concurrency) const {
