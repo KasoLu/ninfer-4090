@@ -113,12 +113,14 @@ GCC 13, and CMake 3.28 or newer; the Docker image builds with CUDA 13.1.
 
 ## Known limits on the RTX 4090
 
-- Keep `--prefill-chunk` at 1024. Larger chunks abort with
-  `cudaErrorCooperativeLaunchTooLarge`: the cooperative grid of the GDN gating projection scales
-  with the chunk and exceeds the co-resident block limit on `sm_89`.
 - Prefill reaches 1.5-1.8k tok/s and trails llama.cpp (about 2.8k tok/s) on the same card. The
-  schedules are inherited from SM86 tuning; retuning them for Ada is the main open work. Decode
-  is where this engine leads.
+  rate is flat across `--prefill-chunk` 1024 to 2688, so the chunk size is not the lever; the
+  schedules are inherited from SM86 tuning, and retuning them for Ada is the main open work.
+  Decode is where this engine leads.
+- Keep `--prefill-chunk` at 2688 or below. This fork carries measured `sm_89` cooperative
+  residency tables (the former hard abort above chunk 1024 is fixed), and chunks through 2688
+  stay on split-K. Larger chunks route to the unsplit schedule, which is marginally less
+  accurate at its onset (about 1e-5 relative).
 - Concurrency above one request is untested in this fork. The published cohort results in the
   [3090 base](https://github.com/Don-Chad/ninfer-3090) do not transfer directly.
 - The limits of the base engine apply: one process, one GPU, one model, bounded FIFO admission,
