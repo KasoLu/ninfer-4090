@@ -42,16 +42,25 @@ docker run --rm --gpus all --publish 8080:8080 \
   ninfer-4090:sm89 \
   ninfer-serve models/qwen3_8_27b.ninfer \
   --host 0.0.0.0 --port 8080 \
-  --max-context 98304 --kv-capacity 98304 \
+  --max-context 172032 --kv-capacity 172032 \
   --max-concurrency 1 --max-pending-requests 16 \
   --prefill-chunk 1024 --kv-dtype int8 \
   --spec mtp --draft-tokens 3 --lm-head-draft \
-  --vision --preserve-thinking
+  --preserve-thinking
 ```
 
-The API is then available at `http://127.0.0.1:8080/v1`. This profile - 96K context, vision, and
-MTP3 - uses 23.5 GiB at startup. A 128K text-only profile without MTP also fits (20.5 GiB); 128K
-combined with vision and MTP does not fit in 24 GB.
+The API is then available at `http://127.0.0.1:8080/v1`. Vision and maximum context trade
+against each other on a 24 GB card:
+
+| Profile | Context | Startup VRAM |
+|---|---:|---:|
+| Text-only, MTP3 (command above) | 172032 (168K) | 23.9 GiB |
+| With `--vision`, MTP3 | 98304 (96K) | 23.5 GiB |
+
+Dropping vision buys about 72K more tokens of context at INT8 KV. The text-only ceiling is near
+176K: 172032 starts, and 196608 is rejected at startup with a byte-exact deficit. The server
+validates memory before it listens, so an oversized context fails fast instead of at request
+time.
 
 For a native build, follow the [Linux build guide](docs/rtx-3090-linux.md) with
 `CMAKE_CUDA_ARCHITECTURES=89` (the default in this fork). The build requires CUDA 12.8 or newer,
