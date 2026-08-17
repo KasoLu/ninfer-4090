@@ -177,16 +177,24 @@ KV precision, vision, and maximum context trade against each other on a 24 GB ca
 | Text-only, MTP3 | `rk4v4-e8` | 262144 (256K) | 5.08 GiB | 1.37 GiB |
 | Text-only, MTP3 | `rk2v4-e8` | 262144 (256K) | 4.01 GiB | 2.43 GiB |
 | Text-only, MTP3 | `int8` | 172032 (168K) | 6.31 GiB | 136 MiB |
+| With `--vision`, MTP3 | `rk2v4-e8` | 262144 (256K) | 5.85 GiB | 329 MiB |
+| With `--vision`, MTP3 | `rk4v4-e8` | 212992 (208K) | 6.06 GiB | 108 MiB |
 | With `--vision`, MTP3 | `int8` | 98304 (96K) | - | ~1 GiB |
 
 262,144 is the model's own context limit, so `rk2v4-e8` (2-bit keys, 96.2% cosine)
-buys no additional context over `rk4v4-e8` here - only slack, which may matter for a
-future vision-plus-long-context profile. It passes the same retrieval gates
-(single-needle at 260K, 5-needle at 118K, exact code details at 168K) at a 10%
-decode tax (120.5 tok/s on the shallow code probe). The INT8 text-only ceiling is
-near 176K: 172032 starts, and 196608 is rejected at startup with a byte-exact
-deficit. The server validates memory before it listens, so an oversized context
-fails fast instead of at request time.
+buys no additional context over `rk4v4-e8` in the text-only profile - only slack.
+That slack is what pays for vision: the E8 modes dissolve most of the old
+vision-against-context tradeoff. Vision costs about 2.1 GiB (1.83 GiB of runtime
+buffers plus a 0.28 GiB tower), which INT8 could only afford at 96K. With 2-bit
+keys the full native 262,144 fits alongside vision; with 4-bit keys the measured
+ceiling is 219008 (1.5 MiB slack), so 212992 is the practical line. Both vision
+modes answer a two-swatch color oracle exactly at temperature 0, including with
+the image buried under 52,700 tokens of text on `rk2v4-e8`. `rk2v4-e8` also passes
+the text retrieval gates (single-needle at 260K, 5-needle at 118K, exact code
+details at 168K) at a 10% decode tax (120.5 tok/s on the shallow code probe). The
+INT8 text-only ceiling is near 176K: 172032 starts, and 196608 is rejected at
+startup with a byte-exact deficit. The server validates memory before it listens,
+so an oversized context fails fast instead of at request time.
 
 For a native build, follow the [Linux build guide](docs/rtx-3090-linux.md) with
 `CMAKE_CUDA_ARCHITECTURES=89` (the default in this fork). The build requires CUDA 12.8 or newer,
