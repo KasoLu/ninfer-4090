@@ -152,3 +152,72 @@ The matching sweep on the RTX 5090 lives in the
 An earlier measurement recorded llama.cpp prefill at 2,334 tok/s at 64K depth under
 unmatched settings. Under the production configuration above the matched number is
 1,866 tok/s. The table in this document supersedes the old figure.
+
+## 2026-08-17 refresh: E8 KV default
+
+The NInfer default moved from INT8 KV at 172,032 tokens to `rk4v4-e8` (E8
+Conway-Sloane 4-bit keys, 4-bit values) at the full native 262,144 tokens. This
+section re-measures the NInfer side on that configuration. The llama.cpp rows above
+are reused unchanged: same card, same driver, and the llama.cpp configuration did
+not change between the two dates.
+
+Method for this section: `ninfer-serve` on the deployed E8 profile, greedy, thinking
+off, one request at a time. Prefill rates come from differenced
+`llamacpp:prompt_tokens_total` / `prompt_seconds_total` counters on a cold prompt.
+Decode rates come from differenced `tokens_predicted` counters on a second request
+over the same prompt; compatible-prefix reuse recomputed zero prompt tokens in every
+run. The corpora are deterministic generated prose and Go code. They are not the
+2026-08-15 payloads, so acceptance-sensitive MTP rows are close to, but not
+identical with, the older corpus; the acceptance column carries that context.
+
+Prefill, full prompt, computed tokens only:
+
+| Prompt tokens | E8 prefill | E8 wall | INT8 (08-15) | llama.cpp server (08-15) |
+|---:|---:|---:|---:|---:|
+| 29,479 | 2,027 tok/s | 14.5 s | 2,012 tok/s | - |
+| 58,924 | 1,857 | 31.7 | 1,849 | 2,216 tok/s (28.7 s) |
+| 117,791 | 1,581 | 74.5 | 1,561 | 1,787 tok/s (71.6 s) |
+| 176,652 | 1,381 | 127.9 | - | no entry |
+| 235,399 | 1,228 | 191.7 | - | no entry |
+
+E8 prefill is at parity with INT8 or up to 1% above it at every measured depth: the
+halved key traffic in attention offsets the dequantization work. The llama.cpp
+prefill lead is 19% at 64K and 13% at 128K, and llama.cpp has no entry beyond its
+144K deployed ceiling.
+
+Decode without speculation:
+
+| Depth | E8 | INT8 (08-15) | llama.cpp tg32 (08-15) |
+|---:|---:|---:|---:|
+| ~2K | 50.4 tok/s | 50.5 tok/s | 45.9 tok/s |
+| ~118K | 42.1 | 39.6 | 33.1 (at 128K) |
+| ~235K | 36.6 | - | no entry |
+
+The mode inverts with depth. Shallow decode is weights-bound, and E8 pays a small
+dequantization cost. Decode at depth is KV-bandwidth-bound, and the 4-bit cache
+reads half the bytes: E8 beats INT8 by 6% at 118K and extends the curve to 235K.
+Against llama.cpp the no-speculation lead grows from +10% shallow to +27% at 128K.
+
+Decode with MTP3, acceptance in parentheses:
+
+| Depth | E8 prose | E8 code | llama.cpp `draft-mtp` (08-15) |
+|---:|---:|---:|---:|
+| shallow | 94.6 (43.9%) at 29K | 142.9 (78.0%) | code 118.8 (85.9%) |
+| ~60K | 86.1 (42.3%) | 129.0 (80.6%) | prose 55.5 (45.3%) |
+| ~120K | 77.5 (41.6%) | 114.2 (77.8%) | prose 42.3 (45.4%), code 63.5 (85.0%) |
+| ~177K | 69.5 (39.8%) | - | no entry |
+| ~240K | 65.4 (41.1%) | 91.2 (72.1%) | no entry |
+
+The prose rows reproduce the INT8 numbers within noise (86.1 against 85.9 at 64K,
+77.5 against 77.1 at 128K) at matched acceptance, so the E8 keys cost nothing in
+MTP drafting on prose. The code rows use the generated Go corpus; the 2026-08-15
+code rows used a real journal payload with lower acceptance, so compare shapes, not
+cells.
+
+Findings update:
+
+1. The MTP long-context gap doubled: llama.cpp fits 131,584 tokens with MTP buffers
+   on this card, NInfer now serves 262,144 - the model's own limit.
+2. NInfer decode at 128K leads llama.cpp by +27% without speculation (was +20% at
+   INT8) and by +83% on prose with MTP on both sides (was +82%).
+3. Every rate from 144K to 262,144 tokens is NInfer-only territory on this card.

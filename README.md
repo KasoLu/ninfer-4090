@@ -45,44 +45,53 @@ on an RTX 5090 measures 172 tok/s on the same code-generation prompts with a 400
 
 ### Depth sweep against llama.cpp
 
-Both engines were measured on the same card on 2026-08-15. llama.cpp build 10358 ran
-`llama bench` on the `UD-Q4_K_XL` GGUF (16.68 GiB) with q8_0 KV cache, flash attention, and
-`-ub 1024 -b 4096`, which matches its deployed configuration. NInfer ran the deployed 168K
-serve configuration and was measured through the `/metrics` counters. Two caveats: the
-artifacts differ by about 2% in size, and `llama bench` is a bare kernel loop while the
-NInfer numbers include the full server path.
+Both engines were measured on the same card. llama.cpp build 10358 ran `llama bench` on the
+`UD-Q4_K_XL` GGUF (16.68 GiB) with q8_0 KV cache, flash attention, and `-ub 1024 -b 4096`,
+which matches its deployed configuration, on 2026-08-15. The NInfer side was re-measured on
+2026-08-17 on the deployed E8 262K configuration through the `/metrics` counters; the
+llama.cpp configuration did not change between the dates. Two caveats: the artifacts differ
+by about 2% in size, and `llama bench` is a bare kernel loop while the NInfer numbers
+include the full server path.
 
 Marginal rates at depth:
 
 | Depth | llama.cpp pp2048 | llama.cpp tg32 | NInfer decode, no speculation |
 |---:|---:|---:|---:|
-| 0 | 3,024 tok/s | 45.9 tok/s | 50.5 tok/s |
+| 0 | 3,024 tok/s | 45.9 tok/s | 50.4 tok/s |
 | 32K | 2,327 | 42.0 | - |
 | 64K | 1,866 | 38.6 | - |
-| 128K | 1,336 | 33.1 | 39.6 |
+| 128K | 1,336 | 33.1 | 42.1 |
+| 256K | no entry | no entry | 36.6 |
 
 Wall time to prefill one full prompt (llama.cpp integrated from the marginal rates, NInfer
 measured):
 
 | Prompt | llama.cpp | NInfer |
 |---:|---:|---:|
-| 32K | 12.5 s (2,630 tok/s) | 15.5 s (2,012 tok/s) |
-| 64K | 28.3 s (2,317 tok/s) | 34.4 s (1,849 tok/s) |
-| 128K | 70.4 s (1,862 tok/s) | 82.0 s (1,561 tok/s) |
+| 32K | 12.5 s (2,630 tok/s) | 14.5 s (2,027 tok/s) |
+| 64K | 28.3 s (2,317 tok/s) | 31.7 s (1,857 tok/s) |
+| 128K | 70.4 s (1,862 tok/s) | 74.5 s (1,581 tok/s) |
+| 192K | no entry | 127.9 s (1,381 tok/s) |
+| 256K | no entry | 191.7 s (1,228 tok/s) |
 
 The llama.cpp prefill lead narrows with depth. Server-measured, it prefills a 64K prompt in
-28.7 s against 34.4 s (a 20% lead) and a 128K prompt in 71.6 s against 82.0 s (15%); the
-server path costs llama.cpp 2-4% over the bare-loop estimates above. Decode inverts this.
-NInfer leads by 10% shallow and by 20% at 128K without speculation, and the MTP3 gap grows
-with depth:
+28.7 s against 31.7 s (a 10% lead) and a 128K prompt in 71.6 s against 74.5 s (4%); the
+server path costs llama.cpp 2-4% over the bare-loop estimates above. Everything past its
+144K ceiling is NInfer-only. Decode inverts the shallow picture. NInfer leads by 10%
+shallow and by 27% at 128K without speculation, and the MTP3 gap grows with depth:
 
-| Workload | llama.cpp `draft-mtp` | NInfer MTP3 |
+| Workload | llama.cpp `draft-mtp` | NInfer MTP3 (E8) |
 |---|---:|---:|
-| Code, shallow | 118.8 tok/s at 85.9% acceptance | 148.6 tok/s at 81.0% |
-| Prose, 64K depth | 55.5 tok/s at 45.3% | 85.9 tok/s at 44.6% |
-| Prose, 128K depth | 42.3 tok/s at 45.4% | 77.1 tok/s at 45.6% |
+| Code, shallow | 118.8 tok/s at 85.9% acceptance | 142.9 tok/s at 78.0% |
+| Prose, 64K depth | 55.5 tok/s at 45.3% | 86.1 tok/s at 42.3% |
+| Prose, 128K depth | 42.3 tok/s at 45.4% | 77.5 tok/s at 41.6% |
+| Prose, 256K depth | no entry | 65.4 tok/s at 41.1% |
+| Code, 256K depth | no entry | 91.2 tok/s at 72.1% |
 
-The llama.cpp MTP rows required a reduced 131,584-token context; the draft buffers push VRAM
+The NInfer rows in this table use the 2026-08-17 generated corpora; acceptance on them runs
+a few points below the 2026-08-15 payloads (code 78% against 81%), which accounts for the
+difference from the headline 148.6 tok/s. The llama.cpp MTP rows required a reduced
+131,584-token context; the draft buffers push VRAM
 to 23.8 of 24 GiB, and the deployed 144K llama.cpp configuration cannot fit them at all.
 NInfer serves 172,032 tokens with MTP in the same VRAM at INT8 KV, and the full native
 262,144 with the E8 4-bit KV default. Acceptance matches per content type, so the decode gap
