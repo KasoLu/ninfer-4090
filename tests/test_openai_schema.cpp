@@ -465,6 +465,35 @@ int test_parse_tool_history_messages() {
     failures +=
         check(throws_api([&] { (void)parse_chat_completion_request(bad_args, default_limits()); }),
               "non-object tool call arguments rejected");
+
+    Json parts                   = body;
+    parts["messages"][2]["content"] = Json::array(
+        {Json{{"type", "text"}, {"text", R"({"temp":20})"}}, Json{{"type", "text"}, {"text", "sunny"}}});
+    GenerationRequest parts_req = parse_chat_completion_request(parts, default_limits());
+    failures += check(parts_req.messages[2].content.size() == 2, "tool content-part array parsed");
+    failures += check(parts_req.messages[2].content.at(0).text == R"({"temp":20})",
+                      "tool content part 0 text parsed");
+    failures +=
+        check(parts_req.messages[2].content.at(1).text == "sunny", "tool content part 1 text parsed");
+
+    Json empty_parts                   = body;
+    empty_parts["messages"][2]["content"] = Json::array();
+    GenerationRequest empty_req = parse_chat_completion_request(empty_parts, default_limits());
+    failures += check(empty_req.messages[2].content.size() == 1 &&
+                          empty_req.messages[2].content.at(0).text.empty(),
+                      "empty tool content array maps to empty text part");
+
+    Json null_content                   = body;
+    null_content["messages"][2]["content"] = nullptr;
+    failures += check(
+        throws_api([&] { (void)parse_chat_completion_request(null_content, default_limits()); }),
+        "null tool content rejected");
+
+    Json missing_content = body;
+    missing_content["messages"][2].erase("content");
+    failures += check(
+        throws_api([&] { (void)parse_chat_completion_request(missing_content, default_limits()); }),
+        "missing tool content rejected");
     return failures;
 }
 
