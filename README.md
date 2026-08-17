@@ -274,6 +274,12 @@ JSONL request logs. See [HTTP serving](docs/serving.md) and [CLI usage](docs/cli
 - [Don-Chad/ninfer-3090](https://github.com/Don-Chad/ninfer-3090) - the SM86 compatibility layer,
   ReplaySSM integration, and Qwen3.8 runtime support this fork builds on. Its
   [v0.6.1 release notes](RELEASE_NOTES_0.6.1.md) describe the inherited state.
+- [UDPSendToFailed/ninfer-4090](https://github.com/UDPSendToFailed/ninfer-4090) - a sibling
+  RTX 4090 port from the same 3090 base. The rotated and E8-lattice KV-cache quantization
+  modes (`rk8v4`, `rk4v4`, `rk4v4-e8`, `rk2v4-e8`), the E8 codecs, and the 1M visible-keys
+  envelope are their work, cherry-picked here with authorship preserved. The full 262K
+  default profile exists because of it; see
+  [the fork comparison](docs/udp-fork-comparison.md).
 - [jram4/ninfer-4090](https://github.com/jram4/ninfer-4090) - an earlier RTX 4090 port of a July
   2026 snapshot. Its Ada dispatch tuning targets a kernel organization that upstream has since
   replaced, so this fork starts from the current 3090 base instead.
