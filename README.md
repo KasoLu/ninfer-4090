@@ -32,6 +32,12 @@ decode rows use the `ninfer` CLI.
 MTP acceptance, and with it the decoded rate, tracks how predictable the output is: structured
 code accepts about 81% of draft tokens, the mixed bench corpus about 49%.
 
+The shipping default has since moved from INT8 KV to the E8 4-bit KV mode, which serves the
+model's full native 262,144-token context on this card. Retrieval stays exact through 260K
+(single-needle, 5-needle, and exact-code-detail probes), MTP acceptance at depth is unchanged,
+and the costs against the INT8 numbers above are a 5.7% decode tax and 1-2% of prefill; see
+[Quick start](#text-only-full-262k-native-context-e8-4-bit-kv-default) for the measured deltas.
+
 For scale: llama.cpp on the same card decodes the Qwen3.8-27B `UD-Q4_K_XL` GGUF at about
 46 tok/s in a 144K-context configuration where the MTP buffers do not fit. The upstream engine
 on an RTX 5090 measures 172 tok/s on the same code-generation prompts with a 400 W power cap
@@ -78,8 +84,9 @@ with depth:
 
 The llama.cpp MTP rows required a reduced 131,584-token context; the draft buffers push VRAM
 to 23.8 of 24 GiB, and the deployed 144K llama.cpp configuration cannot fit them at all.
-NInfer serves 172,032 tokens with MTP in the same VRAM. Acceptance matches per content type,
-so the decode gap is engine time, not draft quality.
+NInfer serves 172,032 tokens with MTP in the same VRAM at INT8 KV, and the full native
+262,144 with the E8 4-bit KV default. Acceptance matches per content type, so the decode gap
+is engine time, not draft quality.
 
 Full configurations, method, and raw numbers:
 [NInfer against llama.cpp](docs/llamacpp-comparison.md).
@@ -95,7 +102,7 @@ docker build --tag ninfer-4090:sm89 .
 NINFER_MODEL_DIR="$PWD/models" bash scripts/download-qwen38.sh
 ```
 
-Then start one of the two profiles. The API is available at `http://127.0.0.1:8080/v1`.
+Then start one of the three profiles. The API is available at `http://127.0.0.1:8080/v1`.
 
 ### Text-only, full 262K native context (E8 4-bit KV, default)
 
@@ -165,10 +172,12 @@ KV precision, vision, and maximum context trade against each other on a 24 GB ca
 
 262,144 is the model's own context limit, so `rk2v4-e8` (2-bit keys, 96.2% cosine)
 buys no additional context over `rk4v4-e8` here - only slack, which may matter for a
-future vision-plus-long-context profile. The INT8 text-only ceiling is near 176K:
-172032 starts, and 196608 is rejected at startup with a byte-exact deficit. The
-server validates memory before it listens, so an oversized context fails fast
-instead of at request time.
+future vision-plus-long-context profile. It passes the same retrieval gates
+(single-needle at 260K, 5-needle at 118K, exact code details at 168K) at a 10%
+decode tax (120.5 tok/s on the shallow code probe). The INT8 text-only ceiling is
+near 176K: 172032 starts, and 196608 is rejected at startup with a byte-exact
+deficit. The server validates memory before it listens, so an oversized context
+fails fast instead of at request time.
 
 For a native build, follow the [Linux build guide](docs/rtx-3090-linux.md) with
 `CMAKE_CUDA_ARCHITECTURES=89` (the default in this fork). The build requires CUDA 12.8 or newer,
