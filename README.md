@@ -97,7 +97,32 @@ NINFER_MODEL_DIR="$PWD/models" bash scripts/download-qwen38.sh
 
 Then start one of the two profiles. The API is available at `http://127.0.0.1:8080/v1`.
 
-### Text-only, 168K context
+### Text-only, full 262K native context (E8 4-bit KV, default)
+
+The E8 Conway-Sloane lattice KV mode (`rk4v4-e8`, ported from
+[UDPSendToFailed/ninfer-4090](https://github.com/UDPSendToFailed/ninfer-4090); see
+[the fork comparison](docs/udp-fork-comparison.md)) fits the model's entire native
+262,144-token context on 24 GB with 1.4 GiB to spare:
+
+```bash
+docker run --rm --gpus all --publish 8080:8080 \
+  --volume "$PWD/models:/workspace/models:ro" \
+  ninfer-4090:sm89 \
+  ninfer-serve models/qwen3_8_27b.ninfer \
+  --host 0.0.0.0 --port 8080 \
+  --max-context 262144 --kv-capacity 262144 \
+  --max-concurrency 1 --max-pending-requests 16 \
+  --prefill-chunk 1024 --kv-dtype rk4v4-e8 \
+  --spec mtp --draft-tokens 3 --lm-head-draft \
+  --preserve-thinking
+```
+
+Measured against INT8 KV on this build: identical MTP acceptance at 111K depth
+(78.8% vs 78.4%), a 5.7% decode tax (126.6 vs 134.2 tok/s on a shallow greedy code
+probe), prefill within 1-2% at matched depth, and exact single-needle, 5-needle, and
+code-detail retrieval through 260K tokens.
+
+### Text-only, 168K context (INT8 KV, maximum precision)
 
 ```bash
 docker run --rm --gpus all --publish 8080:8080 \
@@ -129,17 +154,21 @@ docker run --rm --gpus all --publish 8080:8080 \
 
 ### The tradeoff
 
-Vision and maximum context trade against each other on a 24 GB card:
+KV precision, vision, and maximum context trade against each other on a 24 GB card:
 
-| Profile | Context | Startup VRAM |
-|---|---:|---:|
-| Text-only, MTP3 | 172032 (168K) | 23.9 GiB |
-| With `--vision`, MTP3 | 98304 (96K) | 23.5 GiB |
+| Profile | KV mode | Context | KV runtime | Startup slack |
+|---|---|---:|---:|---:|
+| Text-only, MTP3 | `rk4v4-e8` | 262144 (256K) | 5.08 GiB | 1.37 GiB |
+| Text-only, MTP3 | `rk2v4-e8` | 262144 (256K) | 4.01 GiB | 2.43 GiB |
+| Text-only, MTP3 | `int8` | 172032 (168K) | 6.31 GiB | 136 MiB |
+| With `--vision`, MTP3 | `int8` | 98304 (96K) | - | ~1 GiB |
 
-Dropping vision buys about 72K more tokens of context at INT8 KV. The text-only ceiling is near
-176K: 172032 starts, and 196608 is rejected at startup with a byte-exact deficit. The server
-validates memory before it listens, so an oversized context fails fast instead of at request
-time.
+262,144 is the model's own context limit, so `rk2v4-e8` (2-bit keys, 96.2% cosine)
+buys no additional context over `rk4v4-e8` here - only slack, which may matter for a
+future vision-plus-long-context profile. The INT8 text-only ceiling is near 176K:
+172032 starts, and 196608 is rejected at startup with a byte-exact deficit. The
+server validates memory before it listens, so an oversized context fails fast
+instead of at request time.
 
 For a native build, follow the [Linux build guide](docs/rtx-3090-linux.md) with
 `CMAKE_CUDA_ARCHITECTURES=89` (the default in this fork). The build requires CUDA 12.8 or newer,
@@ -172,6 +201,13 @@ GCC 13, and CMake 3.28 or newer; the Docker image builds with CUDA 13.1.
   mid-flight and reported as zero.
 - **NVFP4-A4 test gating.** The A4 activation tests skip on hardware without FP4 tensor cores
   instead of aborting. The full remaining suite passes on the RTX 4090.
+- **E8 lattice KV quantization (ported).** The `rk8v4`/`rk4v4`/`rk4v4-e8`/`rk2v4-e8` KV modes
+  and the 262K-to-1M visible-keys envelope lift from the
+  [UDPSendToFailed/ninfer-4090](https://github.com/UDPSendToFailed/ninfer-4090) sibling fork,
+  merged under this fork's retuned `sm_89` attention prefill schedule. The E8 codec verifies
+  bit-exactly against the upstream microbenchmark (96.155% / 98.678% cosine); their 1 GiB
+  CUDA-graph allowance bump was deliberately not taken (it would evict the INT8 168K profile).
+  Method and measurements in [docs/udp-fork-comparison.md](docs/udp-fork-comparison.md).
 
 ## Known limits on the RTX 4090
 

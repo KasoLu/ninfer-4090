@@ -78,3 +78,37 @@ Open questions before switching production KV dtype:
 - MTP acceptance under E8 KV at depth is unmeasured (shallow decode only).
 - Their bench matrix was Windows/CUDA 13.3; our numbers here are the Linux
   container stack.
+
+## Port results (2026-08-17)
+
+All six KV commits are merged onto `rtx4090-port` (`7c2ce91e..ec56f922` plus the
+`2619adf7` request-log name fix). Merge notes:
+
+- Their mode machinery never overlaps the `ce50e995` retune except at kernel
+  signatures: fill kernels, staging lambda, and Q-quant loop hooks all landed
+  automatically; every hook site was diffed against their tip. The ops layer is
+  byte-identical to their branch except `gqa_attention_prefill_i8.cuh` (retune +
+  modes interleaved) and the restored `int8-group64` request-log name.
+- Their 1 GiB CUDA-graph allowance bump (`layouts_impl.h`) was NOT taken: with our
+  allowances the INT8 172032 profile still loads (136 MiB slack); with theirs it
+  cannot. No graph-allowance errors appeared in any E8 run.
+- Upstream bug found: their `kv_cache_name` rename to "int8" breaks
+  `test_request_log`, invisible on their side because the Windows flow never runs
+  ctest. `ninfer_test_e8_codec` builds but is not registered with ctest.
+- `ninfer_state_store_test` failed once under `ctest -j8` (GPU contention with the
+  new codec test); serial and isolated runs pass 84/84 consistently.
+
+Measured on the merged branch (same probes as the pre-port eval, same card):
+
+| Mode | Ctx loaded | KV runtime / slack | NIAH | 5-needle @118k | Code detail @168k | Prefill t/s | Decode | MTP acc @111k |
+|---|---:|---|---|---|---|---|---:|---:|
+| `int8` | 172032 | 6.31 / 0.13 GiB | 59k, 118k pass | - | - | 1869 @59k / 1604 @118k | 134.2 | 78.4% |
+| `rk4v4-e8` | 262144 | 5.08 / 1.37 GiB | 59k-260k all pass | 5/5 | 3/3 | 1846 / 1575 / 1347 @189k / 1172 @260k | 126.6 | 78.8% |
+| `rk2v4-e8` | 262144 | 4.01 / 2.43 GiB | 260k pass | 5/5 | 3/3 | 1059 @260k | 120.5 | - |
+
+The retune carries into E8: at matched depth the merged branch beats their branch by
++2.6% @59k growing to +7.7% @189k on rk4v4-e8 prefill. E8 keys cost nothing in MTP
+acceptance at depth. **Deployed config since 2026-08-17: `rk4v4-e8` at the full
+native 262,144 context** - the 24 GB card now serves the same context window as the
+32 GB 5090. `rk2v4-e8` adds slack, not context (262,144 is the model's own limit);
+it stays available for a future vision-plus-long-context profile.
