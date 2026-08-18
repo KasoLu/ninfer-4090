@@ -113,6 +113,15 @@ NINFER_MODEL_DIR="$PWD/models" bash scripts/download-qwen38.sh
 
 Then start one of the three profiles. The API is available at `http://127.0.0.1:8080/v1`.
 
+All three profiles run one generation slot. Extra requests wait in the admission
+queue, and the queue deadline defaults to 30 seconds. A deep prefill can hold the
+slot longer than that, so parallel agent clients would fail with
+`request_queue_timeout`. The `--pending-timeout-ms 600000` line raises the
+deadline to 10 minutes. On a streaming request the timeout arrives as an in-band
+SSE error event after HTTP 200; a client that does not parse error events sees a
+stream that ends without a `finish_reason`. See [docs/serving.md](docs/serving.md)
+for the full queue contract.
+
 ### Text-only, full 262K native context (E8 4-bit KV, default)
 
 The E8 Conway-Sloane lattice KV mode (`rk4v4-e8`, ported from
@@ -128,6 +137,7 @@ docker run --rm --gpus all --publish 8080:8080 \
   --host 0.0.0.0 --port 8080 \
   --max-context 262144 --kv-capacity 262144 \
   --max-concurrency 1 --max-pending-requests 16 \
+  --pending-timeout-ms 600000 \
   --prefill-chunk 1024 --kv-dtype rk4v4-e8 \
   --spec mtp --draft-tokens 3 --lm-head-draft \
   --preserve-thinking
@@ -148,6 +158,7 @@ docker run --rm --gpus all --publish 8080:8080 \
   --host 0.0.0.0 --port 8080 \
   --max-context 172032 --kv-capacity 172032 \
   --max-concurrency 1 --max-pending-requests 16 \
+  --pending-timeout-ms 600000 \
   --prefill-chunk 1024 --kv-dtype int8 \
   --spec mtp --draft-tokens 3 --lm-head-draft \
   --preserve-thinking
@@ -163,6 +174,7 @@ docker run --rm --gpus all --publish 8080:8080 \
   --host 0.0.0.0 --port 8080 \
   --max-context 98304 --kv-capacity 98304 \
   --max-concurrency 1 --max-pending-requests 16 \
+  --pending-timeout-ms 600000 \
   --prefill-chunk 1024 --kv-dtype int8 \
   --spec mtp --draft-tokens 3 --lm-head-draft \
   --vision --preserve-thinking
