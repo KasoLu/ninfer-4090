@@ -112,3 +112,41 @@ acceptance at depth. **Deployed config since 2026-08-17: `rk4v4-e8` at the full
 native 262,144 context** - the 24 GB card now serves the same context window as the
 32 GB 5090. `rk2v4-e8` adds slack, not context (262,144 is the model's own limit);
 it stays available for a future vision-plus-long-context profile.
+
+## Second wave (their 2026-08-18 evening push, assessed 2026-08-18)
+
+Sixteen commits (`0a925796..6d3fd165`), all with claimed bit-exact parity and a
+green 84/84 suite on their side. Disposition per group:
+
+- **`--vision-max-tokens` (6d3fd165): ported.** The vision scratchpad drops from a
+  hardcoded 32768 tokens to a configurable default of 8192 and frees about 1.5 GiB.
+  Cherry-picked clean. Their commit leaves the processor budget
+  (`max_vision_tokens`, still 32768) out of sync with the shrunken workspace: a
+  request with 8K-32K image tokens passes the budget check and reaches the
+  undersized encoder. This fork wires the budget to the same limit
+  (`fix(frontend)` follow-up commit), so the failure is a clean
+  `media_budget_exceeded`. With the port, `rk4v4-e8` serves the full native
+  262,144 context with `--vision` at 780 MiB slack - the 208K practical line and
+  the vision-against-context tradeoff are gone.
+- **CUDA-graph allowance tightening (c85db47a): skipped.** They replace their old
+  1 GiB SM86/SM89 per-lane padding with flat 64 MiB (ordinary) / 256-320 MiB (MTP)
+  allowances. This branch already carries the per-topology-class accounting, which
+  measures 8 MiB / 86 MiB for the same profiles - tighter than their new flat
+  values. Their commit is a catch-up, not a win.
+- **Causal-tile partitioned prefill attention (c5f70526): re-evaluate as a
+  project.** Claimed 76 to 56-64 microseconds on their non-retuned kernel via
+  branchless interior tiles, specialized full/partial `cp.async` staging, and
+  shift-based paged offsets. The idea is orthogonal to this fork's
+  fp16-accumulate retune and could compose, but both sides rewrote
+  `gqa_attention_prefill_i8.cuh`, so this is a re-implementation inside the
+  retuned kernel, not a cherry-pick. Potential 5-11% end-to-end prefill at depth.
+- **Q4/Q5/Q6/W8 dequantization micro-optimizations (73f3d7be, 8f298555, b8ddda48,
+  d9d701bc): bench before adopting.** PTX `bfe.s32` extraction, warp-shuffle code
+  distribution against bank conflicts, and address hoisting on the GEMMs that
+  carry 60-75% of prefill time. The ops layer was byte-identical before this
+  wave, so these should cherry-pick clean.
+- **GDN / conv1d / 2D-memcpy decode-tail work (52fc4aec, fa629318, b860bd5f,
+  fa767237, d520f7bf, cf586d09, 4d79043e): low priority.** Decode on this card
+  measures bandwidth-saturated end to end; expected gain is 1-3%.
+- **Windows WDDM/D3D12 residency and MSVC flags (a35acf6a, aa8a1c98): not
+  applicable.** All `_WIN32`-guarded.

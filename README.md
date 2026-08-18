@@ -164,7 +164,12 @@ docker run --rm --gpus all --publish 8080:8080 \
   --preserve-thinking
 ```
 
-### With vision, 96K context
+### With vision, full 262K context (E8 4-bit KV)
+
+The vision scratchpad defaults to 8192 tokens (`--vision-max-tokens`, ported from
+the same fork as the E8 KV modes) instead of the former hardcoded 32768. The
+smaller scratchpad frees about 1.5 GiB, so the full native context fits next to
+vision on 4-bit keys:
 
 ```bash
 docker run --rm --gpus all --publish 8080:8080 \
@@ -172,13 +177,21 @@ docker run --rm --gpus all --publish 8080:8080 \
   ninfer-4090:sm89 \
   ninfer-serve models/qwen3_8_27b.ninfer \
   --host 0.0.0.0 --port 8080 \
-  --max-context 98304 --kv-capacity 98304 \
+  --max-context 262144 --kv-capacity 262144 \
   --max-concurrency 1 --max-pending-requests 16 \
   --pending-timeout-ms 600000 \
-  --prefill-chunk 1024 --kv-dtype int8 \
+  --prefill-chunk 1024 --kv-dtype rk4v4-e8 \
   --spec mtp --draft-tokens 3 --lm-head-draft \
   --vision --preserve-thinking
 ```
+
+The scratchpad bounds the image tokens per request, not the conversation depth:
+a 51K-token conversation with an attached image completes normally. One
+1024x1024 image costs 1026 vision tokens, so the default fits about seven
+maximum-size images per request. The server rejects a request over the limit
+with `media_budget_exceeded` before the request reaches the encoder. For dense
+video workloads, raise the limit with `--vision-max-tokens`. Each additional
+1024 tokens of scratchpad costs about 62 MiB of VRAM.
 
 ### The tradeoff
 
@@ -189,17 +202,19 @@ KV precision, vision, and maximum context trade against each other on a 24 GB ca
 | Text-only, MTP3 | `rk4v4-e8` | 262144 (256K) | 5.08 GiB | 1.37 GiB |
 | Text-only, MTP3 | `rk2v4-e8` | 262144 (256K) | 4.01 GiB | 2.43 GiB |
 | Text-only, MTP3 | `int8` | 172032 (168K) | 6.31 GiB | 136 MiB |
-| With `--vision`, MTP3 | `rk2v4-e8` | 262144 (256K) | 5.85 GiB | 329 MiB |
-| With `--vision`, MTP3 | `rk4v4-e8` | 212992 (208K) | 6.06 GiB | 108 MiB |
-| With `--vision`, MTP3 | `int8` | 98304 (96K) | - | ~1 GiB |
+| With `--vision`, MTP3 | `rk4v4-e8` | 262144 (256K) | 5.41 GiB | 780 MiB |
+| With `--vision` (32K scratchpad), MTP3 | `rk2v4-e8` | 262144 (256K) | 5.85 GiB | 329 MiB |
+| With `--vision` (32K scratchpad), MTP3 | `rk4v4-e8` | 212992 (208K) | 6.06 GiB | 108 MiB |
+| With `--vision` (32K scratchpad), MTP3 | `int8` | 98304 (96K) | - | ~1 GiB |
 
 262,144 is the model's own context limit, so `rk2v4-e8` (2-bit keys, 96.2% cosine)
 buys no additional context over `rk4v4-e8` in the text-only profile - only slack.
-That slack is what pays for vision: the E8 modes dissolve most of the old
-vision-against-context tradeoff. Vision costs about 2.1 GiB (1.83 GiB of runtime
-buffers plus a 0.28 GiB tower), which INT8 could only afford at 96K. With 2-bit
-keys the full native 262,144 fits alongside vision; with 4-bit keys the measured
-ceiling is 219008 (1.5 MiB slack), so 212992 is the practical line. Both vision
+That slack is what pays for vision. With the former hardcoded 32,768-token vision
+scratchpad, vision cost about 2.1 GiB (1.83 GiB of runtime buffers plus a
+0.28 GiB tower): INT8 could only afford it at 96K, 4-bit keys topped out at
+212992, and only 2-bit keys fit the full 262,144. The default 8192-token
+scratchpad cuts the cost to about 0.6 GiB, and the full native 262,144 now fits
+alongside vision on 4-bit keys with 780 MiB of slack. The vision
 modes answer a two-swatch color oracle exactly at temperature 0, including with
 the image buried under 52,700 tokens of text on `rk2v4-e8`. `rk2v4-e8` also passes
 the text retrieval gates (single-needle at 260K, 5-needle at 118K, exact code
@@ -246,6 +261,10 @@ GCC 13, and CMake 3.28 or newer; the Docker image builds with CUDA 13.1.
   bit-exactly against the upstream microbenchmark (96.155% / 98.678% cosine); their 1 GiB
   CUDA-graph allowance bump was deliberately not taken (it would evict the INT8 168K profile).
   Method and measurements in [docs/udp-fork-comparison.md](docs/udp-fork-comparison.md).
+- **Configurable vision scratchpad (ported).** `--vision-max-tokens` comes from the same fork
+  and sizes the vision encode workspace (default 8192 tokens, formerly hardcoded 32768). This
+  fork additionally wires the processor media budget to the same limit, so an over-limit
+  request fails as `media_budget_exceeded` instead of reaching an undersized encoder.
 
 ## Known limits on the RTX 4090
 
