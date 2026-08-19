@@ -92,6 +92,17 @@ public:
         return engine_->sampling_defaults();
     }
 
+    [[nodiscard]] ninfer::SlotSaveResult slot_save(std::uint32_t slot, const std::string& path) {
+        return engine_->save_slot(slot, path);
+    }
+
+    [[nodiscard]] ninfer::SlotRestoreResult slot_restore(std::uint32_t slot,
+                                                         const std::string& path) {
+        return engine_->restore_slot(slot, path);
+    }
+
+    std::uint32_t slot_erase(std::uint32_t slot) { return engine_->erase_slot(slot); }
+
     [[nodiscard]] PreparedRequest prepare(const GenerationRequest& req,
                                           std::function<bool()> is_cancelled = {}) const;
     [[nodiscard]] int count_prompt_tokens(const GenerationRequest& req,

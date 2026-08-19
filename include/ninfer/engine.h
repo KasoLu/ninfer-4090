@@ -3,7 +3,9 @@
 #include "ninfer/types.h"
 
 #include <chrono>
+#include <cstdint>
 #include <memory>
+#include <string>
 
 namespace ninfer {
 
@@ -90,6 +92,15 @@ public:
     [[nodiscard]] MemorySummary memory_summary() const;
     [[nodiscard]] RuntimeStats runtime_stats() const;
     void reset_memory_peaks() noexcept;
+
+    // Session persistence for one Engine lane ("slot"). save_slot writes the lane's retained
+    // session to `path`; restore_slot rebuilds a lane from a saved file, evicting whatever the
+    // lane retained; erase_slot evicts the lane's retained session and reports its depth. A
+    // busy lane raises RequestError(Overloaded); incompatible or missing files raise
+    // std::invalid_argument. GPU work runs at a request boundary; file I/O runs outside it.
+    [[nodiscard]] SlotSaveResult save_slot(std::uint32_t lane, const std::string& path);
+    [[nodiscard]] SlotRestoreResult restore_slot(std::uint32_t lane, const std::string& path);
+    std::uint32_t erase_slot(std::uint32_t lane);
 
 private:
     class Impl;

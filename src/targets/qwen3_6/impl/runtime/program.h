@@ -21,6 +21,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <string_view>
 #include <vector>
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
@@ -219,6 +220,12 @@ public:
     void abort_lane(std::uint32_t lane) noexcept;
     [[nodiscard]] bool has_retained_lane(std::uint32_t lane) const noexcept;
     void evict_retained_lane(std::uint32_t lane) noexcept;
+    [[nodiscard]] std::uint32_t retained_lane_depth(std::uint32_t lane) const noexcept;
+    [[nodiscard]] qwen3_6::RetainedSessionSnapshot
+    save_retained_lane(std::uint32_t lane, std::string_view model_binding);
+    [[nodiscard]] std::uint32_t restore_retained_lane(std::uint32_t lane,
+                                                      std::span<const std::uint8_t> snapshot,
+                                                      std::string_view model_binding);
     [[nodiscard]] GenerationTimings generation_timings_lane(std::uint32_t lane) const noexcept;
     [[nodiscard]] SpeculativeStats speculative_stats_lane(std::uint32_t lane) const noexcept;
 

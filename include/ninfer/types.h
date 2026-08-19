@@ -416,6 +416,20 @@ struct RuntimeStats {
     std::uint32_t waiting_requests      = 0;
 };
 
+// Session persistence outcomes. Tokens count the resident session depth moved; bytes count the
+// snapshot file payload on disk.
+struct SlotSaveResult {
+    std::uint32_t tokens = 0;
+    std::uint64_t bytes  = 0;
+    double seconds       = 0.0;
+};
+
+struct SlotRestoreResult {
+    std::uint32_t tokens = 0;
+    std::uint64_t bytes  = 0;
+    double seconds       = 0.0;
+};
+
 struct LoadSummary {
     std::string target;
     std::string model_id;

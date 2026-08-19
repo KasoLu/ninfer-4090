@@ -214,6 +214,24 @@ void Program<Variant>::evict_retained_lane(std::uint32_t lane) noexcept {
 }
 
 template <>
+std::uint32_t Program<Variant>::retained_lane_depth(std::uint32_t lane) const noexcept {
+    return impl_->retained_lane_depth(lane);
+}
+
+template <>
+RetainedSessionSnapshot Program<Variant>::save_retained_lane(std::uint32_t lane,
+                                                             std::string_view model_binding) {
+    return impl_->save_retained_lane(lane, model_binding);
+}
+
+template <>
+std::uint32_t Program<Variant>::restore_retained_lane(std::uint32_t lane,
+                                                      std::span<const std::uint8_t> snapshot,
+                                                      std::string_view model_binding) {
+    return impl_->restore_retained_lane(lane, snapshot, model_binding);
+}
+
+template <>
 GenerationTimings Program<Variant>::generation_timings_lane(std::uint32_t lane) const noexcept {
     return impl_->generation_timings_lane(lane);
 }

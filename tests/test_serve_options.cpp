@@ -35,6 +35,8 @@ int main() {
     failures += check(!defaults.enable_vision, "Vision is not disabled by default");
     failures += check(defaults.request_log_jsonl.empty(),
                       "request JSONL logging is not disabled by default");
+    failures += check(defaults.slot_save_path.empty(),
+                      "slot persistence is not disabled by default");
     failures += check(defaults.log_stats_interval_ms == 5000,
                       "periodic throughput interval default mismatch");
     failures += check(defaults.kv_capacity.mode == ninfer::KvCapacityMode::Explicit &&
@@ -216,6 +218,14 @@ int main() {
     failures +=
         check(serve_usage_text("ninfer-serve").find("--request-log-jsonl") != std::string::npos,
               "serve help omits --request-log-jsonl");
+
+    const ServeOptions slots =
+        parse({"ninfer-serve", "model.ninfer", "--slot-save-path", "/var/lib/ninfer/slots"});
+    failures += check(slots.slot_save_path == "/var/lib/ninfer/slots",
+                      "--slot-save-path did not preserve its directory");
+    failures +=
+        check(serve_usage_text("ninfer-serve").find("--slot-save-path") != std::string::npos,
+              "serve help omits --slot-save-path");
     bool secret_present    = false;
     bool redaction_present = false;
     for (const std::string& argument : logged.startup_argv) {

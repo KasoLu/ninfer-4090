@@ -380,6 +380,7 @@ std::string format_server_start_json(
                               {"cors_enabled", options.enable_cors},
                               {"max_request_bytes", options.max_request_bytes},
                               {"request_log_jsonl", options.request_log_jsonl},
+                              {"slot_save_path", options.slot_save_path},
                               {"default_output_tokens", options.default_max_tokens},
                               {"default_thinking", options.enable_thinking},
                               {"default_preserve_thinking", options.preserve_thinking}};

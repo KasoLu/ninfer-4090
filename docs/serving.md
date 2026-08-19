@@ -53,6 +53,29 @@ cannot be combined with `--vision`. A later request cannot enable a capability o
 | `GET /v1/responses/{id}/input_items` | list that Response's normalized input Items |
 | `POST /v1/messages` | Anthropic-style message generation |
 | `POST /v1/messages/count_tokens` | checkpoint-native expanded input-token count |
+| `GET /slots` | llama.cpp-shaped slot table for scrapers |
+| `POST /slots/{id}?action=save\|restore\|erase` | session persistence; requires `--slot-save-path` |
+
+### Session persistence
+
+`--slot-save-path DIR` enables llama.cpp-compatible slot persistence. `save` writes slot
+`{id}`'s complete resident session - paged Text and MTP KV in logical page order, GDN
+linear-attention state, the MTP tail hidden, the turn checkpoint, and the resident prefix
+identity - to `DIR/filename` from a `{"filename": NAME}` body; `restore` rebuilds the slot
+from such a file (evicting whatever it retained); `erase` evicts the slot and reports its
+depth. Names are one conservative path component: 1-128 bytes of `[A-Za-z0-9._-]` with no
+leading dot.
+
+A restored slot is indistinguishable from one the engine retained itself: a request that
+extends the saved conversation reuses the cache (`AppendAtFrontier`, or the saved turn
+checkpoint on a rewritten last turn) instead of re-prefilling, across server restarts. The
+device round trip runs at a request boundary while file I/O stays outside the GPU lock; a
+slot with an active request answers 409. Snapshots bind to the exact weights identity, KV
+dtype/geometry, and speculative configuration, and restore refuses anything mismatched.
+Sizing: roughly the configured KV bytes per token times session depth, plus a fixed GDN
+state block (about 300 MiB with a held turn checkpoint on Qwen3.8-27B); a 6.9k-token
+session measures 416 MiB, saving in ~0.24 s and restoring in ~0.12 s on NVMe. The DFlash
+backend is not supported.
 
 ## OpenAI Chat Completions
 
@@ -428,6 +451,7 @@ curl http://127.0.0.1:8080/v1/models \
 | `--device N` | CUDA device index | `0` |
 | `--max-request-mib N` | body-size limit before JSON parsing | `384` |
 | `--request-log-jsonl FILE` | append full-precision server/request records | disabled |
+| `--slot-save-path DIR` | enable `/slots/{id}?action=save\|restore\|erase` session persistence into DIR | disabled |
 | `--response-store-max-records N` | maximum locally retained Responses objects | `1024` |
 | `--response-store-max-mib N` | total local Response envelope/Item/context budget | `256` |
 | `--kv-dtype bf16\|int8\|rk8v4\|rk4v4\|rk4v4-e8\|rk2v4-e8` | KV-cache storage; rotated and E8-lattice modes trade key/value precision for capacity | `bf16` |

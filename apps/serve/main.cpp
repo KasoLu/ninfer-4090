@@ -9,6 +9,7 @@
 #include <csignal>
 #include <cstddef>
 #include <exception>
+#include <filesystem>
 #include <iomanip>
 #include <iostream>
 #include <sstream>
@@ -44,6 +45,18 @@ int main(int argc, char** argv) {
         if (options.help_requested) {
             std::cout << ninfer::serve::serve_usage_text(argv[0]);
             return 0;
+        }
+
+        if (!options.slot_save_path.empty()) {
+            std::error_code directory_error;
+            std::filesystem::create_directories(options.slot_save_path, directory_error);
+            if (directory_error ||
+                !std::filesystem::is_directory(options.slot_save_path, directory_error)) {
+                ninfer::serve::write_console_log(ninfer::serve::ConsoleLogLevel::Error,
+                                                 "--slot-save-path is not a usable directory: " +
+                                                     options.slot_save_path);
+                return 1;
+            }
         }
 
         using Clock = std::chrono::steady_clock;

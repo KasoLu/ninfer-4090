@@ -8,6 +8,7 @@
 #include "runtime/engine/request_memory.h"
 #include "runtime/generation/generation_budget.h"
 #include "targets/qwen3_6/export/ninfer/targets/qwen3_6/frontend.h"
+#include "targets/qwen3_6/export/ninfer/targets/qwen3_6/runtime.h"
 
 #include <algorithm>
 #include <array>
@@ -24,6 +25,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -198,7 +200,52 @@ public:
         } catch (...) {}
     }
 
+    // Session persistence entry points. Each claims the execution mutex, so GPU copies land at
+    // a request boundary; the worker resumes as soon as the device round trip completes. A lane
+    // with an active request is refused rather than drained.
+    [[nodiscard]] targets::qwen3_6::RetainedSessionSnapshot
+    save_retained_lane(std::uint32_t lane, std::string_view model_binding) {
+        std::scoped_lock lock(execution_mutex_);
+        require_idle_lane(lane);
+        return instance_.program->save_retained_lane(lane, model_binding);
+    }
+
+    [[nodiscard]] std::uint32_t restore_retained_lane(std::uint32_t lane,
+                                                      std::span<const std::uint8_t> snapshot,
+                                                      std::string_view model_binding) {
+        std::scoped_lock lock(execution_mutex_);
+        require_idle_lane(lane);
+        if (instance_.program->has_retained_lane(lane)) {
+            instance_.program->evict_retained_lane(lane);
+            invalidate_lane_plans(lane);
+        }
+        const std::uint32_t tokens =
+            instance_.program->restore_retained_lane(lane, snapshot, model_binding);
+        invalidate_lane_plans(lane);
+        return tokens;
+    }
+
+    std::uint32_t erase_retained_lane(std::uint32_t lane) {
+        std::scoped_lock lock(execution_mutex_);
+        require_idle_lane(lane);
+        const std::uint32_t tokens = instance_.program->retained_lane_depth(lane);
+        if (instance_.program->has_retained_lane(lane)) {
+            instance_.program->evict_retained_lane(lane);
+            invalidate_lane_plans(lane);
+        }
+        return tokens;
+    }
+
 private:
+    void require_idle_lane(std::uint32_t lane) const {
+        if (lane >= max_concurrency_) {
+            throw std::invalid_argument("slot id is outside the Engine lane count");
+        }
+        if (slots_[lane] != nullptr) {
+            throw RequestError(RequestErrorKind::Overloaded, "slot is processing a request");
+        }
+    }
+
     void publish_runtime_stats() {
         RuntimeStats snapshot = cumulative_stats_;
         {
