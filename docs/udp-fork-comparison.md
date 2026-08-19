@@ -141,10 +141,27 @@ green 84/84 suite on their side. Disposition per group:
   `gqa_attention_prefill_i8.cuh`, so this is a re-implementation inside the
   retuned kernel, not a cherry-pick. Potential 5-11% end-to-end prefill at depth.
 - **Q4/Q5/Q6/W8 dequantization micro-optimizations (73f3d7be, 8f298555, b8ddda48,
-  d9d701bc): bench before adopting.** PTX `bfe.s32` extraction, warp-shuffle code
-  distribution against bank conflicts, and address hoisting on the GEMMs that
-  carry 60-75% of prefill time. The ops layer was byte-identical before this
-  wave, so these should cherry-pick clean.
+  d9d701bc): rejected on measurement (2026-08-19).** All four cherry-pick clean
+  and pass the 84-test suite, but on this Linux CUDA 13.1.2 `sm_89` build they
+  regress the Q4/Q5 MMA rowsplit path hard. Measured medians at T=1024
+  (`ninfer_q5_linear_add_bench --k 17408`, `ninfer_q4_linear_swiglu_bench`,
+  suite shapes):
+
+  | State | Q5 down k=17408 | Fused Q4 swiglu |
+  |---|---:|---:|
+  | pre-wave baseline | 1494.9 us (122.1 TFLOP/s) | 3166.2 us (115.3 TFLOP/s) |
+  | + 73f3d7be (Q4/Q5 hoist) | 1631.2 us (-9.1%) | 3436.5 us (-8.5%) |
+  | + 8f298555, b8ddda48 | 1618.9 us (flat) | 3394.6 us (flat) |
+  | + d9d701bc (shuffle) | 2281.5 us (**-52.6%**) | 3123.1 us (+1.4% net) |
+
+  The suite confirms the pattern on production shapes: `gdn_output_gate` Q5
+  -38 to -49%, `draft_head` Q4 -5 to -9%, vision Q4/Q5 projections -13 to -54%,
+  Q6/W8 and every small-T SIMT path neutral. The only net winner is the fused
+  swiglu at +1.4% (~0.5% end-to-end), and it is inseparable from the losses
+  without splitting the shared decode atoms per kernel. Suspected cause of the
+  mismatch with their results: their WDDM and MSVC commits indicate a Windows
+  toolchain, and the shuffle and `bfe.s32` patterns compile to different SASS
+  there. The picks were dropped from this branch after the bisect.
 - **GDN / conv1d / 2D-memcpy decode-tail work (52fc4aec, fa629318, b860bd5f,
   fa767237, d520f7bf, cf586d09, 4d79043e): low priority.** Decode on this card
   measures bandwidth-saturated end to end; expected gain is 1-3%.
