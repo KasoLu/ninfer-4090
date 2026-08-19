@@ -70,7 +70,7 @@ std::string serve_usage_text(const char* argv0) {
            " <model.ninfer> [--host H] [--port N] [--api-key KEY] "
            "[--model-id ID] [--max-context N] [--kv-capacity N|auto] [--max-concurrency N] "
            "[--max-pending-requests N] [--pending-timeout-ms N] "
-           "[--prefill-chunk N] [--log-stats-interval-ms N] [--device N] "
+           "[--prefill-chunk N] [--turn-checkpoints N] [--log-stats-interval-ms N] [--device N] "
            "[--max-request-mib N] [--request-log-jsonl FILE] [--slot-save-path DIR] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
            "[--kv-dtype bf16|int8|rk8v4|rk4v4|rk4v4-e8|rk2v4-e8] [--spec mtp|dflash --draft-tokens N] "
@@ -88,6 +88,9 @@ std::string serve_usage_text(const char* argv0) {
            "       --slot-save-path enables llama.cpp-style session persistence: POST "
            "/slots/{id}?action=save|restore|erase with {\"filename\": NAME} moves one idle "
            "slot's resident session to or from DIR (disabled when omitted)\n"
+           "       --turn-checkpoints retains N host turn checkpoints per slot so a prompt "
+           "that diverges mid-history re-prefills from the nearest checkpoint instead of from "
+           "zero (0 disables; each entry holds the full GDN state image in host memory)\n"
            "       --model-id overrides the artifact identity.model_id reported by the server\n"
            "       Responses state is process-local and bounded to 1024 records / 256 MiB by "
            "default\n"
@@ -160,6 +163,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--prefill-chunk") {
             options.prefill_chunk = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--prefill-chunk"), "prefill-chunk"));
+        } else if (arg == "--turn-checkpoints") {
+            options.turn_checkpoint_ring = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--turn-checkpoints"), "turn-checkpoints"));
         } else if (arg == "--log-stats-interval-ms") {
             options.log_stats_interval_ms = static_cast<std::uint32_t>(parse_nonnegative_int(
                 require_value("--log-stats-interval-ms"), "log-stats-interval-ms"));

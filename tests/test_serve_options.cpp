@@ -37,6 +37,12 @@ int main() {
                       "request JSONL logging is not disabled by default");
     failures += check(defaults.slot_save_path.empty(),
                       "slot persistence is not disabled by default");
+    failures += check(defaults.turn_checkpoint_ring == 0,
+                      "turn checkpoint ring is not disabled by default");
+
+    const ServeOptions ring =
+        parse({"ninfer-serve", "model.ninfer", "--turn-checkpoints", "8"});
+    failures += check(ring.turn_checkpoint_ring == 8, "--turn-checkpoints was not applied");
     failures += check(defaults.log_stats_interval_ms == 5000,
                       "periodic throughput interval default mismatch");
     failures += check(defaults.kv_capacity.mode == ninfer::KvCapacityMode::Explicit &&

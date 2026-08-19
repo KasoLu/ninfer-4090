@@ -309,10 +309,16 @@ void HttpServer::register_routes() {
         for (std::uint32_t i = 0; i < options_.max_concurrency; ++i) {
             const ninfer::SlotState state =
                 i < states.size() ? states[i] : ninfer::SlotState{};
+            nlohmann::json checkpoints = nlohmann::json::array();
+            for (const ninfer::SlotCheckpoint& checkpoint : state.checkpoints) {
+                checkpoints.push_back({{"frontier", checkpoint.frontier},
+                                       {"session_digest", checkpoint.session_digest}});
+            }
             slots.push_back({{"id", i},
                              {"is_processing", state.processing},
                              {"retained", state.retained},
                              {"session_digest", state.session_digest},
+                             {"checkpoints", std::move(checkpoints)},
                              {"n_ctx", options_.max_context},
                              {"n_prompt_tokens", state.prompt_tokens},
                              {"n_prompt_tokens_cache", state.cached_tokens},
