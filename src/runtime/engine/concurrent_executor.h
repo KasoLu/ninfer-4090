@@ -225,7 +225,9 @@ public:
         const std::uint32_t tokens =
             instance_.program->restore_retained_lane(lane, snapshot, model_binding);
         invalidate_lane_plans(lane);
-        return {tokens, instance_.program->retained_lane_digest(lane)};
+        retained_digest_cache_[lane] = instance_.program->retained_lane_digest(lane);
+        publish_runtime_stats();
+        return {tokens, retained_digest_cache_[lane]};
     }
 
     std::uint32_t erase_retained_lane(std::uint32_t lane, std::string_view expected_digest) {
@@ -236,29 +238,19 @@ public:
         if (instance_.program->has_retained_lane(lane)) {
             instance_.program->evict_retained_lane(lane);
             invalidate_lane_plans(lane);
+            publish_runtime_stats();
         }
         return tokens;
     }
 
-    // Truthful per-lane occupancy read at a request boundary: an active request's prompt size,
-    // or the retained session's depth and identifying digest.
+    // Truthful per-lane occupancy: an active request's prompt size, or the retained session's
+    // depth and identifying digest. Served from the snapshot the worker publishes at every unit
+    // boundary - the execution mutex is held nearly continuously while a request runs, so a
+    // scraper that waited on it would starve for the length of a deep prefill.
     [[nodiscard]] std::vector<SlotState> slot_states() const {
-        std::scoped_lock lock(execution_mutex_);
-        std::vector<SlotState> states(max_concurrency_);
-        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
-            SlotState& state    = states[lane];
-            const auto& request = slots_[lane];
-            if (request != nullptr) {
-                state.processing    = true;
-                state.prompt_tokens = request->prompt_summary.prompt_tokens;
-                if (request->begin) { state.cached_tokens = request->begin->reused_prompt_tokens; }
-            } else if (instance_.program->has_retained_lane(lane)) {
-                state.retained       = true;
-                state.prompt_tokens  = instance_.program->retained_lane_depth(lane);
-                state.cached_tokens  = state.prompt_tokens;
-                state.session_digest = instance_.program->retained_lane_digest(lane);
-            }
-        }
+        std::lock_guard lock(stats_mutex_);
+        std::vector<SlotState> states = published_slots_;
+        states.resize(max_concurrency_);
         return states;
     }
 
@@ -291,8 +283,28 @@ private:
             ++snapshot.running_requests;
             if (slots_[lane]->decode_ready) { ++snapshot.decode_ready_requests; }
         }
+
+        // Per-lane occupancy for /slots-style readers. Digests come from the cache the
+        // completion and restore paths maintain, so publishing costs no ledger hashing.
+        std::vector<SlotState> slot_snapshot(max_concurrency_);
+        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+            SlotState& state    = slot_snapshot[lane];
+            const auto& request = slots_[lane];
+            if (request != nullptr) {
+                state.processing    = true;
+                state.prompt_tokens = request->prompt_summary.prompt_tokens;
+                if (request->begin) { state.cached_tokens = request->begin->reused_prompt_tokens; }
+            } else if (instance_.program->has_retained_lane(lane)) {
+                state.retained       = true;
+                state.prompt_tokens  = instance_.program->retained_lane_depth(lane);
+                state.cached_tokens  = state.prompt_tokens;
+                state.session_digest = retained_digest_cache_[lane];
+            }
+        }
+
         std::lock_guard lock(stats_mutex_);
         published_stats_ = snapshot;
+        published_slots_ = std::move(slot_snapshot);
     }
 
     GenerationResult wait_for_request(std::shared_ptr<Request> request, OutputSink* sink,
@@ -524,6 +536,9 @@ private:
             result.slot        = static_cast<std::int32_t>(*request->lane);
             // Empty unless the lane retained the finished session (aborts and cancels clear it).
             result.session_digest = instance_.program->retained_lane_digest(*request->lane);
+            // Completion and restore are the only paths that make a lane retained, so keeping
+            // the cache here means publish_runtime_stats never has to hash a ledger.
+            retained_digest_cache_[*request->lane] = result.session_digest;
         }
         if (request->first_token) {
             result.timings.first_token_seconds =
@@ -1270,6 +1285,10 @@ private:
     std::uint64_t next_protection_epoch_ = 1;
     RuntimeStats cumulative_stats_;
     RuntimeStats published_stats_;
+    std::vector<SlotState> published_slots_;
+    // Digest of each lane's retained session, maintained by the completion and restore paths
+    // (the only ones that set `retained`) so publishing needs no ledger hashing.
+    std::array<std::string, kMaximumConcurrency> retained_digest_cache_{};
     bool stopping_ = false;
     bool failed_   = false;
     std::thread worker_;
