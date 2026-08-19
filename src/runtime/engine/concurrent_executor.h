@@ -48,6 +48,7 @@ public:
           max_outstanding_(static_cast<std::size_t>(options.max_concurrency) +
                            options.max_pending_requests),
           pending_timeout_(std::chrono::milliseconds(options.pending_timeout_ms)),
+          auto_save_evicted_(options.auto_save_evicted),
           admission_capacity_(instance.program->admission_capacity()) {
         if (max_concurrency_ == 0 || max_concurrency_ > kMaximumConcurrency ||
             options.max_pending_requests == 0 || pending_timeout_.count() <= 0) {
@@ -204,27 +205,37 @@ public:
     // a request boundary; the worker resumes as soon as the device round trip completes. A lane
     // with an active request is refused rather than drained. A non-empty expected_digest is a
     // precondition on the lane's resident session, checked atomically with the operation.
+    // session_path is the file the operation targets; a successful save or restore binds the
+    // lane to it so an involuntary eviction can spill the session back (see
+    // spill_retained_lane).
     [[nodiscard]] targets::qwen3_6::RetainedSessionSnapshot
     save_retained_lane(std::uint32_t lane, std::string_view model_binding,
-                       std::string_view expected_digest) {
+                       std::string_view expected_digest, std::string_view session_path = {}) {
         std::scoped_lock lock(execution_mutex_);
         require_idle_lane(lane);
         require_session_digest(lane, expected_digest);
-        return instance_.program->save_retained_lane(lane, model_binding);
+        auto snapshot = instance_.program->save_retained_lane(lane, model_binding);
+        if (!session_path.empty()) { lane_session_path_[lane] = session_path; }
+        return snapshot;
     }
 
     [[nodiscard]] std::pair<std::uint32_t, std::string>
     restore_retained_lane(std::uint32_t lane, std::span<const std::uint8_t> snapshot,
-                          std::string_view model_binding) {
+                          std::string_view model_binding, std::string_view session_path = {}) {
         std::scoped_lock lock(execution_mutex_);
         require_idle_lane(lane);
         if (instance_.program->has_retained_lane(lane)) {
+            // Involuntary for whatever session held the lane: the client asked for a restore,
+            // not for that session's destruction.
+            spill_retained_lane(lane);
             instance_.program->evict_retained_lane(lane);
             invalidate_lane_plans(lane);
         }
+        lane_session_path_[lane].clear();
         const std::uint32_t tokens =
             instance_.program->restore_retained_lane(lane, snapshot, model_binding);
         invalidate_lane_plans(lane);
+        if (!session_path.empty()) { lane_session_path_[lane] = session_path; }
         retained_digest_cache_[lane] = instance_.program->retained_lane_digest(lane);
         retained_checkpoints_cache_[lane] = instance_.program->retained_lane_checkpoints(lane);
         publish_runtime_stats();
@@ -236,12 +247,24 @@ public:
         require_idle_lane(lane);
         require_session_digest(lane, expected_digest);
         const std::uint32_t tokens = instance_.program->retained_lane_depth(lane);
+        // Explicit erase is a deletion request: never auto-save, and drop the binding.
+        lane_session_path_[lane].clear();
         if (instance_.program->has_retained_lane(lane)) {
             instance_.program->evict_retained_lane(lane);
             invalidate_lane_plans(lane);
             publish_runtime_stats();
         }
         return tokens;
+    }
+
+    // Installs the auto-save sink: the model binding save_retained_lane needs, and a consumer
+    // that receives (path, snapshot) for each spilled session and writes the file off-thread.
+    void set_eviction_sink(
+        std::string model_binding,
+        std::function<void(std::string, targets::qwen3_6::RetainedSessionSnapshot&&)> sink) {
+        std::scoped_lock lock(execution_mutex_);
+        eviction_model_binding_ = std::move(model_binding);
+        eviction_sink_          = std::move(sink);
     }
 
     // Truthful per-lane occupancy: an active request's prompt size, or the retained session's
@@ -269,6 +292,24 @@ private:
         if (expected_digest.empty()) { return; }
         if (instance_.program->retained_lane_digest(lane) != expected_digest) {
             throw SlotSessionMismatch("slot session does not match if_digest");
+        }
+    }
+
+    // Best-effort spill of a retained session about to be destroyed involuntarily. The device
+    // snapshot runs on the calling thread (it synchronizes the stream); the file write happens
+    // on the Engine's writer thread through the sink. Only sessions bound to a slot file are
+    // spilled, and a spill failure never blocks the eviction itself.
+    void spill_retained_lane(std::uint32_t lane) noexcept {
+        if (!auto_save_evicted_ || !eviction_sink_ || lane >= kMaximumConcurrency) { return; }
+        if (lane_session_path_[lane].empty() || !instance_.program->has_retained_lane(lane)) {
+            return;
+        }
+        try {
+            auto snapshot = instance_.program->save_retained_lane(lane, eviction_model_binding_);
+            eviction_sink_(lane_session_path_[lane], std::move(snapshot));
+        } catch (...) {
+            // The session was going to be destroyed either way; losing the spill costs the
+            // client one cold prefill, exactly the pre-feature behavior.
         }
     }
 
@@ -890,6 +931,8 @@ private:
                  ++retained_lane) {
                 if (retained_lane != lane && slots_[retained_lane] == nullptr &&
                     instance_.program->has_retained_lane(retained_lane)) {
+                    spill_retained_lane(retained_lane);
+                    lane_session_path_[retained_lane].clear();
                     instance_.program->evict_retained_lane(retained_lane);
                     invalidate_lane_plans(retained_lane);
                 }
@@ -913,6 +956,14 @@ private:
             protection_->temporal_credit -= summary.service_work_quanta;
         }
         clear_protection_if_head(request);
+
+        // Zero reuse means the target takes the FullReset path and destroys whatever session
+        // the lane retained. Spill it first, and start the new session unbound either way so a
+        // later eviction can never write it over the previous session's file.
+        if (summary.reusable_prompt_tokens == 0) {
+            spill_retained_lane(lane);
+            lane_session_path_[lane].clear();
+        }
 
         const bool needs_prefill = summary.reusable_prompt_tokens < summary.prompt_tokens;
         bool target_started      = false;
@@ -1282,6 +1333,7 @@ private:
     const std::uint32_t max_concurrency_;
     const std::size_t max_outstanding_;
     const std::chrono::milliseconds pending_timeout_;
+    const bool auto_save_evicted_;
     const AdmissionResources admission_capacity_;
 
     mutable std::mutex execution_mutex_;
@@ -1303,6 +1355,11 @@ private:
     // (the only ones that set `retained`) so publishing needs no ledger hashing.
     std::array<std::string, kMaximumConcurrency> retained_digest_cache_{};
     std::array<std::vector<SlotCheckpoint>, kMaximumConcurrency> retained_checkpoints_cache_{};
+    // Slot file each lane's resident session was last saved to or restored from; empty means
+    // unbound. Guarded by execution_mutex_ like the lane state it describes.
+    std::array<std::string, kMaximumConcurrency> lane_session_path_{};
+    std::string eviction_model_binding_;
+    std::function<void(std::string, targets::qwen3_6::RetainedSessionSnapshot&&)> eviction_sink_;
     bool stopping_ = false;
     bool failed_   = false;
     std::thread worker_;

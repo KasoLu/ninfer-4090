@@ -2,6 +2,7 @@
 #include "serve/translate.h"
 
 #include <iostream>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -43,6 +44,19 @@ int main() {
     const ServeOptions ring =
         parse({"ninfer-serve", "model.ninfer", "--turn-checkpoints", "8"});
     failures += check(ring.turn_checkpoint_ring == 8, "--turn-checkpoints was not applied");
+    failures += check(!ring.auto_save_evicted, "auto-save-evicted is not disabled by default");
+
+    const ServeOptions auto_save = parse({"ninfer-serve", "model.ninfer", "--slot-save-path",
+                                          "/tmp/slots", "--auto-save-evicted"});
+    failures += check(auto_save.auto_save_evicted, "--auto-save-evicted was not applied");
+    bool auto_save_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--auto-save-evicted"});
+    } catch (const std::invalid_argument&) {
+        auto_save_rejected = true;
+    }
+    failures += check(auto_save_rejected,
+                      "--auto-save-evicted without --slot-save-path was not rejected");
     failures += check(defaults.log_stats_interval_ms == 5000,
                       "periodic throughput interval default mismatch");
     failures += check(defaults.kv_capacity.mode == ninfer::KvCapacityMode::Explicit &&

@@ -306,6 +306,11 @@ GCC 13, and CMake 3.28 or newer; the Docker image builds with CUDA 13.1.
   only when the ring is non-empty, so existing files stay readable everywhere). The
   recommended value is 32. Details in
   [docs/turn-checkpoint-ring.md](docs/turn-checkpoint-ring.md).
+- **Auto-save on eviction.** `--auto-save-evicted` (off by default, requires
+  `--slot-save-path`) spills an involuntarily evicted session - checkpoint ring included -
+  back to the slot file it was last saved to or restored from, before the eviction destroys
+  it. Rotating more sessions than slots then loses nothing: the next restore recovers the
+  session at its latest frontier. Explicit `erase` never auto-saves.
 - **NVFP4-A4 test gating.** The A4 activation tests skip on hardware without FP4 tensor cores
   instead of aborting. The full remaining suite passes on the RTX 4090.
 - **E8 lattice KV quantization (ported).** The `rk8v4`/`rk4v4`/`rk4v4-e8`/`rk2v4-e8` KV modes

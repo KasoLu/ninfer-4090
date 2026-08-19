@@ -131,6 +131,13 @@ more sessions than `--max-concurrency` slots, save each session to disk before i
 loses its slot; the ring returns with the restore. A session evicted without a
 snapshot starts cold and rebuilds its ring one turn per request.
 
+`--auto-save-evicted` closes the remaining gap: before an involuntary eviction
+destroys a retained session, the server spills it (ring included) back to the
+slot file it was last saved to or restored from. Sessions that never touched a
+slot file are not covered, and an explicit `erase` never auto-saves. The device
+snapshot runs on the eviction path and costs a few hundred milliseconds; the
+file write runs on a background thread. Requires `--slot-save-path`.
+
 ## Limits
 
 - The DFlash backend is not supported. Its cyclic local cache mirrors only the

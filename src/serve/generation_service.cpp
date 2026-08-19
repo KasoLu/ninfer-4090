@@ -259,6 +259,20 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
     engine_options.pending_timeout_ms   = options_.pending_timeout_ms;
     engine_options.prefill_chunk        = options_.prefill_chunk;
     engine_options.turn_checkpoint_ring = options_.turn_checkpoint_ring;
+    engine_options.auto_save_evicted    = options_.auto_save_evicted;
+    if (options_.auto_save_evicted) {
+        engine_options.auto_save_listener = [](const ninfer::SlotAutoSaveEvent& event) {
+            if (event.error.empty()) {
+                write_console_log(ConsoleLogLevel::Info,
+                                  "slot auto-save file=" + event.path +
+                                      " n_saved=" + std::to_string(event.tokens) +
+                                      " bytes=" + std::to_string(event.bytes));
+            } else {
+                write_console_log(ConsoleLogLevel::Warning,
+                                  "slot auto-save FAILED file=" + event.path + ": " + event.error);
+            }
+        };
+    }
     engine_options.kv_cache             = options_.kv_cache;
     engine_options.enable_vision        = options_.enable_vision;
     engine_options.vision_max_tokens    = options_.vision_max_tokens;

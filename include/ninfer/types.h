@@ -71,6 +71,16 @@ struct LoadProgress {
     std::function<void(std::string_view phase, std::uint64_t done, std::uint64_t total)> callback;
 };
 
+// Outcome of one background auto-save of an involuntarily evicted session. Delivered on the
+// Engine's writer thread; the listener must be thread-safe.
+struct SlotAutoSaveEvent {
+    std::string path;
+    std::uint32_t tokens = 0;
+    std::size_t bytes    = 0;
+    double seconds       = 0.0;
+    std::string error; // empty on success
+};
+
 struct EngineOptions {
     std::filesystem::path artifact_path;
     int device                         = 0;
@@ -85,6 +95,13 @@ struct EngineOptions {
     // re-prefills from the nearest checkpoint instead of from zero. Host memory cost per entry
     // is the model's full GDN state image (~147 MiB on Qwen3.8-27B).
     std::uint32_t turn_checkpoint_ring = 0;
+    // Before an involuntary eviction destroys a retained session, snapshot it back to the slot
+    // file it was last saved to or restored from (sessions that never touched a slot file are
+    // not covered). The device snapshot runs on the eviction path; the file write runs on a
+    // background writer thread. Explicit erase never auto-saves.
+    bool auto_save_evicted = false;
+    // Optional observer for auto-save outcomes; called on the writer thread.
+    std::function<void(const SlotAutoSaveEvent&)> auto_save_listener;
     KvCacheStorage kv_cache            = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
     bool enable_vision                 = false;

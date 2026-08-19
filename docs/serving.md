@@ -92,6 +92,14 @@ which binaries without ring support keep reading). The restored ring lets a late
 mid-history edit reuse the session; see
 [turn-checkpoint-ring.md](turn-checkpoint-ring.md).
 
+A successful save or restore binds the slot to its file. With `--auto-save-evicted`, an
+involuntary eviction (a fresh session claiming the slot, a restore over it, or a
+KV-pressure eviction) first spills the resident session back to that file, so the client's
+next restore recovers the session at its latest frontier instead of the last explicit
+save. Sessions never saved or restored have no binding and are not spilled; an explicit
+`erase` is a deletion request and never auto-saves. The console reports each spill as
+`slot auto-save file=... n_saved=...`.
+
 ## OpenAI Chat Completions
 
 ```bash
@@ -468,6 +476,7 @@ curl http://127.0.0.1:8080/v1/models \
 | `--request-log-jsonl FILE` | append full-precision server/request records | disabled |
 | `--slot-save-path DIR` | enable `/slots/{id}?action=save\|restore\|erase` session persistence into DIR | disabled |
 | `--turn-checkpoints N` | retained turn checkpoints per slot for mid-history prompt reuse; see [turn-checkpoint-ring.md](turn-checkpoint-ring.md) | `0` |
+| `--auto-save-evicted` | spill an involuntarily evicted session back to its bound slot file; requires `--slot-save-path` | off |
 | `--response-store-max-records N` | maximum locally retained Responses objects | `1024` |
 | `--response-store-max-mib N` | total local Response envelope/Item/context budget | `256` |
 | `--kv-dtype bf16\|int8\|rk8v4\|rk4v4\|rk4v4-e8\|rk2v4-e8` | KV-cache storage; rotated and E8-lattice modes trade key/value precision for capacity | `bf16` |
