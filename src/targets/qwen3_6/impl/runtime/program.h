@@ -288,6 +288,11 @@ public:
     const bool use_cuda_graph;
     const std::uint32_t checkpoint_ring_capacity;
     const std::size_t kv_payload_bytes;
+    const std::size_t text_kv_bytes;
+    const std::size_t mtp_kv_bytes;
+    const std::size_t gdn_state_bytes;
+    const std::size_t dflash_kv_bytes;
+    const std::size_t replay_records_bytes;
     const std::size_t graph_allowance_bytes;
     std::size_t graph_observed_bytes = 0;
     const WorkspacePlan workspace_plan;
