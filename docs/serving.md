@@ -86,6 +86,12 @@ state block (about 300 MiB with a held turn checkpoint on Qwen3.8-27B); a 6.9k-t
 session measures 416 MiB, saving in ~0.24 s and restoring in ~0.12 s on NVMe. The DFlash
 backend is not supported.
 
+When `--turn-checkpoints` is active, a snapshot also carries the slot's checkpoint ring at
+about 147 MiB per entry (format version 2; a snapshot with an empty ring stays version 1,
+which binaries without ring support keep reading). The restored ring lets a later
+mid-history edit reuse the session; see
+[turn-checkpoint-ring.md](turn-checkpoint-ring.md).
+
 ## OpenAI Chat Completions
 
 ```bash
@@ -461,6 +467,7 @@ curl http://127.0.0.1:8080/v1/models \
 | `--max-request-mib N` | body-size limit before JSON parsing | `384` |
 | `--request-log-jsonl FILE` | append full-precision server/request records | disabled |
 | `--slot-save-path DIR` | enable `/slots/{id}?action=save\|restore\|erase` session persistence into DIR | disabled |
+| `--turn-checkpoints N` | retained turn checkpoints per slot for mid-history prompt reuse; see [turn-checkpoint-ring.md](turn-checkpoint-ring.md) | `0` |
 | `--response-store-max-records N` | maximum locally retained Responses objects | `1024` |
 | `--response-store-max-mib N` | total local Response envelope/Item/context budget | `256` |
 | `--kv-dtype bf16\|int8\|rk8v4\|rk4v4\|rk4v4-e8\|rk2v4-e8` | KV-cache storage; rotated and E8-lattice modes trade key/value precision for capacity | `bf16` |

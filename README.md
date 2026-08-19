@@ -121,6 +121,12 @@ decode batched at roughly 1.5x aggregate throughput, each lane keeping its own
 resident prefix. Prefill still serializes across lanes, so a deep cold prefill
 delays the other lane's first token.
 
+Add `--turn-checkpoints 32` when clients edit conversation history (agent memory
+updates, message rewrites, regenerated turns): the server then re-prefills from
+the nearest retained turn boundary instead of from zero. The ring costs host
+memory only, about 4.6 GiB per slot at 32 entries. See
+[docs/turn-checkpoint-ring.md](docs/turn-checkpoint-ring.md).
+
 Extra requests beyond the slots wait in the admission queue, and the queue deadline
 defaults to 30 seconds. A deep prefill can hold a slot longer than that, so
 parallel agent clients would fail with `request_queue_timeout`. The
@@ -290,6 +296,16 @@ GCC 13, and CMake 3.28 or newer; the Docker image builds with CUDA 13.1.
   admission picks the lane whose occupation costs least to replace - an empty lane before any
   retained session, then the shallowest - so a burst request no longer evicts a deep resident
   session while a free lane exists.
+- **Turn checkpoint ring.** `--turn-checkpoints N` (off by default) keeps up to N past turn
+  checkpoints per slot in host memory. A prompt that rewrites the middle of its history -
+  an edited message, an updated agent memory block, a regenerated earlier turn - restores at
+  the deepest checkpoint below the edit instead of re-prefilling from zero; generation after
+  the restore is greedy-identical to a cold prefill. One checkpoint holds the GDN
+  linear-attention state (about 147 MiB of host memory on Qwen3.8-27B); the attention KV
+  needs no copy. Slot snapshots carry the ring across restarts (format version 2, written
+  only when the ring is non-empty, so existing files stay readable everywhere). The
+  recommended value is 32. Details in
+  [docs/turn-checkpoint-ring.md](docs/turn-checkpoint-ring.md).
 - **NVFP4-A4 test gating.** The A4 activation tests skip on hardware without FP4 tensor cores
   instead of aborting. The full remaining suite passes on the RTX 4090.
 - **E8 lattice KV quantization (ported).** The `rk8v4`/`rk4v4`/`rk4v4-e8`/`rk2v4-e8` KV modes
