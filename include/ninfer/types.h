@@ -411,6 +411,10 @@ struct RuntimeStats {
     std::uint64_t computed_prefill_tokens = 0;
     // Tokens committed by decode rounds; the first token emitted by prefill is excluded.
     std::uint64_t committed_decode_tokens = 0;
+    // Cumulative wall time of prefill and decode execution units. Advances with every unit,
+    // so counter scrapers see rates move during a request rather than at its completion.
+    double prefill_seconds_total = 0.0;
+    double decode_seconds_total  = 0.0;
     // Decode batch executions and the sum of their batch sizes.
     std::uint64_t decode_rounds         = 0;
     std::uint64_t decode_row_rounds     = 0;

@@ -753,7 +753,10 @@ private:
         if (request == nullptr || request->decode_ready) {
             throw std::logic_error("staged prefill lane has invalid request state");
         }
+        const auto unit_started       = Clock::now();
         const PrefillStepResult step  = instance_.program->advance_prefill_lane(lane);
+        cumulative_stats_.prefill_seconds_total +=
+            std::chrono::duration<double>(Clock::now() - unit_started).count();
         const bool cancel_at_boundary = request->cancelled.load(std::memory_order_acquire);
         resolve_prefill_step(request, step, cancel_at_boundary);
         publish_runtime_stats();
@@ -930,8 +933,11 @@ private:
             }
             publish_runtime_stats();
             target_started                = true;
+            const auto unit_started       = Clock::now();
             const PrefillStepResult first = instance_.program->start_prefill_lane(
                 lane, std::move(request->prompt), std::move(selected_plan), transient);
+            cumulative_stats_.prefill_seconds_total +=
+                std::chrono::duration<double>(Clock::now() - unit_started).count();
             if (!first.complete && (!prefill_lane_ || *prefill_lane_ != lane)) {
                 throw std::logic_error("partial prefill did not retain its execution owner");
             }
@@ -1098,8 +1104,11 @@ private:
 
     void run_decode_round(const RoundMembership& membership) {
         const std::span<const std::uint32_t> lanes = membership.lane_span();
+        const auto unit_started                    = Clock::now();
         const BatchedGeneratedRound round =
             instance_.program->decode_batch(lanes, membership.budget_span());
+        cumulative_stats_.decode_seconds_total +=
+            std::chrono::duration<double>(Clock::now() - unit_started).count();
 
         std::array<std::uint8_t, kMaximumConcurrency> cancelled{};
         for (std::size_t row = 0; row < lanes.size(); ++row) {
