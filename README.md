@@ -240,6 +240,16 @@ GCC 13, and CMake 3.28 or newer; the Docker image builds with CUDA 13.1.
   (109 to 143 TFLOP/s on the `d256-h24-kv4` INT8 append shape); serve prefill gains 5-7% at
   88K-128K. Needle-in-a-haystack retrieval stays exact at both depths and all 84 suite tests
   pass, which bounds the fp16-accumulation numerics change.
+- **Causal-tile partitioned key-block traversal.** Interior key blocks (wholly below the causal
+  diagonal for the whole CTA tile) run a separate instantiation of the key-block body: KV stages
+  with unconditional copies and the softmax drops its masking selects; boundary blocks keep the
+  exact masked path. The idea comes from the
+  [UDPSendToFailed fork](https://github.com/UDPSendToFailed/ninfer-4090) (c5f70526),
+  re-implemented inside the retuned schedule above. Kernel: 144 to 165 TFLOP/s at 32K-224K
+  context on the INT8 append shape (-12 to -13% latency), register count unchanged, bit-exact.
+  End-to-end this is bounded by the attention wall share of this hybrid-GDN model: about +1%
+  serve prefill at 51K on INT8 KV, within noise on the E8 modes, whose staging time is dominated
+  by lattice decode rather than the removed guards.
 - **`/v1/models` reports `context_window`.** Clients without access to a llama.cpp `/props` or a
   vLLM `max_model_len` can size prompts from the models payload.
 - **`GET /metrics`.** Prometheus counters under llama.cpp-compatible names

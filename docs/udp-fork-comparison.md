@@ -133,13 +133,22 @@ green 84/84 suite on their side. Disposition per group:
   allowances. This branch already carries the per-topology-class accounting, which
   measures 8 MiB / 86 MiB for the same profiles - tighter than their new flat
   values. Their commit is a catch-up, not a win.
-- **Causal-tile partitioned prefill attention (c5f70526): re-evaluate as a
-  project.** Claimed 76 to 56-64 microseconds on their non-retuned kernel via
-  branchless interior tiles, specialized full/partial `cp.async` staging, and
-  shift-based paged offsets. The idea is orthogonal to this fork's
-  fp16-accumulate retune and could compose, but both sides rewrote
-  `gqa_attention_prefill_i8.cuh`, so this is a re-implementation inside the
-  retuned kernel, not a cherry-pick. Potential 5-11% end-to-end prefill at depth.
+- **Causal-tile partitioned prefill attention (c5f70526): ported 2026-08-19
+  (commit 694e01f0), re-implemented inside the retuned kernel.** Our baseline
+  already skipped masking on interior tiles (`full_score_tile`), so their
+  headline could not transfer whole; what did transfer is the structural split:
+  a FullTile-tagged instantiation of the key-block body with unconditional
+  staging, no masking, and no softmax zero-selects, dispatched per block from a
+  precomputed `n_full_blocks`. Their bf16 kernel and common-header changes were
+  taken verbatim (identical base). Measured on the INT8 `d256-h24-kv4` append
+  shape at W=1024: 144 to 165 TFLOP/s at 32K-224K context (-12 to -13%
+  latency), 200 to 171 us shallow, registers stay at 128 with no spills,
+  84/84 tests bit-exact. End-to-end serve prefill: +1.1% at 51K on INT8 KV
+  (attention wall share of the hybrid-GDN model is only ~10% there and the
+  share grows with depth), within noise on the deployed `rk4v4-e8` mode - E8
+  staging time is lattice-decode compute, not the removed guards. The biggest
+  serve-level beneficiary is the INT8-KV 5090 deployment; porting this to
+  ninfer-5090 is queued.
 - **Q4/Q5/Q6/W8 dequantization micro-optimizations (73f3d7be, 8f298555, b8ddda48,
   d9d701bc): rejected on measurement (2026-08-19).** All four cherry-pick clean
   and pass the 84-test suite, but on this Linux CUDA 13.1.2 `sm_89` build they
