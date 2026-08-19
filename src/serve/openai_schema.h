@@ -63,7 +63,7 @@ std::string make_chat_chunk_tool_calls(const std::string& id, const std::string&
 // so proxies can derive per-request rates from the final chunk alone.
 std::string make_chat_chunk_final(const std::string& id, const std::string& model,
                                   std::int64_t created, const char* finish_reason,
-                                  bool include_usage, const CompletionUsage& usage);
+                                  bool include_usage, const CompletionUsage& usage = {});
 // Dedicated usage chunk: `choices: []` with the request's token usage. Emitted
 // only when stream_options.include_usage is true.
 std::string make_chat_chunk_usage(const std::string& id, const std::string& model,
