@@ -60,6 +60,12 @@ struct CompletionUsage {
     std::int64_t cache_hit_tokens  = 0;
     std::uint64_t draft_tokens     = 0;
     std::uint64_t accepted_tokens  = 0;
+
+    // Slot identity extras emitted next to `timings`: the lane that served the request
+    // (id_slot >= 0) and its retained session's digest, the handle for /slots save
+    // preconditions. Both are omitted from payloads when absent.
+    int id_slot = -1;
+    std::string session_digest;
 };
 
 enum class ContentKind {

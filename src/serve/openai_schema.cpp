@@ -464,6 +464,13 @@ Json base_chunk(const std::string& id, const std::string& model, std::int64_t cr
 // populate per-request Prefill/Decode rates, draft acceptance, cache hits and
 // phase durations. Shape matches llama.cpp's server `timings` JSON so existing
 // metric parsers work unchanged.
+// Slot identity next to `timings`: which lane served the request and, when that lane retained
+// the finished session, its digest - what a client needs to target /slots operations safely.
+void add_slot_identity(Json& payload, const CompletionUsage& usage) {
+    if (usage.id_slot >= 0) { payload["id_slot"] = usage.id_slot; }
+    if (!usage.session_digest.empty()) { payload["session_digest"] = usage.session_digest; }
+}
+
 void add_timings(Json& payload, const CompletionUsage& usage) {
     if (!usage.has_timings) { return; }
     Json timings = {
@@ -619,6 +626,7 @@ std::string make_chat_completion_response(const std::string& id, const std::stri
                        {"completion_tokens", usage.completion_tokens},
                        {"total_tokens", usage.prompt_tokens + usage.completion_tokens}}}};
     add_timings(payload, usage);
+    add_slot_identity(payload, usage);
     return payload.dump();
 }
 
@@ -643,6 +651,7 @@ std::string make_chat_completion_tool_response(const std::string& id, const std:
                        {"completion_tokens", usage.completion_tokens},
                        {"total_tokens", usage.prompt_tokens + usage.completion_tokens}}}};
     add_timings(payload, usage);
+    add_slot_identity(payload, usage);
     return payload.dump();
 }
 
@@ -698,6 +707,7 @@ std::string make_chat_chunk_final(const std::string& id, const std::string& mode
         {Json{{"index", 0}, {"delta", Json::object()}, {"finish_reason", finish_reason}}});
     if (include_usage) { payload["usage"] = nullptr; }
     add_timings(payload, usage);
+    add_slot_identity(payload, usage);
     return sse_event(payload);
 }
 
@@ -709,6 +719,7 @@ std::string make_chat_chunk_usage(const std::string& id, const std::string& mode
                               {"completion_tokens", usage.completion_tokens},
                               {"total_tokens", usage.prompt_tokens + usage.completion_tokens}};
     add_timings(payload, usage);
+    add_slot_identity(payload, usage);
     return sse_event(payload);
 }
 

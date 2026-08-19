@@ -367,6 +367,10 @@ struct GenerationResult {
     PrefixReusePath prefix_reuse_path  = PrefixReusePath::FullReset;
     GenerationTimings timings;
     SpeculativeStats speculative;
+    // Lane that served the request and, when it retained the finished session, that session's
+    // identifying digest (see SlotState) - the handle a client needs for /slots operations.
+    std::int32_t slot = -1;
+    std::string session_digest;
 };
 
 struct ArenaMemorySummary {
@@ -417,17 +421,38 @@ struct RuntimeStats {
 };
 
 // Session persistence outcomes. Tokens count the resident session depth moved; bytes count the
-// snapshot file payload on disk.
+// snapshot file payload on disk; session_digest identifies the session (see SlotState).
 struct SlotSaveResult {
     std::uint32_t tokens = 0;
     std::uint64_t bytes  = 0;
     double seconds       = 0.0;
+    std::string session_digest;
 };
 
 struct SlotRestoreResult {
     std::uint32_t tokens = 0;
     std::uint64_t bytes  = 0;
     double seconds       = 0.0;
+    std::string session_digest;
+};
+
+// One Engine lane's occupancy for /slots-style reporting: an active request's prompt size, or
+// the retained resident session. session_digest is a stable identifier of the exact resident
+// token ledger (FNV-1a 64 as 16 hex chars) - equal digests mean the identical session; clients
+// treat it as opaque and may pass it back as a slot-operation precondition.
+struct SlotState {
+    bool processing              = false;
+    bool retained                = false;
+    std::uint32_t prompt_tokens  = 0;
+    std::uint32_t cached_tokens  = 0;
+    std::string session_digest;
+};
+
+// Raised when a slot operation's session precondition (if_digest) does not match the lane's
+// resident session.
+class SlotSessionMismatch final : public std::invalid_argument {
+public:
+    using std::invalid_argument::invalid_argument;
 };
 
 struct LoadSummary {

@@ -72,6 +72,8 @@ CompletionUsage usage_with_timings(const GenerationOutcome& outcome) {
     usage.cache_hit_tokens  = outcome.metrics.prefix_cache_hit_tokens;
     usage.draft_tokens      = outcome.metrics.speculative_draft_tokens;
     usage.accepted_tokens   = outcome.metrics.speculative_accepted_tokens;
+    usage.id_slot           = outcome.id_slot;
+    usage.session_digest    = outcome.session_digest;
     return usage;
 }
 
@@ -290,31 +292,27 @@ void HttpServer::register_routes() {
     server_.Get("/metrics", [this](const httplib::Request&, httplib::Response& res) {
         res.set_content(metrics_.render(options_.max_concurrency), "text/plain; version=0.0.4");
     });
-    // llama.cpp-shaped slot detail. The Engine has no exposed slot table, so
-    // the first `max_concurrency` in-flight requests (FIFO order) count as
-    // processing and the rest of the table reads idle; per-slot cache detail
-    // is unknown mid-flight and reported as zero. A fully idle table keeps
-    // the last completed request's counts on slot 0 - llama.cpp retains slot
-    // state the same way, and scrapers read it as the resident session
-    // depth, which the prefix cache genuinely still holds. With requests in
-    // flight the retained figure is suppressed: it may describe the same
-    // session a busy slot is already reporting, and per-slot attribution is
-    // unknowable without an engine slot table.
+    // llama.cpp-shaped slot detail, read from the Engine's real lane table: a busy lane
+    // reports its request's prompt and reused-prefix sizes; an idle retained lane reports
+    // the resident session's depth (as both tokens and cache, matching llama.cpp's retained
+    // slot) plus its identifying `session_digest`. Before the service attaches (model still
+    // loading) every slot reads idle.
     server_.Get("/slots", [this](const httplib::Request&, httplib::Response& res) {
-        const auto active = metrics_.active_snapshot();
-        const auto last   = metrics_.last_completed();
         const bool speculative =
             options_.speculative.backend != ninfer::SpeculativeBackend::None;
+        std::vector<ninfer::SlotState> states;
+        if (service_ != nullptr) { states = service_->slot_states(); }
         nlohmann::json slots = nlohmann::json::array();
         for (std::uint32_t i = 0; i < options_.max_concurrency; ++i) {
-            const bool busy    = i < active.size();
-            const bool retains = active.empty() && i == 0;
+            const ninfer::SlotState state =
+                i < states.size() ? states[i] : ninfer::SlotState{};
             slots.push_back({{"id", i},
-                             {"is_processing", busy},
+                             {"is_processing", state.processing},
+                             {"retained", state.retained},
+                             {"session_digest", state.session_digest},
                              {"n_ctx", options_.max_context},
-                             {"n_prompt_tokens",
-                              busy ? active[i].second : (retains ? last.prompt_tokens : 0)},
-                             {"n_prompt_tokens_cache", retains ? last.cached_tokens : 0},
+                             {"n_prompt_tokens", state.prompt_tokens},
+                             {"n_prompt_tokens_cache", state.cached_tokens},
                              {"speculative", speculative}});
         }
         res.set_content(slots.dump(), "application/json");
@@ -422,27 +420,36 @@ void HttpServer::handle_slot_action(const httplib::Request& req, httplib::Respon
     }
     const std::string action = req.get_param_value("action");
 
+    // Body: {"filename": NAME} for save/restore, plus optional {"if_digest": DIGEST} on save
+    // and erase - a precondition that the slot still holds the session the client means,
+    // checked atomically with the operation (mismatch = 409 slot_session_mismatch).
+    std::string filename;
+    std::string if_digest;
+    try {
+        const nlohmann::json body =
+            req.body.empty() ? nlohmann::json::object() : nlohmann::json::parse(req.body);
+        filename  = body.value("filename", std::string());
+        if_digest = body.value("if_digest", std::string());
+    } catch (const std::exception&) {
+        fail(400, "invalid_request", "request body is not valid JSON");
+        return;
+    }
+
     if (action == "erase") {
         try {
-            const std::uint32_t erased = service_->slot_erase(slot);
+            const std::uint32_t erased = service_->slot_erase(slot, if_digest);
             log_line("slot erase id=" + id_text + " n_erased=" + std::to_string(erased));
             res.set_content(nlohmann::json{{"id_slot", slot}, {"n_erased", erased}}.dump(),
                             "application/json");
         } catch (const ninfer::RequestError& engine_error) {
             fail(409, "slot_busy", engine_error.what());
+        } catch (const ninfer::SlotSessionMismatch& mismatch) {
+            fail(409, "slot_session_mismatch", mismatch.what());
         }
         return;
     }
     if (action != "save" && action != "restore") {
         fail(400, "invalid_action", "action must be save, restore, or erase");
-        return;
-    }
-
-    std::string filename;
-    try {
-        filename = nlohmann::json::parse(req.body).value("filename", std::string());
-    } catch (const std::exception&) {
-        fail(400, "invalid_request", "request body is not valid JSON");
         return;
     }
     const std::optional<std::string> sanitized = sanitize_slot_filename(filename);
@@ -456,16 +463,18 @@ void HttpServer::handle_slot_action(const httplib::Request& req, httplib::Respon
 
     try {
         if (action == "save") {
-            const ninfer::SlotSaveResult saved = service_->slot_save(slot, path);
+            const ninfer::SlotSaveResult saved = service_->slot_save(slot, path, if_digest);
             log_line("slot save id=" + id_text + " file=" + *sanitized +
                      " n_saved=" + std::to_string(saved.tokens) +
-                     " n_written=" + std::to_string(saved.bytes) + " in " +
+                     " n_written=" + std::to_string(saved.bytes) +
+                     " session=" + saved.session_digest + " in " +
                      format_seconds(saved.seconds) + " s");
             res.set_content(
                 nlohmann::json{{"id_slot", slot},
                                {"filename", *sanitized},
                                {"n_saved", saved.tokens},
                                {"n_written", saved.bytes},
+                               {"session_digest", saved.session_digest},
                                {"timings", {{"save_ms", saved.seconds * 1000.0}}}}
                     .dump(),
                 "application/json");
@@ -473,19 +482,23 @@ void HttpServer::handle_slot_action(const httplib::Request& req, httplib::Respon
             const ninfer::SlotRestoreResult restored = service_->slot_restore(slot, path);
             log_line("slot restore id=" + id_text + " file=" + *sanitized +
                      " n_restored=" + std::to_string(restored.tokens) +
-                     " n_read=" + std::to_string(restored.bytes) + " in " +
+                     " n_read=" + std::to_string(restored.bytes) +
+                     " session=" + restored.session_digest + " in " +
                      format_seconds(restored.seconds) + " s");
             res.set_content(
                 nlohmann::json{{"id_slot", slot},
                                {"filename", *sanitized},
                                {"n_restored", restored.tokens},
                                {"n_read", restored.bytes},
+                               {"session_digest", restored.session_digest},
                                {"timings", {{"restore_ms", restored.seconds * 1000.0}}}}
                     .dump(),
                 "application/json");
         }
     } catch (const ninfer::RequestError& engine_error) {
         fail(409, "slot_busy", engine_error.what());
+    } catch (const ninfer::SlotSessionMismatch& mismatch) {
+        fail(409, "slot_session_mismatch", mismatch.what());
     } catch (const std::invalid_argument& engine_error) {
         fail(400, "slot_" + action + "_failed", engine_error.what());
     }

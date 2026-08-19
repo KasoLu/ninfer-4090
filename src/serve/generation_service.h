@@ -51,6 +51,10 @@ struct GenerationOutcome {
     std::size_t streamed_content_bytes = 0;
     ninfer::FinishReason finish_reason = ninfer::FinishReason::OutputLimit;
     GenerationMetrics metrics;
+    // Lane that served the request and the retained session's digest (empty when the lane did
+    // not retain it) - the handle a client needs for /slots save operations.
+    int id_slot = -1;
+    std::string session_digest;
 };
 
 struct StreamSink {
@@ -92,8 +96,9 @@ public:
         return engine_->sampling_defaults();
     }
 
-    [[nodiscard]] ninfer::SlotSaveResult slot_save(std::uint32_t slot, const std::string& path) {
-        return engine_->save_slot(slot, path);
+    [[nodiscard]] ninfer::SlotSaveResult slot_save(std::uint32_t slot, const std::string& path,
+                                                   const std::string& expected_digest = {}) {
+        return engine_->save_slot(slot, path, expected_digest);
     }
 
     [[nodiscard]] ninfer::SlotRestoreResult slot_restore(std::uint32_t slot,
@@ -101,7 +106,13 @@ public:
         return engine_->restore_slot(slot, path);
     }
 
-    std::uint32_t slot_erase(std::uint32_t slot) { return engine_->erase_slot(slot); }
+    std::uint32_t slot_erase(std::uint32_t slot, const std::string& expected_digest = {}) {
+        return engine_->erase_slot(slot, expected_digest);
+    }
+
+    [[nodiscard]] std::vector<ninfer::SlotState> slot_states() const {
+        return engine_->slot_states();
+    }
 
     [[nodiscard]] PreparedRequest prepare(const GenerationRequest& req,
                                           std::function<bool()> is_cancelled = {}) const;

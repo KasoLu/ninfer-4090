@@ -53,7 +53,7 @@ cannot be combined with `--vision`. A later request cannot enable a capability o
 | `GET /v1/responses/{id}/input_items` | list that Response's normalized input Items |
 | `POST /v1/messages` | Anthropic-style message generation |
 | `POST /v1/messages/count_tokens` | checkpoint-native expanded input-token count |
-| `GET /slots` | llama.cpp-shaped slot table for scrapers |
+| `GET /slots` | per-slot occupancy from the Engine lane table: processing/retained, depths, `session_digest` |
 | `POST /slots/{id}?action=save\|restore\|erase` | session persistence; requires `--slot-save-path` |
 
 ### Session persistence
@@ -70,7 +70,16 @@ A restored slot is indistinguishable from one the engine retained itself: a requ
 extends the saved conversation reuses the cache (`AppendAtFrontier`, or the saved turn
 checkpoint on a rewritten last turn) instead of re-prefilling, across server restarts. The
 device round trip runs at a request boundary while file I/O stays outside the GPU lock; a
-slot with an active request answers 409. Snapshots bind to the exact weights identity, KV
+slot with an active request answers 409.
+
+Sessions are identified by a `session_digest` (a stable hash of the resident token ledger;
+treat it as opaque). Successful chat completions report `id_slot` and, when the lane retained
+the finished session, its `session_digest` top-level next to `timings` (final stream chunk
+included); `GET /slots` reports each idle retained lane's digest; save and restore responses
+echo the digest of the session they moved. `save` and `erase` accept an optional
+`{"if_digest": DIGEST}` precondition, checked atomically with the operation, so a client
+always persists or evicts exactly the session it means - a mismatch (including a since-evicted
+session) answers 409 `slot_session_mismatch`. Snapshots bind to the exact weights identity, KV
 dtype/geometry, and speculative configuration, and restore refuses anything mismatched.
 Sizing: roughly the configured KV bytes per token times session depth, plus a fixed GDN
 state block (about 300 MiB with a held turn checkpoint on Qwen3.8-27B); a 6.9k-token

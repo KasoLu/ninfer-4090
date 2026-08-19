@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <memory>
 #include <span>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -35,6 +36,7 @@ struct GraphExecutionProfile {
 struct RetainedSessionSnapshot {
     std::vector<std::uint8_t> bytes;
     std::uint32_t tokens = 0;
+    std::string session_digest;
 };
 
 namespace detail {
@@ -182,6 +184,9 @@ public:
     [[nodiscard]] bool has_retained_lane(std::uint32_t lane) const noexcept;
     void evict_retained_lane(std::uint32_t lane) noexcept;
     [[nodiscard]] std::uint32_t retained_lane_depth(std::uint32_t lane) const noexcept;
+    // Stable identifier (FNV-1a 64 hex) of the lane's resident token ledger; empty unless the
+    // lane holds a retained session.
+    [[nodiscard]] std::string retained_lane_digest(std::uint32_t lane) const;
     // Session persistence for one idle retained lane. `model_binding` pins the snapshot to the
     // serving weights identity; restore rejects a mismatched binding or configuration. Both
     // synchronize the device before returning and require the lane to hold no active request.

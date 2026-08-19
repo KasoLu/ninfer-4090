@@ -21,6 +21,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -221,6 +222,7 @@ public:
     [[nodiscard]] bool has_retained_lane(std::uint32_t lane) const noexcept;
     void evict_retained_lane(std::uint32_t lane) noexcept;
     [[nodiscard]] std::uint32_t retained_lane_depth(std::uint32_t lane) const noexcept;
+    [[nodiscard]] std::string retained_lane_digest(std::uint32_t lane) const;
     [[nodiscard]] qwen3_6::RetainedSessionSnapshot
     save_retained_lane(std::uint32_t lane, std::string_view model_binding);
     [[nodiscard]] std::uint32_t restore_retained_lane(std::uint32_t lane,

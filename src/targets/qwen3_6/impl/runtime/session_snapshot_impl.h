@@ -5,6 +5,7 @@
 
 #include <array>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <span>
@@ -266,11 +267,31 @@ SnapshotSession read_session(SnapshotReader& reader) {
     return session;
 }
 
+// Session identity: FNV-1a 64 over the resident ledger's token bytes, rendered as 16 hex
+// chars. Deterministic across processes on one endianness, which snapshot compatibility
+// already requires.
+std::string ledger_digest(const std::vector<TokenId>& ledger) {
+    std::uint64_t hash = 1469598103934665603ULL;
+    const auto* bytes  = reinterpret_cast<const unsigned char*>(ledger.data());
+    const std::size_t count = ledger.size() * sizeof(TokenId);
+    for (std::size_t index = 0; index < count; ++index) {
+        hash = (hash ^ bytes[index]) * 1099511628211ULL;
+    }
+    char text[17];
+    std::snprintf(text, sizeof(text), "%016llx", static_cast<unsigned long long>(hash));
+    return text;
+}
+
 } // namespace
 
 std::uint32_t ProgramImplCore::retained_lane_depth(std::uint32_t lane) const noexcept {
     if (lane >= max_concurrency || !sequences[lane].retained) { return 0; }
     return static_cast<std::uint32_t>(sequences[lane].ledger.size());
+}
+
+std::string ProgramImplCore::retained_lane_digest(std::uint32_t lane) const {
+    if (lane >= max_concurrency || !sequences[lane].retained) { return {}; }
+    return ledger_digest(sequences[lane].ledger);
 }
 
 qwen3_6::RetainedSessionSnapshot
@@ -352,7 +373,8 @@ ProgramImplCore::save_retained_lane(std::uint32_t lane, std::string_view model_b
     session.backend_pages            = static_cast<std::uint32_t>(backend_pages.size());
 
     qwen3_6::RetainedSessionSnapshot snapshot;
-    snapshot.tokens = session.tokens;
+    snapshot.tokens         = session.tokens;
+    snapshot.session_digest = ledger_digest(sequence.ledger);
     SnapshotWriter writer(snapshot.bytes);
     writer.bytes(kSessionSnapshotMagic, sizeof(kSessionSnapshotMagic));
     writer.pod(kSessionSnapshotVersion);

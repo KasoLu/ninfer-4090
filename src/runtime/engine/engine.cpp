@@ -351,7 +351,8 @@ std::string slot_model_binding(const LoadSummary& load) {
 
 } // namespace
 
-SlotSaveResult Engine::save_slot(std::uint32_t lane, const std::string& path) {
+SlotSaveResult Engine::save_slot(std::uint32_t lane, const std::string& path,
+                                 const std::string& expected_digest) {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     const auto started = std::chrono::steady_clock::now();
     const std::string binding = slot_model_binding(impl_->load);
@@ -361,7 +362,7 @@ SlotSaveResult Engine::save_slot(std::uint32_t lane, const std::string& path) {
             if constexpr (std::is_same_v<Executor, std::monostate>) {
                 throw std::logic_error("concurrent Engine executor is unavailable");
             } else {
-                return executor->save_retained_lane(lane, binding);
+                return executor->save_retained_lane(lane, binding, expected_digest);
             }
         },
         impl_->executor);
@@ -387,8 +388,9 @@ SlotSaveResult Engine::save_slot(std::uint32_t lane, const std::string& path) {
     }
 
     SlotSaveResult result;
-    result.tokens  = snapshot.tokens;
-    result.bytes   = snapshot.bytes.size();
+    result.tokens         = snapshot.tokens;
+    result.bytes          = snapshot.bytes.size();
+    result.session_digest = std::move(snapshot.session_digest);
     result.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
     return result;
 }
@@ -410,8 +412,8 @@ SlotRestoreResult Engine::restore_slot(std::uint32_t lane, const std::string& pa
     file.close();
 
     const std::string binding = slot_model_binding(impl_->load);
-    const std::uint32_t tokens = std::visit(
-        [&](auto& executor) -> std::uint32_t {
+    auto restored = std::visit(
+        [&](auto& executor) -> std::pair<std::uint32_t, std::string> {
             using Executor = std::remove_cvref_t<decltype(executor)>;
             if constexpr (std::is_same_v<Executor, std::monostate>) {
                 throw std::logic_error("concurrent Engine executor is unavailable");
@@ -424,13 +426,14 @@ SlotRestoreResult Engine::restore_slot(std::uint32_t lane, const std::string& pa
         impl_->executor);
 
     SlotRestoreResult result;
-    result.tokens  = tokens;
-    result.bytes   = snapshot.size();
+    result.tokens         = restored.first;
+    result.bytes          = snapshot.size();
+    result.session_digest = std::move(restored.second);
     result.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
     return result;
 }
 
-std::uint32_t Engine::erase_slot(std::uint32_t lane) {
+std::uint32_t Engine::erase_slot(std::uint32_t lane, const std::string& expected_digest) {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     return std::visit(
         [&](auto& executor) -> std::uint32_t {
@@ -438,7 +441,21 @@ std::uint32_t Engine::erase_slot(std::uint32_t lane) {
             if constexpr (std::is_same_v<Executor, std::monostate>) {
                 throw std::logic_error("concurrent Engine executor is unavailable");
             } else {
-                return executor->erase_retained_lane(lane);
+                return executor->erase_retained_lane(lane, expected_digest);
+            }
+        },
+        impl_->executor);
+}
+
+std::vector<SlotState> Engine::slot_states() const {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    return std::visit(
+        [](const auto& executor) -> std::vector<SlotState> {
+            using Executor = std::remove_cvref_t<decltype(executor)>;
+            if constexpr (std::is_same_v<Executor, std::monostate>) {
+                throw std::logic_error("concurrent Engine executor is unavailable");
+            } else {
+                return executor->slot_states();
             }
         },
         impl_->executor);

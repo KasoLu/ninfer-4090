@@ -202,17 +202,20 @@ public:
 
     // Session persistence entry points. Each claims the execution mutex, so GPU copies land at
     // a request boundary; the worker resumes as soon as the device round trip completes. A lane
-    // with an active request is refused rather than drained.
+    // with an active request is refused rather than drained. A non-empty expected_digest is a
+    // precondition on the lane's resident session, checked atomically with the operation.
     [[nodiscard]] targets::qwen3_6::RetainedSessionSnapshot
-    save_retained_lane(std::uint32_t lane, std::string_view model_binding) {
+    save_retained_lane(std::uint32_t lane, std::string_view model_binding,
+                       std::string_view expected_digest) {
         std::scoped_lock lock(execution_mutex_);
         require_idle_lane(lane);
+        require_session_digest(lane, expected_digest);
         return instance_.program->save_retained_lane(lane, model_binding);
     }
 
-    [[nodiscard]] std::uint32_t restore_retained_lane(std::uint32_t lane,
-                                                      std::span<const std::uint8_t> snapshot,
-                                                      std::string_view model_binding) {
+    [[nodiscard]] std::pair<std::uint32_t, std::string>
+    restore_retained_lane(std::uint32_t lane, std::span<const std::uint8_t> snapshot,
+                          std::string_view model_binding) {
         std::scoped_lock lock(execution_mutex_);
         require_idle_lane(lane);
         if (instance_.program->has_retained_lane(lane)) {
@@ -222,18 +225,41 @@ public:
         const std::uint32_t tokens =
             instance_.program->restore_retained_lane(lane, snapshot, model_binding);
         invalidate_lane_plans(lane);
-        return tokens;
+        return {tokens, instance_.program->retained_lane_digest(lane)};
     }
 
-    std::uint32_t erase_retained_lane(std::uint32_t lane) {
+    std::uint32_t erase_retained_lane(std::uint32_t lane, std::string_view expected_digest) {
         std::scoped_lock lock(execution_mutex_);
         require_idle_lane(lane);
+        require_session_digest(lane, expected_digest);
         const std::uint32_t tokens = instance_.program->retained_lane_depth(lane);
         if (instance_.program->has_retained_lane(lane)) {
             instance_.program->evict_retained_lane(lane);
             invalidate_lane_plans(lane);
         }
         return tokens;
+    }
+
+    // Truthful per-lane occupancy read at a request boundary: an active request's prompt size,
+    // or the retained session's depth and identifying digest.
+    [[nodiscard]] std::vector<SlotState> slot_states() const {
+        std::scoped_lock lock(execution_mutex_);
+        std::vector<SlotState> states(max_concurrency_);
+        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+            SlotState& state    = states[lane];
+            const auto& request = slots_[lane];
+            if (request != nullptr) {
+                state.processing    = true;
+                state.prompt_tokens = request->prompt_summary.prompt_tokens;
+                if (request->begin) { state.cached_tokens = request->begin->reused_prompt_tokens; }
+            } else if (instance_.program->has_retained_lane(lane)) {
+                state.retained       = true;
+                state.prompt_tokens  = instance_.program->retained_lane_depth(lane);
+                state.cached_tokens  = state.prompt_tokens;
+                state.session_digest = instance_.program->retained_lane_digest(lane);
+            }
+        }
+        return states;
     }
 
 private:
@@ -243,6 +269,13 @@ private:
         }
         if (slots_[lane] != nullptr) {
             throw RequestError(RequestErrorKind::Overloaded, "slot is processing a request");
+        }
+    }
+
+    void require_session_digest(std::uint32_t lane, std::string_view expected_digest) const {
+        if (expected_digest.empty()) { return; }
+        if (instance_.program->retained_lane_digest(lane) != expected_digest) {
+            throw SlotSessionMismatch("slot session does not match if_digest");
         }
     }
 
@@ -488,6 +521,9 @@ private:
             result.timings = instance_.program->generation_timings_lane(*request->lane);
             result.timings.prepare_seconds = request->prepare_seconds;
             result.speculative = instance_.program->speculative_stats_lane(*request->lane);
+            result.slot        = static_cast<std::int32_t>(*request->lane);
+            // Empty unless the lane retained the finished session (aborts and cancels clear it).
+            result.session_digest = instance_.program->retained_lane_digest(*request->lane);
         }
         if (request->first_token) {
             result.timings.first_token_seconds =
