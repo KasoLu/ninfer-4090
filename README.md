@@ -113,14 +113,22 @@ NINFER_MODEL_DIR="$PWD/models" bash scripts/download-qwen38.sh
 
 Then start one of the three profiles. The API is available at `http://127.0.0.1:8080/v1`.
 
-All three profiles run one generation slot. Extra requests wait in the admission
-queue, and the queue deadline defaults to 30 seconds. A deep prefill can hold the
-slot longer than that, so parallel agent clients would fail with
-`request_queue_timeout`. The `--pending-timeout-ms 600000` line raises the
-deadline to 10 minutes. On a streaming request the timeout arrives as an in-band
-SSE error event after HTTP 200; a client that does not parse error events sees a
-stream that ends without a `finish_reason`. See [docs/serving.md](docs/serving.md)
-for the full queue contract.
+The profiles as written run one generation slot. `--max-concurrency 2` is measured
+and worthwhile on the 4090: the second lane costs about 390 MiB (state pools plus a
+doubled CUDA-graph allowance) while the KV page pool stays shared, so a lone session
+still uses the full context; single-stream decode is unregressed and two sessions
+decode batched at roughly 1.5x aggregate throughput, each lane keeping its own
+resident prefix. Prefill still serializes across lanes, so a deep cold prefill
+delays the other lane's first token.
+
+Extra requests beyond the slots wait in the admission queue, and the queue deadline
+defaults to 30 seconds. A deep prefill can hold a slot longer than that, so
+parallel agent clients would fail with `request_queue_timeout`. The
+`--pending-timeout-ms 600000` line raises the deadline to 10 minutes. On a
+streaming request the timeout arrives as an in-band SSE error event after HTTP 200;
+a client that does not parse error events sees a stream that ends without a
+`finish_reason`. See [docs/serving.md](docs/serving.md) for the full queue
+contract.
 
 ### Text-only, full 262K native context (E8 4-bit KV, default)
 
@@ -264,9 +272,24 @@ GCC 13, and CMake 3.28 or newer; the Docker image builds with CUDA 13.1.
   server without changes. Prompt tokens count only computed prefill; prefix-cache hits are
   excluded, as in llama.cpp. Additional `ninfer:` series report request totals, prefix-cache
   hits, and MTP draft/acceptance totals.
-- **`GET /slots`.** A llama.cpp-shaped slot table built from in-flight requests, for dashboards
-  that poll slot state. Entries are HTTP-layer FIFO positions; per-slot cache detail is unknown
-  mid-flight and reported as zero.
+- **`GET /slots`.** A llama.cpp-shaped slot table read from the engine's real lane state: busy
+  slots report their request's prompt and reused-prefix sizes, idle retained slots report the
+  resident session's depth and its identifying `session_digest`. Truthful per-slot attribution
+  holds at any `--max-concurrency`.
+- **Slot session save/restore.** `--slot-save-path DIR` (off by default) enables llama.cpp-style
+  `POST /slots/{id}?action=save|restore|erase`: one idle slot's complete resident session -
+  paged Text and MTP KV, GDN linear-attention state, turn checkpoint, and prefix identity -
+  moves to or from disk, and a restored slot reuses the cache across server restarts instead of
+  re-prefilling (a 6.9k-token session restores in about 0.1 s against a multi-second reprefill).
+  Sessions are identified by a stable `session_digest`; chat completions carry `id_slot` and the
+  digest next to `timings`, and `save`/`erase` accept an `if_digest` precondition checked
+  atomically, so a client always persists exactly the session it means. Restore extends the
+  saved frontier (or its turn checkpoint); the GDN state cannot rewind further, and the DFlash
+  backend is not supported. Details in [docs/serving.md](docs/serving.md).
+- **Reuse-aware lane choice.** When prefix reuse ties (typically zero for a fresh session),
+  admission picks the lane whose occupation costs least to replace - an empty lane before any
+  retained session, then the shallowest - so a burst request no longer evicts a deep resident
+  session while a free lane exists.
 - **NVFP4-A4 test gating.** The A4 activation tests skip on hardware without FP4 tensor cores
   instead of aborting. The full remaining suite passes on the RTX 4090.
 - **E8 lattice KV quantization (ported).** The `rk8v4`/`rk4v4`/`rk4v4-e8`/`rk2v4-e8` KV modes
@@ -292,8 +315,13 @@ GCC 13, and CMake 3.28 or newer; the Docker image builds with CUDA 13.1.
   residency tables (the former hard abort above chunk 1024 is fixed), and chunks through 2688
   stay on split-K. Larger chunks route to the unsplit schedule, which is marginally less
   accurate at its onset (about 1e-5 relative).
-- Concurrency above one request is untested in this fork. The published cohort results in the
+- `--max-concurrency 2` is measured on the 4090 (see Quick start); higher lane counts are
+  untested here, and the published cohort results in the
   [3090 base](https://github.com/Don-Chad/ninfer-3090) do not transfer directly.
+- Prefill is strictly serialized across lanes with no chunk-level interleaving, and decode
+  starves while any prefill runs: a short request submitted behind a 31k-token cold prefill
+  measured a 13.5 s first token. Concurrency pays off for decode and for per-lane resident
+  prefixes, not for prefill fairness.
 - The limits of the base engine apply: one process, one GPU, one model, bounded FIFO admission,
   no multi-GPU execution, no weight offload.
 
