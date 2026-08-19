@@ -224,6 +224,12 @@ std::string Program<Variant>::retained_lane_digest(std::uint32_t lane) const {
 }
 
 template <>
+std::vector<SlotCheckpoint>
+Program<Variant>::retained_lane_checkpoints(std::uint32_t lane) const {
+    return impl_->retained_lane_checkpoints(lane);
+}
+
+template <>
 RetainedSessionSnapshot Program<Variant>::save_retained_lane(std::uint32_t lane,
                                                              std::string_view model_binding) {
     return impl_->save_retained_lane(lane, model_binding);

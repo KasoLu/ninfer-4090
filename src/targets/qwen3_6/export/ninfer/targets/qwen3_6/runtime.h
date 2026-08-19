@@ -187,6 +187,10 @@ public:
     // Stable identifier (FNV-1a 64 hex) of the lane's resident token ledger; empty unless the
     // lane holds a retained session.
     [[nodiscard]] std::string retained_lane_digest(std::uint32_t lane) const;
+    // Retained turn checkpoints of the lane's resident session, oldest first: the frontiers a
+    // diverging prompt can restore from, each with the digest of the ledger prefix it covers.
+    [[nodiscard]] std::vector<SlotCheckpoint>
+    retained_lane_checkpoints(std::uint32_t lane) const;
     // Session persistence for one idle retained lane. `model_binding` pins the snapshot to the
     // serving weights identity; restore rejects a mismatched binding or configuration. Both
     // synchronize the device before returning and require the lane to hold no active request.

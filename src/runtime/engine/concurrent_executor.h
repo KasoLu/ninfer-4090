@@ -226,6 +226,7 @@ public:
             instance_.program->restore_retained_lane(lane, snapshot, model_binding);
         invalidate_lane_plans(lane);
         retained_digest_cache_[lane] = instance_.program->retained_lane_digest(lane);
+        retained_checkpoints_cache_[lane] = instance_.program->retained_lane_checkpoints(lane);
         publish_runtime_stats();
         return {tokens, retained_digest_cache_[lane]};
     }
@@ -299,6 +300,7 @@ private:
                 state.prompt_tokens  = instance_.program->retained_lane_depth(lane);
                 state.cached_tokens  = state.prompt_tokens;
                 state.session_digest = retained_digest_cache_[lane];
+                state.checkpoints    = retained_checkpoints_cache_[lane];
             }
         }
 
@@ -539,6 +541,8 @@ private:
             // Completion and restore are the only paths that make a lane retained, so keeping
             // the cache here means publish_runtime_stats never has to hash a ledger.
             retained_digest_cache_[*request->lane] = result.session_digest;
+            retained_checkpoints_cache_[*request->lane] =
+                instance_.program->retained_lane_checkpoints(*request->lane);
         }
         if (request->first_token) {
             result.timings.first_token_seconds =
@@ -1298,6 +1302,7 @@ private:
     // Digest of each lane's retained session, maintained by the completion and restore paths
     // (the only ones that set `retained`) so publishing needs no ledger hashing.
     std::array<std::string, kMaximumConcurrency> retained_digest_cache_{};
+    std::array<std::vector<SlotCheckpoint>, kMaximumConcurrency> retained_checkpoints_cache_{};
     bool stopping_ = false;
     bool failed_   = false;
     std::thread worker_;

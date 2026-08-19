@@ -80,6 +80,11 @@ struct EngineOptions {
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;
     std::uint32_t prefill_chunk        = 1024;
+    // Retained host-side turn checkpoints per lane (0 disables the ring). Each entry snapshots
+    // the linear-attention state at a past turn boundary so a prompt that diverges mid-history
+    // re-prefills from the nearest checkpoint instead of from zero. Host memory cost per entry
+    // is the model's full GDN state image (~147 MiB on Qwen3.8-27B).
+    std::uint32_t turn_checkpoint_ring = 0;
     KvCacheStorage kv_cache            = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
     bool enable_vision                 = false;
@@ -440,16 +445,26 @@ struct SlotRestoreResult {
     std::string session_digest;
 };
 
+// One retained turn checkpoint of a resident session: the ledger depth it rewinds to and the
+// digest of the ledger prefix up to that frontier (same FNV-1a 64 hex encoding as
+// SlotState::session_digest, computed over the prefix only).
+struct SlotCheckpoint {
+    std::uint32_t frontier = 0;
+    std::string session_digest;
+};
+
 // One Engine lane's occupancy for /slots-style reporting: an active request's prompt size, or
 // the retained resident session. session_digest is a stable identifier of the exact resident
 // token ledger (FNV-1a 64 as 16 hex chars) - equal digests mean the identical session; clients
-// treat it as opaque and may pass it back as a slot-operation precondition.
+// treat it as opaque and may pass it back as a slot-operation precondition. checkpoints lists
+// the retained turn checkpoints (oldest first) a diverging prompt can restore from.
 struct SlotState {
     bool processing              = false;
     bool retained                = false;
     std::uint32_t prompt_tokens  = 0;
     std::uint32_t cached_tokens  = 0;
     std::string session_digest;
+    std::vector<SlotCheckpoint> checkpoints;
 };
 
 // Raised when a slot operation's session precondition (if_digest) does not match the lane's

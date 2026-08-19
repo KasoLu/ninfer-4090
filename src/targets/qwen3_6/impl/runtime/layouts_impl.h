@@ -623,6 +623,10 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->max_concurrency     = inputs.max_concurrency;
     impl->prefill_chunk       = inputs.prefill_chunk;
     impl->draft_window        = inputs.draft_window;
+    // DFlash keeps checkpoint state in its own cyclic mirror that only covers the resident
+    // checkpoint; older ring entries could not rebuild it, so the ring stays off there.
+    impl->turn_checkpoint_ring =
+        inputs.speculative_backend == SpeculativeBackend::DFlash ? 0 : inputs.turn_checkpoint_ring;
     impl->speculative_backend = inputs.speculative_backend;
     impl->proposal_head       = inputs.proposal_head;
     impl->features            = inputs.features;
@@ -718,6 +722,7 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .max_concurrency     = options.max_concurrency,
         .prefill_chunk       = std::min(options.prefill_chunk, options.max_context),
         .draft_window        = options.speculative.draft_tokens,
+        .turn_checkpoint_ring = options.turn_checkpoint_ring,
         .speculative_backend = options.speculative.backend,
         .kv_dtype       = options.kv_cache == KvCacheStorage::BFloat16 ? DType::BF16 : DType::I8,
         .kv_quant_group = options.kv_cache == KvCacheStorage::BFloat16 ? 0 : qwen3_6::kKvQuantGroup,
