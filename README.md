@@ -252,6 +252,11 @@ GCC 13, and CMake 3.28 or newer; the Docker image builds with CUDA 13.1.
   by lattice decode rather than the removed guards.
 - **`/v1/models` reports `context_window`.** Clients without access to a llama.cpp `/props` or a
   vLLM `max_model_len` can size prompts from the models payload.
+- **llama.cpp-compatible `timings` on chat completions.** Responses and final stream chunks carry
+  a top-level `timings` block (`prompt_n`/`predicted_n`, per-second rates, `ttft_ms`, `cache_n`,
+  `draft_n`/`draft_n_accepted`), so proxies such as llama-swap show per-request prefill and decode
+  rates, MTP draft acceptance, and prefix-cache hits. Contributed by the
+  [shantanusingh16 fork](https://github.com/shantanusingh16/ninfer-4090) of this repository.
 - **`GET /metrics`.** Prometheus counters under llama.cpp-compatible names
   (`llamacpp:prompt_tokens_total`, `llamacpp:prompt_seconds_total`,
   `llamacpp:tokens_predicted_total`, `llamacpp:tokens_predicted_seconds_total`,
