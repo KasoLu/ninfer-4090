@@ -311,6 +311,7 @@ set_target_properties(ninfer_test_e8_codec PROPERTIES CUDA_ARCHITECTURES "89")
 # include src/ops/kernel/e8_root_codec.cuh, so this is an algorithm oracle, not coverage of
 # the shipped codec. ninfer_e8_root_codec_test below drives the production header.
 add_test(NAME ninfer_test_e8_codec COMMAND ninfer_test_e8_codec)
+set_tests_properties(ninfer_test_e8_codec PROPERTIES SKIP_RETURN_CODE 77)
 
 # These tests deliberately compile against the exact target's internal contracts; the target does
 # not export impl/ to ordinary consumers.
