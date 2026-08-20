@@ -39,13 +39,17 @@ Maintenance rules:
 | Turn checkpoint ring | `3a2e7f07`, `cba2c1f8`, `2cbe488d`, `3419fe43` | `6826b8b0`, `1ac61caf`, `8b28e502`, `66401303` | Picked with `-x` |
 | Auto-save on eviction | `8093c640` | `cad0218e` | Picked with `-x` |
 | Causal-tile key-block partition | `694e01f0` | `b5179823` | i8 body re-applied per schedule; bf16 and common taken verbatim |
+| E8 codec hardening | `bc569eb8`, `a0e03d37` | not applicable | The 5090 tree carries no E8 code. Third-hand from upstream PR #35 through the sibling fork; authorship preserved |
+| Production E8 codec test | `94830b3f` | not applicable | Same reason. Also registers the standalone oracle, which ctest had never run |
+| GDN QK norm XOR butterfly | `6e239351` | open | Bit-exact over 6.4M lanes, measures near zero. Port is cheap; value is consistency, not throughput |
+| GDN uniform value pack | `c4d09b61` | open | Bit-exact over all 65536 bf16 patterns, measures near zero. Born here, not a port |
 
 ## Deliberate non-ports
 
 | Feature | Lives in | Decision |
 |---|---|---|
 | sm_89 attention retune (`ce50e995`) | 4090 | Architecture-specific by design |
-| E8 lattice KV modes (`c3a6e5c4`, `ec56f922`, series) | 4090 | Declined for the 5090 on 2026-08-19: 32 GB fits the full 262K context on `int8`, so E8 would buy only the decode-at-depth gain |
+| E8 lattice KV modes (`c3a6e5c4`, `ec56f922`, series) | 4090 | Declined for the 5090 on 2026-08-19: 32 GB fits the full 262K context on `int8`, so E8 would buy only the decode-at-depth gain. **Revisit if NVFP4 becomes the goal**: upstream PR #35 ports E8 to sm_120a, and NVFP4 cannot reach 262K on `int8` at all. Wait for that PR to merge rather than hand-porting it. See `docs/udp-fork-comparison.md` |
 | `--vision-max-tokens` (`0c3d2bee`, `73b42127`) | 4090 | Open: the 5090 fits the legacy 32K scratchpad next to 262K + vision, so nothing forces the port |
 | Single-token W8 column-store fix (`68e2d0be`) | 4090 | Not applicable: the 5090 tree's `w8_linear_add_gemm_splitk.cu` is the upstream variant without the vulnerable tail dispatch |
 | NVFP4 weights profile | 5090 (upstream) | Ada has no FP4 tensor cores; the 4090 gates the A4 tests off instead |
