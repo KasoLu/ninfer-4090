@@ -44,6 +44,31 @@ Maintenance rules:
 | GDN QK norm XOR butterfly | `6e239351` | open | Bit-exact over 6.4M lanes, measures near zero. Port is cheap; value is consistency, not throughput |
 | GDN uniform value pack | `c4d09b61` | open | Bit-exact over all 65536 bf16 patterns, measures near zero. Born here, not a port |
 
+## Inbound ports from downstream forks
+
+Nine forks of `sergiuszm/ninfer-4090` now exist. This table records what each
+one contributed and what was declined, so that a later sweep does not
+re-examine the same commits. Survey date: 2026-08-29.
+
+| Source commit | Here | Decision |
+|---|---|---|
+| jomcgi `a0d78215`, `chat_template_kwargs` aliases | `6affed2e` | Ported. llama.cpp and vLLM spell the Qwen thinking controls under `chat_template_kwargs`. Existing clients reach the effort knob without a change |
+| Don-Chad `db076d67`, remove CUDA forward-compat libraries | `ff925039` | Ported. Our `Dockerfile` uses the same `nvidia/cuda:13.1.2` base and carried the same latent failure. The deployed `ninfer-dev:runtime` image is built by hand, so no rebuild is forced |
+| Don-Chad `ccb20680`, qualify Qwen3.8 on SM89 | not applicable | `layouts_impl.h` already gates on `device.sm() != 89`. The upstream form admits 86 or 89 and would loosen our gate |
+| jomcgi `1513de5a`, ghcr image workflow | declined | Hardwired to `ghcr.io/jomcgi` and to a `runAsNonRoot` cluster policy. We deploy hand-built local images |
+| Don-Chad `7afc8e17`, resident-CTA budget from the runtime SM count | open | Not a cherry-pick. See the note below |
+
+The `7afc8e17` principle applies to us, but its constants do not. That fix
+separates per-SM occupancy from the device-wide budget for sm_86, where the
+supported range is 82 to 84 SMs. Our `bf16_gdn_gating_proj_plan.cpp` hardcodes
+the 128-SM budget of the RTX 4090 and feeds the same constants to a
+`static_assert`. The number is correct for the RTX 4090 and wrong for every
+other Ada device: the RTX 4080 has 76 SMs and the L40S has 142. On a card with
+fewer SMs the budget is overstated. A cooperative launch that does not fit is
+then accepted, and the driver rejects it with
+`cudaErrorCooperativeLaunchTooLarge`. A port needs `DeviceContext::sm_count()`,
+our own per-SM occupancy figures, and a `kMinSupportedSmCount` value for sm_89.
+
 ## Deliberate non-ports
 
 | Feature | Lives in | Decision |
