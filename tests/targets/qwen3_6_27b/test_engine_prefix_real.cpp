@@ -1745,6 +1745,11 @@ int main() {
             result != 0) {
             return result;
         }
+        // Fork-local session persistence rides the Qwen3.8 artifact in production; its
+        // auto-save-on-eviction E2E must run whenever that artifact is available.
+        if (const int result = exercise_auto_save_evicted(qwen38_groupwise); result != 0) {
+            return result;
+        }
     }
     if (qwen38_nvfp4 != nullptr && *qwen38_nvfp4 != '\0') {
         if (const int result = exercise_private_checkpoint_pressure_retention(qwen38_nvfp4);
