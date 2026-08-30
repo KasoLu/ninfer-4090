@@ -3,6 +3,7 @@
 #include <ninfer/targets/qwen3_6/state_image.h>
 
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <optional>
 #include <stdexcept>
@@ -243,6 +244,31 @@ public:
             throw std::logic_error("StateImage has no published Host replica");
         }
         return host_->view(*object.host_slot);
+    }
+
+    // Fork-local (session persistence): mint a HostOnly CheckpointImmutable image directly from
+    // host bytes - the shape a demoted checkpoint has - so a snapshot restore can land
+    // checkpoints without a free Device slot. Returns nullopt when the Host pool is absent or
+    // full.
+    [[nodiscard]] std::optional<StateImageHandle>
+    adopt_host_image(const qwen3_6::HostStateImageConstView& source) {
+        if (host_ == nullptr || source.data == nullptr || source.layout == nullptr ||
+            source.layout->image_bytes != host_->layout().image_bytes) {
+            return std::nullopt;
+        }
+        std::optional<StateImageHandle> handle =
+            allocate(StateImageRole::CheckpointImmutable, false);
+        if (!handle) { return std::nullopt; }
+        std::optional<qwen3_6::HostStateSlotHandle> slot = host_->allocate();
+        if (!slot) {
+            (void)release(*handle);
+            return std::nullopt;
+        }
+        Object& object = require(*handle);
+        std::memcpy(host_->writable_view(*slot).data, source.data, source.layout->image_bytes);
+        object.host_slot     = *slot;
+        object.content_epoch = next_epoch();
+        return handle;
     }
 
     void move_checkpoint_to_active(StateImageHandle handle) {

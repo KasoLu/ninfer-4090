@@ -27,9 +27,14 @@
 // Versions 1 and 2 described the pre-reconciliation lane-retained format (v2 appended the
 // turn-checkpoint ring). Both are rejected by this build: the physical KV layout and the
 // state model changed with the upstream reconciliation, so old files cannot be re-landed.
-// Version 3 is the continuation-catalog format. It persists the endpoint checkpoint only:
-// rewrite checkpoints and long anchors are dropped on save, so a restored continuation offers
-// exactly its endpoint frontier to reuse planning.
+// Version 3 is the continuation-catalog format. Beside the endpoint it persists the rewrite
+// checkpoint and long anchors (each an extra StateImage; the KV payload already covers every
+// checkpoint frontier) - a multi-turn continuation diverges from the resident ledger just
+// before the endpoint (the assistant header renders differently once the reply is input), so
+// reuse of a restored session rides those turn-boundary checkpoints exactly as it does for a
+// warm one. Restore degrades gracefully: checkpoints whose StateImage does not fit the state
+// pools, or whose anchor ordinal exceeds the server's configured capacity, are dropped while
+// the endpoint remains mandatory.
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
 namespace {
@@ -356,12 +361,37 @@ ProgramImplCore::save_continuation(const ContinuationHandle& continuation,
         !state_store->valid(sequence.state.read)) {
         throw std::logic_error("retained session state binding is not a settled endpoint");
     }
-    const StateImageHandle state          = sequence.state.read;
-    const StateReplicaResidency residency = state_store->residency(state);
-    if (residency == StateReplicaResidency::None) {
-        throw std::logic_error("retained session StateImage has no published replica");
-    }
+    const StateImageHandle state             = sequence.state.read;
     const StateImageHostLayout& state_layout = state_images->host_layout();
+
+    // Checkpoint directory: every checkpoint names one entry in a deduplicated StateImage
+    // table (a rewrite checkpoint or anchor may alias the endpoint image).
+    std::vector<StateImageHandle> unique_states;
+    unique_states.reserve(2U + sequence.long_anchors.size());
+    const auto image_index = [&](StateImageHandle handle) -> std::int32_t {
+        if (!state_store->valid(handle) ||
+            state_store->residency(handle) == StateReplicaResidency::None) {
+            throw std::logic_error("retained session StateImage has no published replica");
+        }
+        for (std::size_t index = 0; index < unique_states.size(); ++index) {
+            if (unique_states[index] == handle) { return static_cast<std::int32_t>(index); }
+        }
+        unique_states.push_back(handle);
+        return static_cast<std::int32_t>(unique_states.size() - 1U);
+    };
+    const std::int32_t endpoint_image = image_index(state);
+    std::int32_t rewrite_image        = -1;
+    if (sequence.rewrite_checkpoint.valid) {
+        if (!sequence.rewrite_state) {
+            throw std::logic_error("retained rewrite checkpoint has no StateImage");
+        }
+        rewrite_image = image_index(*sequence.rewrite_state);
+    }
+    std::vector<std::int32_t> anchor_images;
+    anchor_images.reserve(sequence.long_anchors.size());
+    for (const LongAnchorCheckpoint& anchor : sequence.long_anchors) {
+        anchor_images.push_back(image_index(anchor.state));
+    }
 
     const DeviceKVPagePool& text_pool = text_kv_pages->physical_pool();
     const HostKVPageLayout text_layout = plan_host_kv_page_layout(text_pool.geometry());
@@ -446,26 +476,47 @@ ProgramImplCore::save_continuation(const ContinuationHandle& continuation,
     write_vector(writer, sequence.prefix_identity.rewrite_execution_frontiers());
     write_vector(writer, sequence.prefix_digests.image());
 
+    // Checkpoint directory: rewrite checkpoint, long anchors, and the StateImage table map.
+    writer.pod<std::uint8_t>(sequence.rewrite_checkpoint.valid ? 1 : 0);
+    writer.pod<std::uint8_t>(static_cast<std::uint8_t>(sequence.rewrite_checkpoint.kind));
+    writer.pod<std::uint32_t>(sequence.rewrite_checkpoint.frontier);
+    writer.pod(sequence.rewrite_checkpoint.rebuild_work);
+    writer.pod<std::uint32_t>(static_cast<std::uint32_t>(sequence.long_anchors.size()));
+    for (const LongAnchorCheckpoint& anchor : sequence.long_anchors) {
+        writer.pod<std::uint32_t>(anchor.frontier);
+        writer.pod<std::uint32_t>(anchor.ordinal);
+        writer.pod(anchor.rebuild_work);
+    }
+    writer.pod<std::uint32_t>(static_cast<std::uint32_t>(unique_states.size()));
+    writer.pod<std::int32_t>(endpoint_image);
+    writer.pod<std::int32_t>(rewrite_image);
+    for (const std::int32_t index : anchor_images) { writer.pod<std::int32_t>(index); }
+
     // Size the device payload in one pass so the vector's storage is final before any
     // cudaMemcpyAsync records a destination pointer.
-    const std::size_t state_offset = writer.reserve_payload(state_layout.image_bytes);
+    const std::size_t state_offset =
+        writer.reserve_payload(state_layout.image_bytes * unique_states.size());
     const std::size_t text_kv_offset =
         writer.reserve_payload(config.text_page_stride * session.text_pages);
     const std::size_t backend_kv_offset =
         writer.reserve_payload(config.backend_page_stride * session.backend_pages);
 
     std::uint8_t* base = snapshot.bytes.data();
-    if (residency == StateReplicaResidency::HostOnly) {
-        const qwen3_6::HostStateImageConstView view = state_store->host_view(state);
-        std::memcpy(base + state_offset, view.data, state_layout.image_bytes);
-    } else {
-        state_images->copy_to_host(
-            state_store->physical_slot(state),
-            qwen3_6::HostStateImageView{reinterpret_cast<std::byte*>(base + state_offset),
-                                        &state_layout},
-            device.stream);
-        ++snapshot_traffic_.state_d2h_count;
-        snapshot_traffic_.state_d2h_bytes += state_layout.image_bytes;
+    for (std::size_t index = 0; index < unique_states.size(); ++index) {
+        const StateImageHandle image  = unique_states[index];
+        std::uint8_t* const image_out = base + state_offset + index * state_layout.image_bytes;
+        if (state_store->residency(image) == StateReplicaResidency::HostOnly) {
+            const qwen3_6::HostStateImageConstView view = state_store->host_view(image);
+            std::memcpy(image_out, view.data, state_layout.image_bytes);
+        } else {
+            state_images->copy_to_host(
+                state_store->physical_slot(image),
+                qwen3_6::HostStateImageView{reinterpret_cast<std::byte*>(image_out),
+                                            &state_layout},
+                device.stream);
+            ++snapshot_traffic_.state_d2h_count;
+            snapshot_traffic_.state_d2h_bytes += state_layout.image_bytes;
+        }
     }
 
     // KV pages: device-resident runs go through the pool's page copier; demoted pages are read
@@ -657,7 +708,68 @@ ProgramImplCore::restore_continuation(std::span<const std::uint8_t> snapshot,
         throw std::invalid_argument("session snapshot holds media but Vision is disabled");
     }
 
-    const std::uint8_t* state_payload = reader.payload(state_layout.image_bytes);
+    // Checkpoint directory.
+    const std::uint8_t rewrite_valid_flag  = reader.pod<std::uint8_t>();
+    const std::uint8_t rewrite_kind_value  = reader.pod<std::uint8_t>();
+    const std::uint32_t rewrite_frontier   = reader.pod<std::uint32_t>();
+    const runtime::PrefillWork rewrite_work = reader.pod<runtime::PrefillWork>();
+    if (rewrite_valid_flag != 0 &&
+        (rewrite_frontier == 0 || rewrite_frontier > session.tokens ||
+         rewrite_work.tokens != rewrite_frontier ||
+         rewrite_kind_value > static_cast<std::uint8_t>(RewriteCheckpointKind::ResponseReplay))) {
+        throw std::invalid_argument("session snapshot rewrite checkpoint is inconsistent");
+    }
+    struct SnapshotAnchor {
+        std::uint32_t frontier = 0;
+        std::uint32_t ordinal  = 0;
+        runtime::PrefillWork rebuild_work;
+        std::int32_t image = -1;
+    };
+    const std::uint32_t anchor_count = reader.pod<std::uint32_t>();
+    if (anchor_count > 64U) {
+        throw std::invalid_argument("session snapshot anchor count is out of range");
+    }
+    std::vector<SnapshotAnchor> anchors(anchor_count);
+    for (SnapshotAnchor& anchor : anchors) {
+        anchor.frontier     = reader.pod<std::uint32_t>();
+        anchor.ordinal      = reader.pod<std::uint32_t>();
+        anchor.rebuild_work = reader.pod<runtime::PrefillWork>();
+        if (anchor.frontier == 0 || anchor.frontier > session.tokens || anchor.ordinal == 0 ||
+            anchor.rebuild_work.tokens != anchor.frontier) {
+            throw std::invalid_argument("session snapshot long anchor is inconsistent");
+        }
+    }
+    for (std::size_t index = 0; index < anchors.size(); ++index) {
+        for (std::size_t previous = 0; previous < index; ++previous) {
+            if (anchors[previous].ordinal == anchors[index].ordinal) {
+                throw std::invalid_argument("session snapshot anchor ordinals are not unique");
+            }
+        }
+    }
+    const std::uint32_t image_count = reader.pod<std::uint32_t>();
+    if (image_count == 0 || image_count > 2U + anchor_count) {
+        throw std::invalid_argument("session snapshot StateImage table is out of range");
+    }
+    const auto read_image_index = [&](bool required) -> std::int32_t {
+        const std::int32_t index = reader.pod<std::int32_t>();
+        if ((required && index < 0) || index >= static_cast<std::int32_t>(image_count) ||
+            (!required && index < -1)) {
+            throw std::invalid_argument("session snapshot StateImage index is out of range");
+        }
+        return index;
+    };
+    const std::int32_t endpoint_image = read_image_index(true);
+    const std::int32_t rewrite_image  = read_image_index(false);
+    if ((rewrite_valid_flag != 0) != (rewrite_image >= 0)) {
+        throw std::invalid_argument("session snapshot rewrite StateImage index is inconsistent");
+    }
+    for (SnapshotAnchor& anchor : anchors) { anchor.image = read_image_index(true); }
+
+    std::vector<const std::uint8_t*> image_payloads(image_count);
+    for (std::uint32_t index = 0; index < image_count; ++index) {
+        image_payloads[index] = reader.payload(state_layout.image_bytes);
+    }
+    const std::uint8_t* state_payload = image_payloads[static_cast<std::size_t>(endpoint_image)];
     const std::uint8_t* text_payload =
         reader.payload(config.text_page_stride * session.text_pages);
     const std::uint8_t* backend_payload =
@@ -696,19 +808,46 @@ ProgramImplCore::restore_continuation(std::span<const std::uint8_t> snapshot,
     }
 
     std::optional<StateImageHandle> state;
+    std::vector<std::optional<StateImageHandle>> extra_images(image_count);
     std::optional<KVAddressSpaceHandle> text_address;
     std::optional<KVAddressSpaceHandle> backend_address;
     try {
-        state = state_store->reserve_reset(device.stream);
+        // Every restored image prefers a Device slot and falls back to a HostOnly replica (the
+        // shape a demoted checkpoint has) when the Device pool is occupied by other sessions.
+        const auto stage_image = [&](const std::uint8_t* payload)
+            -> std::optional<StateImageHandle> {
+            const qwen3_6::HostStateImageConstView view{
+                reinterpret_cast<const std::byte*>(payload), &state_layout};
+            std::optional<StateImageHandle> handle = state_store->reserve_reset(device.stream);
+            if (handle) {
+                state_images->copy_from_host(view, state_store->physical_slot(*handle),
+                                             device.stream);
+                ++snapshot_traffic_.state_h2d_count;
+                snapshot_traffic_.state_h2d_bytes += state_layout.image_bytes;
+                return handle;
+            }
+            return state_store->adopt_host_image(view);
+        };
+        state = stage_image(state_payload);
         if (!state) {
             throw std::invalid_argument(
                 "session snapshot does not fit the free state capacity; evict other sessions "
                 "first");
         }
-        state_images->copy_from_host(
-            qwen3_6::HostStateImageConstView{reinterpret_cast<const std::byte*>(state_payload),
-                                             &state_layout},
-            state_store->physical_slot(*state), device.stream);
+
+        // Optional checkpoint images: an image that fits neither pool just drops the
+        // checkpoints naming it; the endpoint above stays mandatory.
+        const std::uint32_t anchor_capacity =
+            context_cache.max_long_anchors_per_continuation.value_or(0);
+        const auto upload_image = [&](std::int32_t index) {
+            const auto slot_index = static_cast<std::size_t>(index);
+            if (index == endpoint_image || extra_images[slot_index]) { return; }
+            extra_images[slot_index] = stage_image(image_payloads[slot_index]);
+        };
+        if (rewrite_valid_flag != 0) { upload_image(rewrite_image); }
+        for (const SnapshotAnchor& anchor : anchors) {
+            if (anchor.ordinal <= anchor_capacity) { upload_image(anchor.image); }
+        }
 
         const auto build_address =
             [&](KVAddressSpaceStore& addresses, DeviceKVPagePool& pool, std::uint32_t page_count,
@@ -761,7 +900,9 @@ ProgramImplCore::restore_continuation(std::span<const std::uint8_t> snapshot,
         // optionals are disarmed as they are handed over and the failure path collapses to
         // release_continuation_slot.
         SequenceState& sequence = continuation_states[*slot_index];
-        state_store->freeze(*state);
+        if (state_store->role(*state) == StateImageRole::ActiveMutable) {
+            state_store->freeze(*state);
+        }
         sequence.state = ActiveStateBinding{.read = *state, .write = *state};
         state.reset();
         sequence.kv.emplace(SequenceKVBundle{.text = *text_address, .backend = backend_address});
@@ -791,6 +932,44 @@ ProgramImplCore::restore_continuation(std::span<const std::uint8_t> snapshot,
         sequence.reserved_state.reset();
         sequence.rebuild_work       = session.rebuild_work;
         sequence.rebuild_tail_begin = session.rebuild_tail_begin;
+
+        // Adopt the surviving checkpoints: freeze the uploaded images and hand them to the
+        // sequence with one checkpoint reference per naming checkpoint (the endpoint keeps
+        // zero references, matching finish()).
+        for (std::optional<StateImageHandle>& image : extra_images) {
+            if (image && state_store->role(*image) == StateImageRole::ActiveMutable) {
+                state_store->freeze(*image);
+            }
+        }
+        const auto resolve_image =
+            [&](std::int32_t index) -> std::optional<StateImageHandle> {
+            if (index == endpoint_image) { return sequence.state.read; }
+            return extra_images[static_cast<std::size_t>(index)];
+        };
+        if (rewrite_valid_flag != 0) {
+            if (const std::optional<StateImageHandle> handle = resolve_image(rewrite_image)) {
+                sequence.rewrite_state      = *handle;
+                sequence.rewrite_checkpoint = RewriteCheckpoint{
+                    .valid        = true,
+                    .kind         = static_cast<RewriteCheckpointKind>(rewrite_kind_value),
+                    .frontier     = rewrite_frontier,
+                    .rebuild_work = rewrite_work,
+                };
+                state_store->retain_checkpoint_reference(*handle);
+            }
+        }
+        for (const SnapshotAnchor& anchor : anchors) {
+            if (anchor.ordinal > anchor_capacity) { continue; }
+            const std::optional<StateImageHandle> handle = resolve_image(anchor.image);
+            if (!handle) { continue; }
+            sequence.long_anchors.push_back(LongAnchorCheckpoint{
+                .state        = *handle,
+                .frontier     = anchor.frontier,
+                .ordinal      = anchor.ordinal,
+                .rebuild_work = anchor.rebuild_work,
+            });
+            state_store->retain_checkpoint_reference(*handle);
+        }
         refresh_state_views(sequence);
 
         text_kv_addresses->set_checkpoint_requirement(sequence.kv->text,
@@ -803,8 +982,6 @@ ProgramImplCore::restore_continuation(std::span<const std::uint8_t> snapshot,
         // Engine catalog's adoption.
         (void)continuation_summary(sequence);
 
-        ++snapshot_traffic_.state_h2d_count;
-        snapshot_traffic_.state_h2d_bytes += state_layout.image_bytes;
         continuation_slots[*slot_index].role = ContinuationSlotRole::Catalogued;
         advance_resource_revision();
         return ContractAccess::make_continuation(this, *slot_index,
@@ -826,6 +1003,11 @@ ProgramImplCore::restore_continuation(std::span<const std::uint8_t> snapshot,
             (void)text_kv_addresses->release(*text_address);
         }
         if (state) { (void)state_store->release(*state); }
+        // Images already adopted by the sequence carry checkpoint references, so this release
+        // refuses them and release_continuation_slot below owns their teardown instead.
+        for (std::optional<StateImageHandle>& image : extra_images) {
+            if (image) { (void)state_store->release(*image); }
+        }
         if (slot_index) { release_continuation_slot(*slot_index); }
         throw;
     }
