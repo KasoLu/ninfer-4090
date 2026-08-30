@@ -513,6 +513,17 @@ Program<Variant>::restore_continuation(std::span<const std::uint8_t> snapshot,
 }
 
 template <>
+ContinuationSummary
+Program<Variant>::continuation_summary(const ContinuationHandle<Variant>& continuation) const {
+    return impl_->continuation_summary(continuation);
+}
+
+template <>
+SessionSnapshotTraffic Program<Variant>::session_snapshot_traffic() const noexcept {
+    return impl_->session_snapshot_traffic();
+}
+
+template <>
 SequencePlanner<Variant> make_sequence_planner<Variant>(DeviceContext& device,
                                                         const EngineOptions& options,
                                                         Variant::WeightsProfile weights_profile) {

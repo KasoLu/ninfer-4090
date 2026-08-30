@@ -235,6 +235,16 @@ public:
         return *object.device_slot;
     }
 
+    // Fork-local (session persistence): read access to a published Host replica so a snapshot
+    // can serialize a demoted StateImage without forcing it back onto the device.
+    [[nodiscard]] qwen3_6::HostStateImageConstView host_view(StateImageHandle handle) const {
+        const Object& object = require(handle);
+        if (host_ == nullptr || !object.host_slot) {
+            throw std::logic_error("StateImage has no published Host replica");
+        }
+        return host_->view(*object.host_slot);
+    }
+
     void move_checkpoint_to_active(StateImageHandle handle) {
         Object& object = require(handle);
         if (object.role != StateImageRole::CheckpointImmutable || !object.device_slot ||

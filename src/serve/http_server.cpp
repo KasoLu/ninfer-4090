@@ -382,18 +382,23 @@ void HttpServer::register_routes() {
                                                             : ninfer::RuntimeStats{}),
                         "text/plain; version=0.0.4");
     });
-    // llama.cpp-shaped slot detail, read from the Engine's real lane table: a busy lane
-    // reports its request's prompt and reused-prefix sizes; an idle retained lane reports
-    // the resident session's depth (as both tokens and cache, matching llama.cpp's retained
-    // slot) plus its identifying `session_digest`. Before the service attaches (model still
-    // loading) every slot reads idle.
+    // llama.cpp-shaped slot detail, read from the Engine's continuation catalog: one slot per
+    // private catalog cell. A cell claimed by a running request reports that request's prompt
+    // and reused-prefix sizes; a retained cell reports the resident session's depth (as both
+    // tokens and cache, matching llama.cpp's retained slot) plus its identifying
+    // `session_digest`. Before the service attaches (model still loading) every slot reads
+    // idle.
     server_.Get("/slots", [this](const httplib::Request&, httplib::Response& res) {
         const bool speculative =
             options_.speculative.backend != ninfer::SpeculativeBackend::None;
         std::vector<ninfer::SlotState> states;
-        if (service_ != nullptr) { states = service_->slot_states(); }
+        std::uint32_t slot_count = options_.max_concurrency;
+        if (service_ != nullptr) {
+            states     = service_->slot_states();
+            slot_count = service_->slot_count();
+        }
         nlohmann::json slots = nlohmann::json::array();
-        for (std::uint32_t i = 0; i < options_.max_concurrency; ++i) {
+        for (std::uint32_t i = 0; i < slot_count; ++i) {
             const ninfer::SlotState state =
                 i < states.size() ? states[i] : ninfer::SlotState{};
             nlohmann::json checkpoints = nlohmann::json::array();
@@ -508,10 +513,12 @@ void HttpServer::handle_slot_action(const httplib::Request& req, httplib::Respon
         fail(400, "invalid_slot", "slot id is not a number");
         return;
     }
-    if (slot >= options_.max_concurrency) {
+    const std::uint32_t slot_count =
+        service_ != nullptr ? service_->slot_count() : options_.max_concurrency;
+    if (slot >= slot_count) {
         fail(400, "invalid_slot",
-             "slot " + id_text + " is outside this server's " +
-                 std::to_string(options_.max_concurrency) + " slots");
+             "slot " + id_text + " is outside this server's " + std::to_string(slot_count) +
+                 " slots");
         return;
     }
     const std::string action = req.get_param_value("action");

@@ -703,17 +703,25 @@ public:
 
     // Fork-local session persistence (disk slots): serialize one catalogued continuation to a
     // host snapshot and rebuild one from a snapshot. Digest identity hashes the ledger prefix
-    // (FNV-1a 64, session_snapshot_impl.h). save/restore are pending reimplementation on the
-    // upstream state-image + logical-KV model and currently throw.
+    // (FNV-1a 64, session_snapshot_impl.h). The v3 format persists the endpoint checkpoint
+    // only; rewrite checkpoints and long anchors are not serialized and a restored
+    // continuation offers just its endpoint frontier.
     [[nodiscard]] std::uint32_t
     continuation_depth(const ContinuationHandle& continuation) const noexcept;
     [[nodiscard]] std::string continuation_digest(const ContinuationHandle& continuation) const;
     [[nodiscard]] std::vector<SlotCheckpoint>
     continuation_checkpoints(const ContinuationHandle& continuation) const;
+    [[nodiscard]] qwen3_6::ContinuationSummary
+    continuation_summary(const ContinuationHandle& continuation) const;
     [[nodiscard]] qwen3_6::RetainedSessionSnapshot
     save_continuation(const ContinuationHandle& continuation, std::string_view model_binding);
     [[nodiscard]] ContinuationHandle restore_continuation(std::span<const std::uint8_t> snapshot,
                                                           std::string_view model_binding);
+    [[nodiscard]] qwen3_6::SessionSnapshotTraffic session_snapshot_traffic() const noexcept {
+        return snapshot_traffic_;
+    }
+
+    qwen3_6::SessionSnapshotTraffic snapshot_traffic_;
 
 private:
     void advance_resource_revision() noexcept {

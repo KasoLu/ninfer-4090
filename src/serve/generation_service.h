@@ -133,6 +133,13 @@ public:
         return engine_->slot_states();
     }
 
+    // The slot id space of /slots operations: one slot per private continuation-catalog cell
+    // (resolved at Engine construction; at least max_concurrency).
+    [[nodiscard]] std::uint32_t slot_count() const {
+        const ninfer::EngineOptions& options = engine_->options();
+        return options.context_cache.max_private_continuations.value_or(options.max_concurrency);
+    }
+
     [[nodiscard]] PreparedRequest prepare(const GenerationRequest& req,
                                           GenerationConsumerMode consumer_mode,
                                           std::function<bool()> is_cancelled = {},

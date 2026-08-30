@@ -1529,12 +1529,14 @@ int verify_loaded_product(const ninfer::Engine& engine, std::string_view expecte
 
 // End-to-end auto-save-on-eviction: a session bound to a slot file (by an explicit save) is
 // spilled back to that file when a fresh session's admission destroys it, so the file ends up
-// holding the session's latest frontier, not the explicitly saved one.
+// holding the session's latest frontier, not the explicitly saved one. A single-cell private
+// catalog leaves the evictor no vacant publication cell, which forces the eviction (a larger
+// catalog would let both sessions coexist).
 int exercise_auto_save_evicted(const char* artifact) {
-    ninfer::EngineOptions options = engine_options(artifact);
-    options.enable_vision         = false;
-    options.turn_checkpoint_ring  = 4;
-    options.auto_save_evicted     = true;
+    ninfer::EngineOptions options                    = engine_options(artifact);
+    options.enable_vision                            = false;
+    options.auto_save_evicted                        = true;
+    options.context_cache.max_private_continuations  = 1;
     ninfer::Engine engine(options);
 
     const std::string slot_file =
@@ -1566,7 +1568,12 @@ int exercise_auto_save_evicted(const char* artifact) {
     const ninfer::ChatMessage turn1 =
         text_message(ninfer::ChatRole::User, "Name two planets. Be brief.");
     const ninfer::GenerationResult first = engine.generate(engine.prepare(chat({turn1})), request);
-    const ninfer::SlotSaveResult saved   = engine.save_slot(0, slot_file, first.session_digest);
+    if (first.slot < 0 || first.session_digest.empty()) {
+        std::cerr << "auto-save fixture turn 1 did not retain a catalogued session\n";
+        return 1;
+    }
+    const auto slot                    = static_cast<std::uint32_t>(first.slot);
+    const ninfer::SlotSaveResult saved = engine.save_slot(slot, slot_file, first.session_digest);
     if (saved.tokens == 0) {
         std::cerr << "explicit save before eviction moved no tokens\n";
         return 1;
@@ -1592,7 +1599,7 @@ int exercise_auto_save_evicted(const char* artifact) {
     }
 
     // The restore drains the writer queue, so it must observe the spilled (deeper) state.
-    const ninfer::SlotRestoreResult restored = engine.restore_slot(0, slot_file);
+    const ninfer::SlotRestoreResult restored = engine.restore_slot(slot, slot_file);
     if (restored.tokens <= saved.tokens || restored.session_digest != second.session_digest) {
         std::cerr << "auto-save did not spill the evicted session: restored " << restored.tokens
                   << " tokens (explicit save " << saved.tokens << "), digest "

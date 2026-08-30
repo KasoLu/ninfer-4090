@@ -674,8 +674,9 @@ struct GenerationResult {
     GenerationTimings timings;
     GenerationEngineTiming engine_timing;
     SpeculativeStats speculative;
-    // Lane that served the request and, when it retained the finished session, that session's
-    // identifying digest (see SlotState) - the handle a client needs for /slots operations.
+    // Catalog slot that retained the finished session and that session's identifying digest
+    // (see SlotState) - the handle a client needs for /slots operations. Both stay empty when
+    // the request released its context instead of retaining it.
     std::int32_t slot = -1;
     std::string session_digest;
     ThinkingBudgetStats thinking;

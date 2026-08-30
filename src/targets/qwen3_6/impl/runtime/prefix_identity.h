@@ -39,9 +39,13 @@ public:
     [[nodiscard]] const std::vector<VisionItem>& vision_items() const noexcept {
         return vision_items_;
     }
+    [[nodiscard]] const std::vector<std::uint32_t>& rewrite_execution_frontiers() const noexcept {
+        return rewrite_execution_frontiers_;
+    }
     void restore(std::vector<std::uint8_t> token_types,
                  std::array<std::vector<std::int32_t>, 3> positions,
-                 std::vector<VisionItem> vision_items);
+                 std::vector<VisionItem> vision_items,
+                 std::vector<std::uint32_t> rewrite_execution_frontiers = {});
 
 private:
     std::vector<std::uint8_t> token_types_;
@@ -67,6 +71,14 @@ public:
     }
 
     [[nodiscard]] std::array<std::uint64_t, 2> at(std::size_t frontier) const;
+
+    // Snapshot access for session persistence: the exact rolling-digest image (size()+1 entries,
+    // entry 0 is the seed) and its rebuild from a saved one. restore() validates only shape and
+    // the nonzero-lane invariant; content fidelity is the snapshot format's contract.
+    [[nodiscard]] const std::vector<std::array<std::uint64_t, 2>>& image() const noexcept {
+        return digests_;
+    }
+    void restore(std::vector<std::array<std::uint64_t, 2>> image);
 
 private:
     std::vector<std::array<std::uint64_t, 2>> digests_;

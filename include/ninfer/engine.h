@@ -109,19 +109,21 @@ public:
     [[nodiscard]] MediaCacheSummary media_cache_summary() const;
     void reset_memory_peaks() noexcept;
 
-    // Session persistence for one Engine lane ("slot"). save_slot writes the lane's retained
-    // session to `path`; restore_slot rebuilds a lane from a saved file, evicting whatever the
-    // lane retained; erase_slot evicts the lane's retained session and reports its depth. A
-    // busy lane raises RequestError(Overloaded); incompatible or missing files raise
-    // std::invalid_argument; a non-empty expected_digest that does not match the lane's
-    // resident session raises SlotSessionMismatch, checked atomically with the operation. GPU
-    // work runs at a request boundary; file I/O runs outside it.
+    // Session persistence for one retained-session slot: a private continuation-catalog cell
+    // (slot_states().size() cells, at least max_concurrency). save_slot writes the slot's
+    // retained session to `path`; restore_slot rebuilds a slot from a saved file, evicting
+    // whatever the slot retained; erase_slot evicts the slot's retained session and reports
+    // its depth. A slot claimed by a running request or open resource transaction raises
+    // RequestError(Overloaded); incompatible or missing files raise std::invalid_argument; a
+    // non-empty expected_digest that does not match the slot's resident session raises
+    // SlotSessionMismatch, checked atomically with the operation. GPU work runs at a request
+    // boundary; file I/O runs outside it.
     [[nodiscard]] SlotSaveResult save_slot(std::uint32_t lane, const std::string& path,
                                            const std::string& expected_digest = {});
     [[nodiscard]] SlotRestoreResult restore_slot(std::uint32_t lane, const std::string& path);
     std::uint32_t erase_slot(std::uint32_t lane, const std::string& expected_digest = {});
 
-    // Truthful per-lane occupancy, read at a request boundary.
+    // Truthful per-slot occupancy, read from the snapshot published at every unit boundary.
     [[nodiscard]] std::vector<SlotState> slot_states() const;
 
 private:

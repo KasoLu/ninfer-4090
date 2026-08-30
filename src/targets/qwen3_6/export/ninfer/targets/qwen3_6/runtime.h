@@ -64,6 +64,24 @@ struct RetainedSessionSnapshot {
     std::string session_digest;
 };
 
+// Fork-local: cumulative transfer volume moved by session save/restore. These copies run outside
+// the context-cache transactions, so their pages never appear in the transaction-observed stats;
+// the Engine adds this on top when it publishes runtime stats.
+struct SessionSnapshotTraffic {
+    std::uint64_t main_kv_d2h_pages    = 0;
+    std::uint64_t main_kv_h2d_pages    = 0;
+    std::uint64_t backend_kv_d2h_pages = 0;
+    std::uint64_t backend_kv_h2d_pages = 0;
+    std::uint64_t main_kv_d2h_bytes    = 0;
+    std::uint64_t main_kv_h2d_bytes    = 0;
+    std::uint64_t backend_kv_d2h_bytes = 0;
+    std::uint64_t backend_kv_h2d_bytes = 0;
+    std::uint64_t state_d2h_count      = 0;
+    std::uint64_t state_h2d_count      = 0;
+    std::uint64_t state_d2h_bytes      = 0;
+    std::uint64_t state_h2d_bytes      = 0;
+};
+
 // Program-minted shortlist metadata. It only narrows catalog inspection; Program still performs
 // exact token, position, media and runtime-mode verification before a checkpoint can be selected.
 struct PrefixShortlistKey {
@@ -810,6 +828,13 @@ public:
                       std::string_view model_binding);
     [[nodiscard]] ContinuationHandle<Variant>
     restore_continuation(std::span<const std::uint8_t> snapshot, std::string_view model_binding);
+    // Reuse metadata of one catalogued continuation, as the Engine catalog consumes it when it
+    // adopts a restored continuation; throws for an invalid handle.
+    [[nodiscard]] ContinuationSummary
+    continuation_summary(const ContinuationHandle<Variant>& continuation) const;
+    // Cumulative host/device traffic moved by save/restore since construction; the Engine folds
+    // it into the transfer stats the context-cache transactions cannot observe.
+    [[nodiscard]] SessionSnapshotTraffic session_snapshot_traffic() const noexcept;
 
     [[nodiscard]] bool
     isolated_request_feasible(const RequestBasePlan<Variant>& base) const noexcept;
