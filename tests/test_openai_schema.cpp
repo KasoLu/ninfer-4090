@@ -523,6 +523,37 @@ int test_reasoning_and_extensions() {
     failures += check(parse(body).generation.messages.size() == 1,
                       "null unknown template option is neutral");
 
+    // chat_template_kwargs.reasoning_effort is this fork's alias - llama.cpp and vLLM spell
+    // the effort control there, and pi drives it on every request. Upstream tests its own
+    // aliases and never this one, so nothing else guards the parse or the reconciliation
+    // with the top-level field.
+    body                         = base_request();
+    body["chat_template_kwargs"] = Json{{"reasoning_effort", "high"}};
+    failures += check(parse(body).generation.reasoning_effort == RequestedReasoningEffort::High,
+                      "template kwargs carry reasoning effort");
+    body["reasoning_effort"] = "high";
+    failures += check(parse(body).generation.reasoning_effort == RequestedReasoningEffort::High,
+                      "agreeing reasoning effort aliases normalize");
+    body["reasoning_effort"]    = "low";
+    const ApiError effort_clash = api_error([&] { (void)parse(body); });
+    failures += check(effort_clash.code == "conflicting_template_option" &&
+                          effort_clash.param == "reasoning_effort",
+                      "conflicting reasoning effort aliases rejected");
+    body                         = base_request();
+    body["chat_template_kwargs"] = Json{{"reasoning_effort", nullptr}};
+    failures += check(!parse(body).generation.reasoning_effort.has_value(),
+                      "a null reasoning effort alias is neutral");
+    body["chat_template_kwargs"]     = Json{{"reasoning_effort", 3}};
+    const ApiError effort_not_string = api_error([&] { (void)parse(body); });
+    failures += check(effort_not_string.status == 400 &&
+                          effort_not_string.param == "chat_template_kwargs",
+                      "non-string reasoning effort alias rejected");
+    body["chat_template_kwargs"]      = Json{{"reasoning_effort", "turbo"}};
+    const ApiError effort_not_a_value = api_error([&] { (void)parse(body); });
+    failures += check(effort_not_a_value.status == 400 &&
+                          effort_not_a_value.param == "chat_template_kwargs",
+                      "unknown reasoning effort value rejected");
+
     body                        = base_request();
     body["repetition_penalty"]  = 1.0;
     body["mm_processor_kwargs"] = Json{{"max_pixels", nullptr}};
@@ -674,6 +705,22 @@ int test_common_objects() {
     const Json model = Json::parse(make_model_object("qwen", 7, 240000));
     failures += check(model["max_model_len"] == 240000,
                       "model lookup advertises the configured context limit");
+
+    // context_window and modalities are this fork's additions, and ninfer answers 404 on
+    // /props and /version, so this payload is the only metadata the server reports about
+    // itself. Clients key on it: the fleet dashboard reads context_window for the context
+    // figure and modalities for the capability list.
+    failures += check(models["data"][0]["context_window"] == 240000 &&
+                          models["data"][0]["modalities"]["vision"] == false,
+                      "models list carries context_window and text-only modalities");
+    failures += check(model["context_window"] == 240000 &&
+                          model["modalities"]["vision"] == false,
+                      "model lookup carries context_window and text-only modalities");
+    const Json vision_models = Json::parse(make_models_list("qwen", 7, 240000, true));
+    const Json vision_model  = Json::parse(make_model_object("qwen", 7, 240000, true));
+    failures += check(vision_models["data"][0]["modalities"]["vision"] == true &&
+                          vision_model["modalities"]["vision"] == true,
+                      "a vision deployment advertises the vision modality");
     const Json error = Json::parse(make_error_body(
         ApiError{.status = 400, .message = "bad", .param = "messages", .code = "invalid"}));
     failures += check(error["error"]["param"] == "messages" && error["error"]["code"] == "invalid",
