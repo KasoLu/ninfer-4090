@@ -69,6 +69,46 @@ then accepted, and the driver rejects it with
 `cudaErrorCooperativeLaunchTooLarge`. A port needs `DeviceContext::sm_count()`,
 our own per-SM occupancy figures, and a `kMinSupportedSmCount` value for sm_89.
 
+## Inbound sweep 2026-09-01 (UDP fork)
+
+`udp/feat/rtx-4090-sm89-native` moved from `8bba5eb4` to `717479fe`: 25 commits,
+almost all dated 2026-09-01. Four are correctness fixes; the rest are sm_89 kernel
+and build tuning. Triage of the four, checked against this tree rather than read
+from their messages:
+
+| Source commit | Applies here | Decision |
+|---|---|---|
+| `05a88712`, transient admission shortfall bricks the executor | unproven | OPEN, highest stakes. Their fix is in `concurrent_executor.h`, which this tree does not have; our admission lives in `engine_core.h` and throws `std::logic_error` in several places inside `admit_planned_request`, with the same `worker_loop` catch-all and latched `failed_`. The symptom they describe - worker thread exits, every later request 503, `/health` still ok - is worth a targeted review here, especially now that restores run in production and their trigger is a concurrent restore or snapshot save consuming pages before admission |
+| `dd5206f0`, `/health` reports the executor's real state | yes | OPEN, recommended. `http_server.cpp:376` answers a hardcoded `{"status":"ok"}`, and the fleet dashboard polls exactly that route, so a latched-failed engine reads green. Needs adapting to our engine, not a cherry-pick |
+| `8488278c`, publish snapshot saves whose write already finished | no | Not applicable. `src/core/disk_state_cache.*` exists only in the UDP tree - neither here nor in `neroued/master` |
+| `e2556b50`, render mid-conversation system turns in place | no | Already covered by a different implementation. Our template folds only `messages[0]` (`chat_template.cpp:464-477`) and renders later instruction turns in place in the message loop, so the shape that threw for them returns 200 here - verified against the live 8086 server. Their fix also edits `anthropic_schema.cpp`, a file the upstream Anthropic rework replaced in our merge |
+
+The ~15 perf commits are subject to the standing rule from `docs/udp-fork-comparison.md`:
+kernel-bench before any perf pick, because their dequant micro-optimisations lost on
+measurement here. Start with `45a5ae57` ("size CTA waves from the target SM count, not
+an RTX 5090"): it may be the sm_89 form of the Don-Chad `7afc8e17` row still open above,
+which needs `DeviceContext::sm_count()`, our own per-SM occupancy figures and a
+`kMinSupportedSmCount`.
+
+## Upstream catch-up backlog (as of 2026-09-01)
+
+`neroued/master` is 16 commits ahead of the `6b94b8c5` merge target, touching 309 files,
+33 of which this fork has modified since the merge. Two clusters matter:
+
+- **Logging replatform** (`4a1a2188` spdlog foundation, `5438b743` unify product
+  operational logs). It lands on `src/serve/console_log.cpp` and `apps/serve/main.cpp`.
+  Beware the downstream contract: `fleet-probe` parses serve log lines for throughput
+  samples, and the slot save/restore lines are what proves persistence works in
+  production. A format change breaks both silently.
+- **Runtime and context-cache fixes** (`da49c0d6` materialization sources excluded from
+  pressure, `3d9fda22` reuse under bounded pressure search, `5e4bf313` bounded shared
+  capture expansion, `138d76ae` resource scheduling ownership). These land in the same
+  cluster A files the A2 catalog work rewrote, so expect the merge to conflict there
+  again.
+
+Also new: `neroued/feat/kv-nvfp4-k8v4` (`1e7b5877`, nvfp4 and k8v4 KV modes). Relevant to
+the E8 non-port row below, which says to revisit if NVFP4 becomes the goal on the 5090.
+
 ## Deliberate non-ports
 
 | Feature | Lives in | Decision |
