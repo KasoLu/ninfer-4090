@@ -96,10 +96,16 @@ which needs `DeviceContext::sm_count()`, our own per-SM occupancy figures and a
 33 of which this fork has modified since the merge. Two clusters matter:
 
 - **Logging replatform** (`4a1a2188` spdlog foundation, `5438b743` unify product
-  operational logs). It lands on `src/serve/console_log.cpp` and `apps/serve/main.cpp`.
-  Beware the downstream contract: `fleet-probe` parses serve log lines for throughput
-  samples, and the slot save/restore lines are what proves persistence works in
-  production. A format change breaks both silently.
+  operational logs). `5438b743` touches `src/serve/console_log.cpp`, `apps/serve/main.cpp`
+  and `src/serve/http_server.cpp` - the same three files the deprecation warning and the
+  `/health` fix just edited, so expect conflicts there. The log-format contract it
+  threatens is OURS, not the dashboard's: `fleet-probe` filters containers by
+  `SERVER_HINT = llama|llm|vllm|ollama|tabby`, which `ninfer-qwen38` / `ninfer-dev:runtime`
+  does not match, so magnus's logs are never parsed (its card is built from HTTP endpoints).
+  What does depend on the formats is every diagnosis this project runs: the boot
+  KV-capacity line, `[req N] done ... reuse= cache= ttft=`, and the
+  `slot save`/`slot restore`/`slot auto-save` lines that are the only production evidence
+  that persistence works.
 - **Runtime and context-cache fixes** (`da49c0d6` materialization sources excluded from
   pressure, `3d9fda22` reuse under bounded pressure search, `5e4bf313` bounded shared
   capture expansion, `138d76ae` resource scheduling ownership). These land in the same
