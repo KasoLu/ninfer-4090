@@ -56,6 +56,12 @@ int main(int argc, char** argv) {
         std::cout << ninfer::serve::serve_usage_text(argv[0]);
         return 0;
     }
+    if (options.deprecated_turn_checkpoints_given) {
+        ninfer::serve::write_console_log(
+            ninfer::serve::ConsoleLogLevel::Warning,
+            "--turn-checkpoints is retired and was ignored; rewrite checkpoints and long "
+            "anchors cover mid-history divergence, sized by --max-long-anchors-per-continuation");
+    }
     if (!options.slot_save_path.empty()) {
         std::error_code directory_error;
         std::filesystem::create_directories(options.slot_save_path, directory_error);

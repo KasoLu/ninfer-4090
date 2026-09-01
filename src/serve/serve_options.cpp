@@ -71,7 +71,8 @@ std::string serve_usage_text(const char* argv0) {
            " <model.ninfer> [--host H] [--port N] [--api-key KEY] "
            "[--model-id ID] [--max-context N] [--kv-capacity N|auto] [--max-concurrency N] "
            "[--max-pending-requests N] [--pending-timeout-ms N] "
-           "[--prefill-chunk N] [--turn-checkpoints N] [--log-stats-interval-ms N] [--device N] "
+           "[--prefill-chunk N] [--turn-checkpoints N (retired)] [--log-stats-interval-ms N] "
+           "[--device N] "
            "[--context-cost-presets FILE] "
            "[--max-request-mib N] [--media-cache-mib N] [--media-live-mib N] "
            "[--media-preprocess-threads N] "
@@ -99,9 +100,10 @@ std::string serve_usage_text(const char* argv0) {
            "       --slot-save-path enables llama.cpp-style session persistence: POST "
            "/slots/{id}?action=save|restore|erase with {\"filename\": NAME} moves one idle "
            "slot's resident session to or from DIR (disabled when omitted)\n"
-           "       --turn-checkpoints retains N host turn checkpoints per slot so a prompt "
-           "that diverges mid-history re-prefills from the nearest checkpoint instead of from "
-           "zero (0 disables; each entry holds the full GDN state image in host memory)\n"
+           "       --turn-checkpoints is RETIRED and has no effect. Per-sequence rewrite "
+           "checkpoints and long anchors serve the same mid-history divergence, sized by "
+           "--max-long-anchors-per-continuation; the value is accepted and ignored so existing "
+           "command lines keep starting, and the flag goes away in a later release\n"
            "       --auto-save-evicted spills an involuntarily evicted session back to the "
            "slot file it was last saved to or restored from, before the eviction destroys it "
            "(requires --slot-save-path; explicit erase never auto-saves)\n"
@@ -185,8 +187,12 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.prefill_chunk = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--prefill-chunk"), "prefill-chunk"));
         } else if (arg == "--turn-checkpoints") {
-            options.turn_checkpoint_ring = static_cast<std::uint32_t>(
-                parse_nonnegative_int(require_value("--turn-checkpoints"), "turn-checkpoints"));
+            // Retired, but still accepted: the deployed container line passes it, and an
+            // unknown argument is fatal below. The value is validated and dropped; main()
+            // warns once. Remove the flag, this branch and the dead field together, one
+            // release after the warning ships.
+            (void)parse_nonnegative_int(require_value("--turn-checkpoints"), "turn-checkpoints");
+            options.deprecated_turn_checkpoints_given = true;
         } else if (arg == "--auto-save-evicted") {
             options.auto_save_evicted = true;
         } else if (arg == "--context-cost-presets") {

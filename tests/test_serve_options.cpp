@@ -38,12 +38,21 @@ int main() {
                       "request JSONL logging is not disabled by default");
     failures += check(defaults.slot_save_path.empty(),
                       "slot persistence is not disabled by default");
-    failures += check(defaults.turn_checkpoint_ring == 0,
-                      "turn checkpoint ring is not disabled by default");
+    failures += check(!defaults.deprecated_turn_checkpoints_given,
+                      "--turn-checkpoints is not reported when it was never passed");
 
+    // --turn-checkpoints is retired. It stays accepted because the deployed container line
+    // passes it and an unknown argument is fatal, but it must configure nothing.
     const ServeOptions ring =
         parse({"ninfer-serve", "model.ninfer", "--turn-checkpoints", "8"});
-    failures += check(ring.turn_checkpoint_ring == 8, "--turn-checkpoints was not applied");
+    failures += check(ring.turn_checkpoint_ring == 0 && ring.deprecated_turn_checkpoints_given,
+                      "retired --turn-checkpoints is accepted, ignored and reported");
+    bool missing_ring_value_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--turn-checkpoints"});
+    } catch (const std::invalid_argument&) { missing_ring_value_rejected = true; }
+    failures += check(missing_ring_value_rejected,
+                      "retired --turn-checkpoints still requires its value");
     failures += check(!ring.auto_save_evicted, "auto-save-evicted is not disabled by default");
 
     const ServeOptions auto_save = parse({"ninfer-serve", "model.ninfer", "--slot-save-path",

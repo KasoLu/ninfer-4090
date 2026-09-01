@@ -33,8 +33,12 @@ struct ServeOptions {
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;
     std::uint32_t prefill_chunk        = 1024;
-    std::uint32_t turn_checkpoint_ring = 0;     // 0 => host turn-checkpoint ring disabled
-    bool auto_save_evicted             = false; // spill evicted sessions to their slot file
+    // Retired with the upstream merge: per-sequence rewrite checkpoints and long anchors
+    // supersede the host turn-checkpoint ring. The field is dead everywhere and goes away
+    // with the flag one release after the deprecation warning ships.
+    std::uint32_t turn_checkpoint_ring     = 0;
+    bool deprecated_turn_checkpoints_given = false; // --turn-checkpoints was passed and ignored
+    bool auto_save_evicted                 = false; // spill evicted sessions to their slot file
     std::filesystem::path context_cost_presets;
     std::uint32_t log_stats_interval_ms    = 5000; // 0 disables periodic Engine throughput logs
     std::size_t max_request_bytes          = kDefaultMaxRequestBytes;
