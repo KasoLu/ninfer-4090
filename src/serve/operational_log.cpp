@@ -232,6 +232,16 @@ OperationalRecord render_request_done(const RequestLogContext& context,
             << " decode_wait_us_per_round="
             << metrics.engine_timing.decode_device_wait_exposed_seconds * 1.0e6 / rounds;
     }
+    // Fork-local, same reason as the two groups above: upstream's line carries no thinking
+    // accounting, and only the JSONL record did. Reported when a budget was configured, so
+    // an uncapped request stays quiet. thinking_control says whether the Engine actually
+    // committed its control suffix - a budget that never applied looks identical otherwise.
+    if (outcome.thinking.configured_budget) {
+        out << " thinking_budget_tokens=" << *outcome.thinking.configured_budget
+            << " thinking_model_tokens=" << outcome.thinking.model_thinking_tokens
+            << " thinking_control_tokens=" << outcome.thinking.injected_tokens
+            << " thinking_control=" << (outcome.thinking.applied ? "applied" : "unused");
+    }
     return {.severity = OperationalSeverity::Info, .message = out.str()};
 }
 

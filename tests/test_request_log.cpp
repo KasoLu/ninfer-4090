@@ -400,6 +400,13 @@ int main() {
                               std::string::npos &&
                           operational.find(" speculative_acceptance=0.800") != std::string::npos,
                       "operational request line lost the speculative fields");
+    // The fixture configures a 256-token budget with 256 model tokens, 19 injected control
+    // tokens and applied=true, so every field on the thinking group is pinned.
+    failures += check(operational.find(" thinking_budget_tokens=256") != std::string::npos &&
+                          operational.find(" thinking_model_tokens=256") != std::string::npos &&
+                          operational.find(" thinking_control_tokens=19") != std::string::npos &&
+                          operational.find(" thinking_control=applied") != std::string::npos,
+                      "operational request line lost the thinking accounting");
     failures +=
         check(operational.find(" host_exposed_ms=15.000") != std::string::npos &&
                   operational.find(" decode_host_us_per_round=5000.000") != std::string::npos &&
