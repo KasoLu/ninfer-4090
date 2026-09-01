@@ -319,9 +319,11 @@ if(NINFER_BUILD_PROMPT_INPUT)
 endif()
 
 if(NINFER_BUILD_APPS OR BUILD_TESTING)
-  add_library(ninfer_product_load_progress STATIC
-    product/load_progress/load_progress.cpp)
-  ninfer_internal_includes(ninfer_product_load_progress)
+  add_library(ninfer_product_logging STATIC
+    product/logging/logging.cpp
+    product/logging/startup_log.cpp)
+  ninfer_internal_includes(ninfer_product_logging)
+  target_link_libraries(ninfer_product_logging PUBLIC spdlog::spdlog)
 endif()
 
 # One cold closed registry plus the opaque public product Engine. Family and exact-target
@@ -364,8 +366,9 @@ if(NINFER_BUILD_SERVE)
     serve/anthropic_messages_http.cpp
     serve/openai_responses_store.cpp
     serve/translate.cpp
-    serve/console_log.cpp
     serve/generation_service.cpp
+    serve/request_events.cpp
+    serve/operational_log.cpp
     serve/request_log.cpp
     serve/http_server.cpp
     serve/openai_responses_http.cpp
@@ -376,5 +379,5 @@ if(NINFER_BUILD_SERVE)
     ${PROJECT_SOURCE_DIR}/third_party/cpp-httplib)
   target_link_libraries(ninfer_serve
     PUBLIC ninfer_engine Threads::Threads
-    PRIVATE ninfer_media_acquire ${NINFER_CUDART_TARGET})
+    PRIVATE ninfer_media_acquire ninfer_product_logging ${NINFER_CUDART_TARGET})
 endif()

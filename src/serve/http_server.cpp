@@ -1,7 +1,6 @@
 #include "serve/http_server.h"
 
 #include "serve/anthropic_messages.h"
-#include "serve/console_log.h"
 #include "serve/http_transport.h"
 #include "serve/openai_common.h"
 #include "serve/request_log.h"
@@ -133,6 +132,21 @@ bool report_has_activity(const ThroughputReport& report) {
            report.current.host_work.device_wait_ns != report.previous.host_work.device_wait_ns;
 }
 
+const char* endpoint_name(std::string_view path) noexcept {
+    if (path == "/v1/chat/completions") { return "openai_chat_completions"; }
+    if (path == "/v1/responses") { return "openai_responses"; }
+    if (path == "/v1/responses/input_tokens") { return "openai_responses_input_tokens"; }
+    if (path == "/v1/messages") { return "anthropic_messages"; }
+    if (path == "/v1/messages/count_tokens") { return "anthropic_count_tokens"; }
+    return "http_route";
+}
+
+std::string response_request_id(const httplib::Response& response) {
+    if (response.has_header("x-request-id")) { return response.get_header_value("x-request-id"); }
+    if (response.has_header("request-id")) { return response.get_header_value("request-id"); }
+    return {};
+}
+
 } // namespace
 
 void write_openai_error(httplib::Response& response, const ApiError& error) {
@@ -207,10 +221,11 @@ bool matches_bearer_credential(std::string_view authorization, std::string_view 
     return authorization.substr(position, end - position) == api_key;
 }
 
-HttpServer::HttpServer(ServeOptions options)
+HttpServer::HttpServer(ServeOptions options, std::shared_ptr<spdlog::logger> logger)
     : options_(std::move(options)), openai_responses_store_(options_.response_store_max_records,
                                                             options_.response_store_max_bytes),
-      request_jsonl_(options_.request_log_jsonl, options_.artifact_path) {
+      logger_(logger), operational_log_(logger),
+      request_jsonl_(options_.request_log_jsonl, options_.artifact_path, std::move(logger)) {
     const std::size_t queued_requests =
         static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests;
     const std::size_t worker_count = queued_requests + 1;
@@ -222,38 +237,65 @@ HttpServer::HttpServer(ServeOptions options)
     register_routes();
 }
 
-void HttpServer::log_line(const std::string& line) {
-    write_console_log(ConsoleLogLevel::Info, line);
+HttpServer::RequestLifecycle::RequestLifecycle(HttpServer& owner, RequestLogContext context)
+    : owner_(&owner), context_(std::move(context)) {
+    owner_->record_request_start(context_);
 }
 
-void HttpServer::log_request_start(const RequestLogContext& context) {
-    log_line(format_request_start(context));
+bool HttpServer::RequestLifecycle::claim(State terminal) noexcept {
+    State expected = State::Pending;
+    return state_.compare_exchange_strong(expected, terminal, std::memory_order_acq_rel);
+}
+
+void HttpServer::RequestLifecycle::done(const GenerationOutcome& outcome) {
+    if (claim(State::Done)) { owner_->record_request_done(context_, outcome); }
+}
+
+void HttpServer::RequestLifecycle::failure(const RequestFailure& failure) {
+    if (claim(State::Error)) { owner_->record_request_failure(context_, failure); }
+}
+
+void HttpServer::RequestLifecycle::response_failure(const RequestFailure& failure) {
+    owner_->record_response_failure(context_.id, failure);
+}
+
+std::shared_ptr<HttpServer::RequestLifecycle> HttpServer::begin_request(RequestLogContext context) {
+    return std::make_shared<RequestLifecycle>(*this, std::move(context));
+}
+
+void HttpServer::record_request_start(const RequestLogContext& context) {
     request_jsonl_.write_request_start(context);
     metrics_.begin_request(context.id, context.prompt_tokens);
+    operational_log_.request_start(context);
 }
 
-void HttpServer::log_request_rejected(const RequestRejectionLogContext& context) {
-    log_line(format_request_rejected(context));
+void HttpServer::record_request_rejected(const RequestRejectionLogContext& context) {
     request_jsonl_.write_request_rejected(context);
+    operational_log_.request_rejected(context);
 }
 
-void HttpServer::log_request_done(const RequestLogContext& context,
-                                  const GenerationOutcome& outcome) {
-    log_line(format_request_done(context, outcome));
+void HttpServer::record_request_done(const RequestLogContext& context,
+                                     const GenerationOutcome& outcome) {
     request_jsonl_.write_request_done(context, outcome);
     metrics_.end_request(context.id);
     metrics_.record(outcome);
+    operational_log_.request_done(context, outcome);
 }
 
-void HttpServer::log_request_error(const RequestLogContext& context, const std::string& message) {
-    log_line(format_request_error(context, message));
-    request_jsonl_.write_request_error(context, message);
+void HttpServer::record_request_failure(const RequestLogContext& context,
+                                        const RequestFailure& failure) {
+    request_jsonl_.write_request_error(context, failure.machine_message);
+    operational_log_.request_failure(context, failure);
     metrics_.end_request(context.id);
 }
 
-void HttpServer::log_throughput(const ThroughputReport& report) {
-    log_line(format_throughput(report));
+void HttpServer::record_response_failure(std::uint64_t request_id, const RequestFailure& failure) {
+    operational_log_.response_failure(request_id, failure);
+}
+
+void HttpServer::record_throughput(const ThroughputReport& report) {
     request_jsonl_.write_throughput(report);
+    operational_log_.throughput(report);
 }
 
 void HttpServer::run_stats_reporter() {
@@ -272,7 +314,7 @@ void HttpServer::run_stats_reporter() {
         const Clock::time_point now        = Clock::now();
         const ThroughputReport report      = make_throughput_report(
             previous, current, std::chrono::duration<double>(now - previous_time).count());
-        if (report_has_activity(report)) { log_throughput(report); }
+        if (report_has_activity(report)) { record_throughput(report); }
         previous      = current;
         previous_time = now;
     }
@@ -281,7 +323,7 @@ void HttpServer::run_stats_reporter() {
     const Clock::time_point now        = Clock::now();
     const ThroughputReport tail        = make_throughput_report(
         previous, current, std::chrono::duration<double>(now - previous_time).count());
-    if (report_has_activity(tail)) { log_throughput(tail); }
+    if (report_has_activity(tail)) { record_throughput(tail); }
 }
 
 void HttpServer::stop_stats_reporter() {
@@ -341,17 +383,27 @@ void HttpServer::register_routes() {
     });
 
     server_.set_exception_handler(
-        [](const httplib::Request& req, httplib::Response& res, std::exception_ptr ep) {
+        [this](const httplib::Request& req, httplib::Response& res, std::exception_ptr ep) {
             ensure_openai_request_id(req, res);
             try {
                 std::rethrow_exception(ep);
             } catch (const ApiException& e) {
+                if (e.error().status >= 500) {
+                    operational_log_.http_failure(
+                        endpoint_name(req.path),
+                        make_request_failure(RequestFailurePhase::Http, e.error()),
+                        response_request_id(res));
+                }
                 if (req.path.rfind("/v1/messages", 0) == 0) {
                     write_anthropic_error(res, e.error(), new_anthropic_request_id());
                 } else {
                     write_openai_error(res, e.error());
                 }
             } catch (const std::exception& e) {
+                operational_log_.http_failure(
+                    endpoint_name(req.path),
+                    make_internal_request_failure(RequestFailurePhase::Http, e.what()),
+                    response_request_id(res));
                 if (req.path.rfind("/v1/messages", 0) == 0) {
                     ApiError error;
                     error.status  = 500;
@@ -361,6 +413,10 @@ void HttpServer::register_routes() {
                     write_exception(res, e);
                 }
             } catch (...) {
+                operational_log_.http_failure(
+                    endpoint_name(req.path),
+                    make_internal_request_failure(RequestFailurePhase::Http, "unknown error"),
+                    response_request_id(res));
                 ApiError error;
                 error.status  = 500;
                 error.type    = "internal_error";
@@ -549,7 +605,7 @@ void HttpServer::handle_slot_action(const httplib::Request& req, httplib::Respon
     if (action == "erase") {
         try {
             const std::uint32_t erased = service_->slot_erase(slot, if_digest);
-            log_line("slot erase id=" + id_text + " n_erased=" + std::to_string(erased));
+            logger_->info("{}", "slot erase id=" + id_text + " n_erased=" + std::to_string(erased));
             res.set_content(nlohmann::json{{"id_slot", slot}, {"n_erased", erased}}.dump(),
                             "application/json");
         } catch (const ninfer::RequestError& engine_error) {
@@ -575,7 +631,7 @@ void HttpServer::handle_slot_action(const httplib::Request& req, httplib::Respon
     try {
         if (action == "save") {
             const ninfer::SlotSaveResult saved = service_->slot_save(slot, path, if_digest);
-            log_line("slot save id=" + id_text + " file=" + *sanitized +
+            logger_->info("{}", "slot save id=" + id_text + " file=" + *sanitized +
                      " n_saved=" + std::to_string(saved.tokens) +
                      " n_written=" + std::to_string(saved.bytes) +
                      " session=" + saved.session_digest + " in " +
@@ -591,7 +647,7 @@ void HttpServer::handle_slot_action(const httplib::Request& req, httplib::Respon
                 "application/json");
         } else {
             const ninfer::SlotRestoreResult restored = service_->slot_restore(slot, path);
-            log_line("slot restore id=" + id_text + " file=" + *sanitized +
+            logger_->info("{}", "slot restore id=" + id_text + " file=" + *sanitized +
                      " n_restored=" + std::to_string(restored.tokens) +
                      " n_read=" + std::to_string(restored.bytes) +
                      " session=" + restored.session_digest + " in " +

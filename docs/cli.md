@@ -20,9 +20,13 @@ The examples use Qwen3.8-27B NVFP4 with FP8 KV storage.
 Exactly one of `--prompt` and `--messages` is required. The CLI normally omits `--kv-capacity`, so
 the shared Main Text KV pool follows the example's 32,768-token `--max-context`.
 
-Answer content is streamed to stdout. Reasoning, model loading (including the registered target and
-canonical `weights_id`), timings, throughput, GPU memory, and speculative-decoding statistics are
-written to stderr, so stdout can be redirected independently:
+Answer content is streamed to stdout. Shared structured startup/runtime-error records are written
+to stderr. Reasoning and the CLI result report (timings, throughput, GPU memory, token IDs when
+requested, and speculative-decoding statistics) also use stderr but remain unprefixed product
+output, so stdout can be redirected independently. On a terminal, weight materialization is shown
+as one transient progress line coordinated with those records. Redirected stderr contains only
+persistent structured phase records, including rate-limited progress for long loads. Option and
+local prompt/message input failures remain direct command diagnostics:
 
 ```bash
 ./build/apps/ninfer models/qwen3_8_27b_nvfp4.ninfer \

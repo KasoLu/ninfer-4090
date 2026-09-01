@@ -29,9 +29,12 @@ KV representations are `bf16`, `int8`, and `fp8`.
 ```
 
 Run `./build/apps/ninfer-perplexity --help` for the complete command surface. The evaluator loads
-the model once, verifies and tokenizes every selected stream before scoring, prints throttled
-progress to stderr, prints the final domain/overall table to stdout, and writes `report.json` under
-`profiles/perplexity/` unless `--output` supplies an empty directory.
+the model once, verifies and tokenizes every selected stream before scoring, and writes structured
+startup plus closed preflight/scoring/stream phase records to stderr. Long scoring emits throttled
+progress between its begin and terminal records. Interactive weight loading uses the same transient
+progress line as the other applications. The final domain/overall table remains product output on
+stdout; the independent machine report is `report.json` under `profiles/perplexity/` unless
+`--output` supplies an empty directory.
 
 ## Metric
 
