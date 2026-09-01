@@ -389,6 +389,23 @@ int main() {
                                                    .injected_tokens       = 19,
                                                    .applied               = true};
 
+    // Fork-local fields on the operational request line: upstream's restructure dropped
+    // speculative decoding and host timings, and this fork restated them. The fixture above
+    // pins every value: 720 accepted of 900 drafted over 300 rounds is 3.4 tokens per round
+    // at 0.8 acceptance, the five host-exposed components sum to 15 ms, and 2 decode rounds
+    // split 0.01 s of decode host work and 0.2 s of device wait.
+    const std::string operational = render_request_done(context, outcome).message;
+    failures += check(operational.find(" speculative_backend=mtp") != std::string::npos &&
+                          operational.find(" speculative_tokens_per_round=3.400") !=
+                              std::string::npos &&
+                          operational.find(" speculative_acceptance=0.800") != std::string::npos,
+                      "operational request line lost the speculative fields");
+    failures +=
+        check(operational.find(" host_exposed_ms=15.000") != std::string::npos &&
+                  operational.find(" decode_host_us_per_round=5000.000") != std::string::npos &&
+                  operational.find(" decode_wait_us_per_round=100000.000") != std::string::npos,
+              "operational request line lost the host timings");
+
     const Json done = Json::parse(format_request_done_json("serve-test", 3000, context, outcome));
     failures +=
         check(done.at("result").at("finish_reason") == "output_limit", "finish reason missing");

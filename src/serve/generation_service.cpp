@@ -1,7 +1,7 @@
 #include "serve/generation_service.h"
 
 #include "product/media_acquire/acquire.h"
-#include "serve/console_log.h"
+#include <spdlog/logger.h>
 #include "serve/translate.h"
 
 #include <algorithm>
@@ -223,8 +223,9 @@ private:
 
 } // namespace
 
-GenerationService::GenerationService(ServeOptions options, StartupObserver startup_observer)
-    : options_(std::move(options)) {
+GenerationService::GenerationService(ServeOptions options, StartupObserver startup_observer,
+                                     std::shared_ptr<spdlog::logger> logger)
+    : options_(std::move(options)), logger_(std::move(logger)) {
     ninfer::EngineOptions engine_options;
     engine_options.artifact_path            = options_.artifact_path;
     engine_options.device                   = options_.device;
@@ -237,15 +238,16 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
     engine_options.turn_checkpoint_ring     = options_.turn_checkpoint_ring;
     engine_options.auto_save_evicted        = options_.auto_save_evicted;
     if (options_.auto_save_evicted) {
-        engine_options.auto_save_listener = [](const ninfer::SlotAutoSaveEvent& event) {
+        engine_options.auto_save_listener = [logger = logger_](
+                                                const ninfer::SlotAutoSaveEvent& event) {
+            if (!logger) { return; }
             if (event.error.empty()) {
-                write_console_log(ConsoleLogLevel::Info,
-                                  "slot auto-save file=" + event.path +
-                                      " n_saved=" + std::to_string(event.tokens) +
-                                      " bytes=" + std::to_string(event.bytes));
+                logger->info("{}", "slot auto-save file=" + event.path +
+                                       " n_saved=" + std::to_string(event.tokens) +
+                                       " bytes=" + std::to_string(event.bytes));
             } else {
-                write_console_log(ConsoleLogLevel::Warning,
-                                  "slot auto-save FAILED file=" + event.path + ": " + event.error);
+                logger->warn("{}",
+                             "slot auto-save FAILED file=" + event.path + ": " + event.error);
             }
         };
     }

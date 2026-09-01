@@ -343,12 +343,6 @@ double nanoseconds_to_microseconds(std::uint64_t value) noexcept {
     return static_cast<double>(value) * 1.0e-3;
 }
 
-double request_host_exposed_seconds(const ninfer::GenerationEngineTiming& timing) noexcept {
-    return timing.engine_boundary_exposed_seconds + timing.program_submit_exposed_seconds +
-           timing.program_post_exposed_seconds + timing.engine_commit_output_exposed_seconds +
-           timing.engine_maintenance_exposed_seconds;
-}
-
 Json request_engine_timing_json(const ninfer::GenerationEngineTiming& timing) {
     return Json{
         {"queue_wait_seconds", timing.queue_wait_seconds},

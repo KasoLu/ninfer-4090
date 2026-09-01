@@ -1,6 +1,7 @@
 #include "serve/operational_log.h"
 
 #include "product/logging/logging.h"
+#include "product/speculative_options.h"
 
 #include <spdlog/logger.h>
 
@@ -203,6 +204,33 @@ OperationalRecord render_request_done(const RequestLogContext& context,
     }
     if (metrics.decode_seconds > 0.0) {
         out << " decode_tokens_per_second=" << decode_tokens / metrics.decode_seconds;
+    }
+    // Fork-local: upstream's restructure dropped speculative decoding and host-timing
+    // reporting from this line. MTP acceptance is a health metric for this deployment - a
+    // fall in acceptance is how a bad draft configuration shows up - and the host-exposed
+    // timings are how a stall gets attributed to host work rather than the device. Restated
+    // in upstream's structured style; see baseline/LOG-CONTRACT.md for the old shapes.
+    if (metrics.speculative_backend != SpeculativeBackend::None) {
+        out << " speculative_backend="
+            << product::speculative_backend_name(metrics.speculative_backend);
+        if (metrics.speculative_rounds > 0) {
+            out << " speculative_tokens_per_round="
+                << 1.0 + static_cast<double>(metrics.speculative_accepted_tokens) /
+                             static_cast<double>(metrics.speculative_rounds);
+        }
+        if (metrics.speculative_draft_tokens > 0) {
+            out << " speculative_acceptance="
+                << static_cast<double>(metrics.speculative_accepted_tokens) /
+                       static_cast<double>(metrics.speculative_draft_tokens);
+        }
+    }
+    out << " host_exposed_ms=" << request_host_exposed_seconds(metrics.engine_timing) * 1000.0;
+    if (metrics.engine_timing.decode_rounds > 0) {
+        const double rounds = static_cast<double>(metrics.engine_timing.decode_rounds);
+        out << " decode_host_us_per_round="
+            << metrics.engine_timing.decode_host_exposed_seconds * 1.0e6 / rounds
+            << " decode_wait_us_per_round="
+            << metrics.engine_timing.decode_device_wait_exposed_seconds * 1.0e6 / rounds;
     }
     return {.severity = OperationalSeverity::Info, .message = out.str()};
 }

@@ -1,5 +1,7 @@
 #include "serve/http_server.h"
 
+#include <spdlog/logger.h>
+
 #include "serve/anthropic_messages.h"
 #include "serve/http_transport.h"
 #include "serve/openai_common.h"
@@ -265,7 +267,11 @@ std::shared_ptr<HttpServer::RequestLifecycle> HttpServer::begin_request(RequestL
 
 void HttpServer::record_request_start(const RequestLogContext& context) {
     request_jsonl_.write_request_start(context);
-    metrics_.begin_request(context.id, context.prompt_tokens);
+    // Upstream dropped RequestLogContext::prompt_tokens, which this fork declared and read
+    // here but never assigned anywhere - so this argument has always been 0 and the
+    // Prometheus per-request prompt-token value has always been 0 with it. Passing 0
+    // explicitly keeps behaviour identical; fixing the metric is a separate change.
+    metrics_.begin_request(context.id, 0);
     operational_log_.request_start(context);
 }
 

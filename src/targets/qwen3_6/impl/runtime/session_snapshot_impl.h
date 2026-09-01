@@ -898,7 +898,7 @@ ProgramImplCore::restore_continuation(std::span<const std::uint8_t> snapshot,
 
         // Point of adoption: the sequence owns the physical handles from here, so the local
         // optionals are disarmed as they are handed over and the failure path collapses to
-        // release_continuation_slot.
+        // release_continuation_slot_best_effort.
         SequenceState& sequence = continuation_states[*slot_index];
         if (state_store->role(*state) == StateImageRole::ActiveMutable) {
             state_store->freeze(*state);
@@ -1004,11 +1004,12 @@ ProgramImplCore::restore_continuation(std::span<const std::uint8_t> snapshot,
         }
         if (state) { (void)state_store->release(*state); }
         // Images already adopted by the sequence carry checkpoint references, so this release
-        // refuses them and release_continuation_slot below owns their teardown instead.
+        // refuses them and release_continuation_slot_best_effort below owns their teardown
+        // instead.
         for (std::optional<StateImageHandle>& image : extra_images) {
             if (image) { (void)state_store->release(*image); }
         }
-        if (slot_index) { release_continuation_slot(*slot_index); }
+        if (slot_index) { release_continuation_slot_best_effort(*slot_index); }
         throw;
     }
 }

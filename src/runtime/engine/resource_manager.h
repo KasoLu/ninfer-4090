@@ -432,7 +432,7 @@ public:
         MaterializationRecord record = take_materialization_record(choice);
         // Fork-local, and order-critical: the observer reads the record's claim spans, so it
         // must run before upstream moves the record into the open transaction.
-        observe_planned_evictions(record.private_claim_slots, record.private_claim_dispositions);
+        observe_planned_evictions(record.private_claims);
         transaction_.template emplace<MaterializationRecord>(std::move(record));
         MaterializationRecord& open = std::get<MaterializationRecord>(transaction_);
         reserve_logical_materialization(open);
@@ -908,8 +908,7 @@ public:
         }
 
         // Fork-local, and order-critical: see the materialization path above.
-        observe_planned_evictions(record.private_claim_slots,
-                                  record.private_claim_dispositions);
+        observe_planned_evictions(record.private_claims);
         transaction_.template emplace<ActiveCaptureRecord>(std::move(record));
         ActiveCaptureRecord& open = std::get<ActiveCaptureRecord>(transaction_);
         reserve_logical_active_capture(open);
@@ -1149,7 +1148,7 @@ public:
             .state             = entry.state,
             .id                = entry.id,
             .revision          = entry.revision,
-            .active_references = entry.active_references,
+            .active_references = entry.summary.active_references,
             .handle            = entry.handle ? &*entry.handle : nullptr,
         };
     }
@@ -1177,8 +1176,7 @@ public:
         entry.id    = next_continuation_id_++;
         if (entry.id == 0) { entry.id = next_continuation_id_++; }
         entry.session.reset();
-        entry.retention         = RetentionClass::RecentPrivate;
-        entry.active_references = 0;
+        entry.retention = RetentionClass::RecentPrivate;
         assign_continuation_summary(entry.summary, summary);
         migrate_observations(entry, summary, entry.retention);
         advance_revision(entry.revision);
@@ -1194,7 +1192,7 @@ public:
         CatalogEntry& entry = catalog_[slot];
         if (!std::holds_alternative<std::monostate>(transaction_) ||
             entry.state != CatalogState::Catalogued || !entry.handle ||
-            entry.active_references != 0) {
+            entry.summary.active_references != 0) {
             throw std::logic_error("catalog slot is not releasable");
         }
         ContinuationHandle handle = std::move(*entry.handle);
@@ -2346,12 +2344,15 @@ private:
 
     // Fork-local: report each private owner a reserved transaction plans to evict while its
     // physical state is still intact, so the Engine can spill a slot-bound session to disk.
-    void observe_planned_evictions(std::span<const std::uint32_t> slots,
-                                   std::span<const ClaimDisposition> dispositions) noexcept {
+    // Upstream replaced the parallel claim-slot/disposition arrays with a vector of OwnerClaim
+    // carrying VictimDisposition, so this walks the claims and takes the slot from the
+    // capability. Same contract as before: observe planned evictions while the physical state
+    // is still intact.
+    void observe_planned_evictions(const std::vector<OwnerClaim>& claims) noexcept {
         if (!eviction_observer_) { return; }
-        for (std::size_t row = 0; row < slots.size() && row < dispositions.size(); ++row) {
-            if (dispositions[row] != ClaimDisposition::Evicted) { continue; }
-            const std::uint32_t slot = slots[row];
+        for (const OwnerClaim& claim : claims) {
+            if (claim.disposition != VictimDisposition::Evicted) { continue; }
+            const std::uint32_t slot = claim.capability.slot;
             if (slot >= catalog_count_ || !catalog_[slot].handle) { continue; }
             try {
                 eviction_observer_(slot, *catalog_[slot].handle);

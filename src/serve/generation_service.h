@@ -3,6 +3,10 @@
 // Product-side adapter from one protocol-neutral generation request to the public Engine. Wire
 // adapters normalize before this layer and render IDs, usage, and response events after it.
 
+namespace spdlog {
+class logger;
+}
+
 #include "ninfer/engine.h"
 #include "serve/request.h"
 #include "serve/serve_options.h"
@@ -93,7 +97,10 @@ struct PreparedRequest {
 
 class GenerationService {
 public:
-    explicit GenerationService(ServeOptions options, StartupObserver startup_observer = {});
+    // The logger is fork-local: the auto-save-on-eviction listener reports through it, and
+    // that line is the only production evidence that eviction spills actually happen.
+    explicit GenerationService(ServeOptions options, StartupObserver startup_observer = {},
+                               std::shared_ptr<spdlog::logger> logger = {});
 
     [[nodiscard]] const ServeOptions& options() const noexcept { return options_; }
 
@@ -174,6 +181,7 @@ private:
     acquire_request_lifetime(DeadlinePolicy deadline_policy) const;
 
     ServeOptions options_;
+    std::shared_ptr<spdlog::logger> logger_;
     std::unique_ptr<ninfer::Engine> engine_;
     ninfer::PromptCapabilities prompt_capabilities_;
     std::shared_ptr<RequestCapacity> request_capacity_;

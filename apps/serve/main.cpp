@@ -134,7 +134,7 @@ int main(int argc, char** argv) {
             return 1;
         }
 
-        ninfer::serve::GenerationService service(options, startup_log.observer());
+        ninfer::serve::GenerationService service(options, startup_log.observer(), logger);
         startup_log.engine_ready(service.load_summary());
         log_engine_capacity(logger, service, options);
         log_state_pools(logger, service);
