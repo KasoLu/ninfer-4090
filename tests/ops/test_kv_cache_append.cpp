@@ -356,6 +356,11 @@ int full_append_case(int kv_heads, DType dtype, int tokens = 3) {
             for (int head = 0; head < kv_heads; ++head) {
                 for (int group = 0; group < kFullGroups; ++group) {
                     const auto source = full_input_index(group * kFullGroup, head, token, kv_heads);
+                    // The fork's i8 keys are unrotated, so K encodes exactly like V. The FP8
+                    // branch below has always checked both planes; i8 checked only V, which
+                    // left the key path resting on the end-to-end attention test.
+                    encode_full_group(host_k, source, expected_k, head, position, page, group,
+                                      kv_heads, expected_scale_k);
                     encode_full_group(host_v, source, expected_v, head, position, page, group,
                                       kv_heads, expected_scale_v);
                 }
@@ -366,6 +371,11 @@ int full_append_case(int kv_heads, DType dtype, int tokens = 3) {
         const std::string label = "kv_cache_append full int8-g64 Hkv=" + std::to_string(kv_heads) +
                                   " T=" + std::to_string(tokens) +
                                   " P=" + std::to_string(first_position);
+        failures += verify_exact((label + " k codes").c_str(),
+                                 from_device<std::int8_t>(cache_k.data(), code_count), expected_k);
+        failures +=
+            verify_exact((label + " k scales").c_str(),
+                         from_device<std::uint16_t>(scale_k.data(), scale_count), expected_scale_k);
         failures += verify_exact((label + " v codes").c_str(),
                                  from_device<std::int8_t>(cache_v.data(), code_count), expected_v);
         failures +=
