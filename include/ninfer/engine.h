@@ -105,6 +105,9 @@ public:
     [[nodiscard]] const EngineOptions& options() const;
     [[nodiscard]] LoadSummary load_summary() const;
     [[nodiscard]] MemorySummary memory_summary() const;
+    // Whether the engine can still accept work. A latched failure is permanent.
+    [[nodiscard]] bool healthy() const;
+
     [[nodiscard]] RuntimeStats runtime_stats() const;
     [[nodiscard]] MediaCacheSummary media_cache_summary() const;
     void reset_memory_peaks() noexcept;

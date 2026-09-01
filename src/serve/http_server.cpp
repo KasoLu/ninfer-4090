@@ -373,8 +373,16 @@ void HttpServer::register_routes() {
             }
         });
 
-    server_.Get("/health", [](const httplib::Request&, httplib::Response& res) {
-        res.set_content(nlohmann::json{{"status", "ok"}}.dump(), "application/json");
+    // A latched engine failure is permanent - every request then returns 503 "inference
+    // engine is unavailable" and only a restart recovers - so a hardcoded ok here would
+    // hide exactly the state a supervisor, load balancer or fleet dashboard needs to see.
+    // Before a service is attached the server is still binding ahead of model load, which
+    // is healthy by design.
+    server_.Get("/health", [this](const httplib::Request&, httplib::Response& res) {
+        const bool healthy = service_ == nullptr || service_->healthy();
+        if (!healthy) { res.status = 503; }
+        res.set_content(nlohmann::json{{"status", healthy ? "ok" : "error"}}.dump(),
+                        "application/json");
     });
     server_.Get("/metrics", [this](const httplib::Request&, httplib::Response& res) {
         res.set_content(metrics_.render(options_.max_concurrency,

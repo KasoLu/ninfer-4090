@@ -256,6 +256,15 @@ public:
         return out;
     }
 
+    // False once the worker has latched a failure or begun shutting down. The latch is
+    // permanent: fail_all_locked sets failed_ and the worker returns, so every later
+    // submission throws Unavailable and only a restart recovers. Callers that report
+    // liveness must ask, rather than assume the process being up means it can serve.
+    [[nodiscard]] bool healthy() const noexcept {
+        std::lock_guard lock(queue_mutex_);
+        return !stopping_ && !failed_;
+    }
+
     [[nodiscard]] RuntimeStats runtime_stats() const {
         std::lock_guard lock(stats_mutex_);
         return published_stats_;

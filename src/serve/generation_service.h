@@ -105,6 +105,8 @@ public:
 
     [[nodiscard]] ninfer::MemorySummary memory_summary() const { return engine_->memory_summary(); }
 
+    [[nodiscard]] bool healthy() const { return engine_->healthy(); }
+
     [[nodiscard]] ninfer::RuntimeStats runtime_stats() const { return engine_->runtime_stats(); }
 
     [[nodiscard]] ninfer::MediaCacheSummary media_cache_summary() const {

@@ -605,6 +605,20 @@ MediaCacheSummary Engine::media_cache_summary() const {
         impl_->active);
 }
 
+bool Engine::healthy() const {
+    if (impl_ == nullptr) { return false; }
+    return std::visit(
+        [](const auto& core) -> bool {
+            using CoreState = std::remove_cvref_t<decltype(core)>;
+            if constexpr (std::is_same_v<CoreState, std::monostate>) {
+                return false;
+            } else {
+                return core->healthy();
+            }
+        },
+        impl_->core);
+}
+
 RuntimeStats Engine::runtime_stats() const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     return std::visit(

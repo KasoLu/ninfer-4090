@@ -95,6 +95,13 @@ public:
         return out;
     }
 
+    // The scoring core has no failure latch of its own - a failed score throws to its
+    // caller rather than latching - so it is healthy until it is stopping.
+    [[nodiscard]] bool healthy() const noexcept {
+        std::lock_guard lock(queue_mutex_);
+        return !stopping_;
+    }
+
     [[nodiscard]] RuntimeStats runtime_stats() const noexcept { return {}; }
 
     void reset_memory_peaks() noexcept {
@@ -143,7 +150,7 @@ private:
     DeviceContext& device_;
     mutable std::mutex execution_mutex_;
     std::mutex call_mutex_;
-    std::mutex queue_mutex_;
+    mutable std::mutex queue_mutex_;
     std::condition_variable queue_cv_;
     std::unique_ptr<Job> job_;
     bool stopping_ = false;
