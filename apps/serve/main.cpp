@@ -65,11 +65,11 @@ void log_engine_capacity(const std::shared_ptr<spdlog::logger>& logger,
         memory.planned_slack_bytes, memory.cuda_graph_allowance_bytes);
     logger->info("engine context_cache enabled={} active_lanes={} device_state_slots={} "
                  "host_state_slots={} host_kv_bytes={} private_continuations={} shared_prefixes={} "
-                 "long_anchors_per_continuation={}",
+                 "long_anchors_per_continuation={} auto_long_anchors={}",
                  cache.enabled, engine.max_concurrency, *cache.device_state_slots,
                  cache.host_state_slots, cache.host_kv_capacity_bytes,
                  *cache.max_private_continuations, *cache.max_shared_prefixes,
-                 *cache.max_long_anchors_per_continuation);
+                 *cache.max_long_anchors_per_continuation, service.automatic_private_anchors());
     logger->info(
         "engine context_cost transfer_source={} prefill_source={} hardware_class={} model_id={} "
         "weights_id={}",
@@ -113,7 +113,7 @@ int main(int argc, char** argv) {
     if (options.deprecated_turn_checkpoints_given) {
         logger->warn("--turn-checkpoints is retired and was ignored; rewrite checkpoints and "
                      "long anchors cover mid-history divergence, sized by "
-                     "--max-long-anchors-per-continuation");
+                     "--max-long-anchors-per-continuation and placed by --auto-long-anchors");
     }
     if (!options.slot_save_path.empty()) {
         std::error_code directory_error;

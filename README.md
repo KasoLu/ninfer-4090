@@ -121,11 +121,18 @@ decode batched at roughly 1.5x aggregate throughput, each lane keeping its own
 resident prefix. Prefill still serializes across lanes, so a deep cold prefill
 delays the other lane's first token.
 
-Add `--turn-checkpoints 32` when clients edit conversation history (agent memory
-updates, message rewrites, regenerated turns): the server then re-prefills from
-the nearest retained turn boundary instead of from zero. The ring costs host
-memory only, about 4.6 GiB per slot at 32 entries. See
-[docs/turn-checkpoint-ring.md](docs/turn-checkpoint-ring.md).
+When clients edit recent conversation history (a re-serialized reply, tool results
+folded into the previous turn, an updated agent memory block), the server proposes a
+private long anchor at each of the last N message boundaries of every prompt
+(`--auto-long-anchors N`, on by default at the `--max-long-anchors-per-continuation`
+cap of 2) and re-prefills from the anchor below the edit instead of from zero.
+Coverage reaches back exactly as many message boundaries as the retention cap:
+when the anchor set is full the shallowest is evicted, so an edit deeper than the
+cap still re-prefills from zero. Raise `--max-long-anchors-per-continuation` and
+`--auto-long-anchors` together for deeper reach; each retained anchor holds one GDN
+state image (about 147 MiB of host memory on Qwen3.8-27B), so size `--host-state-slots`
+for `continuations x (2 + anchors)`. The old `--turn-checkpoints` ring is retired
+and ignored; see [docs/turn-checkpoint-ring.md](docs/turn-checkpoint-ring.md).
 
 Extra requests beyond the slots wait in the admission queue, and the queue deadline
 defaults to 30 seconds. A deep prefill can hold a slot longer than that, so
@@ -296,16 +303,19 @@ GCC 13, and CMake 3.28 or newer; the Docker image builds with CUDA 13.1.
   admission picks the lane whose occupation costs least to replace - an empty lane before any
   retained session, then the shallowest - so a burst request no longer evicts a deep resident
   session while a free lane exists.
-- **Turn checkpoint ring.** `--turn-checkpoints N` (off by default) keeps up to N past turn
-  checkpoints per slot in host memory. A prompt that rewrites the middle of its history -
-  an edited message, an updated agent memory block, a regenerated earlier turn - restores at
-  the deepest checkpoint below the edit instead of re-prefilling from zero; generation after
-  the restore is greedy-identical to a cold prefill. One checkpoint holds the GDN
-  linear-attention state (about 147 MiB of host memory on Qwen3.8-27B); the attention KV
-  needs no copy. Slot snapshots carry the ring across restarts (format version 2, written
-  only when the ring is non-empty, so existing files stay readable everywhere). The
-  recommended value is 32. Details in
-  [docs/turn-checkpoint-ring.md](docs/turn-checkpoint-ring.md).
+- **Automatic long anchors.** `--auto-long-anchors N` (default: the
+  `--max-long-anchors-per-continuation` cap) has the server propose a private long anchor at
+  each of the last N message boundaries of every prompt. Upstream's long anchors exist only
+  where a client places an explicit `PrivateLongAnchor` marker, which no OpenAI or Anthropic
+  request can express, so without this flag a rewrite deeper than the last assistant reply
+  has no reuse candidate at all and re-prefills from token zero. With it, the prompt restores
+  at the anchor below the edit. A full anchor set replaces its shallowest entry, so the
+  retained anchors track the most recent boundaries and coverage reaches back exactly the
+  cap: an edit deeper than `--max-long-anchors-per-continuation` boundaries still re-prefills
+  from zero, so raise the cap and this flag together (and `--host-state-slots` with them) for
+  deeper history. Anchors ride the existing catalog, pressure planner and slot snapshots. This
+  replaces the retired `--turn-checkpoints` ring
+  ([docs/turn-checkpoint-ring.md](docs/turn-checkpoint-ring.md)).
 - **Auto-save on eviction.** `--auto-save-evicted` (off by default, requires
   `--slot-save-path`) spills an involuntarily evicted session - checkpoint ring included -
   back to the slot file it was last saved to or restored from, before the eviction destroys

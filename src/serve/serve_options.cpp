@@ -1,6 +1,8 @@
 #include "serve/serve_options.h"
 #include "product/speculative_options.h"
 
+#include <algorithm>
+
 #include <cerrno>
 #include <cstdint>
 #include <cstdlib>
@@ -78,7 +80,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--media-preprocess-threads N] "
            "[--device-state-slots N] [--host-state-slots N] [--host-kv-mib N] "
            "[--max-private-continuations N] [--max-shared-prefixes N] "
-           "[--max-long-anchors-per-continuation N] "
+           "[--max-long-anchors-per-continuation N] [--auto-long-anchors N] "
            "[--request-log-jsonl FILE] [--slot-save-path DIR] [--auto-save-evicted] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
            "[--kv-dtype bf16|int8|fp8|rk8v4|rk4v4|rk4v4-e8|rk2v4-e8] "
@@ -102,8 +104,16 @@ std::string serve_usage_text(const char* argv0) {
            "slot's resident session to or from DIR (disabled when omitted)\n"
            "       --turn-checkpoints is RETIRED and has no effect. Per-sequence rewrite "
            "checkpoints and long anchors serve the same mid-history divergence, sized by "
-           "--max-long-anchors-per-continuation; the value is accepted and ignored so existing "
-           "command lines keep starting, and the flag goes away in a later release\n"
+           "--max-long-anchors-per-continuation and placed by --auto-long-anchors; the value is "
+           "accepted and ignored so existing command lines keep starting, and the flag goes "
+           "away in a later release\n"
+           "       --auto-long-anchors N proposes a private long anchor at each of the last N "
+           "message boundaries of every prompt, so a client that rewrites recent history "
+           "restores at the anchor below the edit instead of re-prefilling from zero; coverage "
+           "reaches back only as far as the retained cap (the shallowest anchor is evicted when "
+           "the set is full), so raise it with --max-long-anchors-per-continuation and "
+           "--host-state-slots for deeper edits; defaults to the cap and is clamped to it; "
+           "0 disables (anchors then need explicit markers, which no HTTP protocol can place)\n"
            "       --auto-save-evicted spills an involuntarily evicted session back to the "
            "slot file it was last saved to or restored from, before the eviction destroys it "
            "(requires --slot-save-path; explicit erase never auto-saves)\n"
@@ -261,6 +271,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 parse_nonnegative_int(require_value("--max-long-anchors-per-continuation"),
                                       "max-long-anchors-per-continuation"));
             context_capacity_explicit = true;
+        } else if (arg == "--auto-long-anchors") {
+            options.auto_long_anchors = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--auto-long-anchors"), "auto-long-anchors"));
         } else if (arg == "--request-log-jsonl") {
             options.request_log_jsonl = require_value("--request-log-jsonl");
             if (options.request_log_jsonl.empty()) {
@@ -368,6 +381,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         options.context_cache.enabled                = false;
         options.context_cache.host_state_slots       = 0;
         options.context_cache.host_kv_capacity_bytes = 0;
+        options.auto_long_anchors                    = 0;
     }
     if (options.port <= 0 || options.port > 65535) {
         throw std::invalid_argument("--port must be in [1,65535]");
@@ -411,6 +425,13 @@ std::string resolve_public_model_id(const ServeOptions& options,
         throw std::logic_error("loaded artifact model_id must not be empty");
     }
     return std::string(artifact_model_id);
+}
+
+std::uint32_t resolve_automatic_private_anchors(const ServeOptions& options,
+                                                const ContextCacheOptions& resolved) {
+    if (!resolved.enabled || !options.allow_prefix_reuse) { return 0; }
+    const std::uint32_t cap = resolved.max_long_anchors_per_continuation.value_or(0U);
+    return std::min(options.auto_long_anchors.value_or(cap), cap);
 }
 
 } // namespace ninfer::serve

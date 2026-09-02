@@ -460,6 +460,16 @@ struct ContextCacheHints {
     // Advance the named session lineage when session_key is present. This does not require an
     // anonymous content-matched source to be retained.
     bool update_session_index = true;
+    // Engine-automatic private long anchors. Propose a PrivateLongAnchor capture at each of the
+    // last N message boundaries strictly inside the prompt; the boundary after the final message
+    // is left to the endpoint and rewrite checkpoints. 0 (the default) proposes none, which is
+    // upstream behavior: anchors then exist only where a client placed an explicit
+    // PrivateLongAnchor marker, and no OpenAI or Anthropic request can express one. Retention
+    // stays bounded by ContextCacheOptions::max_long_anchors_per_continuation; a full set
+    // replaces its shallowest anchor, so a continuation converges on its most recent turn
+    // boundaries. Automatic anchors are opportunities, not markers, so they do not count
+    // against the explicit marker limit and merge with an explicit anchor at the same frontier.
+    std::uint32_t automatic_private_anchors = 0;
 };
 
 struct PromptInput {
