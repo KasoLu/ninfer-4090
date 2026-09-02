@@ -684,6 +684,27 @@ struct MaterializationDiagnostics {
     std::uint32_t selected_degradation_units = 0;
     bool selected_maximal_fallback           = false;
 
+    /**
+     * The most reusable candidate the search actually ASSESSED, with what the cost model
+     * charged for it and whether it was physically feasible.
+     *
+     * Every other field here describes the plan that WON, which leaves a request that
+     * re-prefills from root ambiguous between two very different faults: no reuse
+     * candidate was ever generated, or one was generated and then priced worse than
+     * reading 200k tokens again. Production has produced that exact ambiguity repeatedly
+     * (2026-09-01, 2026-09-02) and five out-of-production reproductions failed to settle
+     * it. These three fields separate the cases at the moment of the decision.
+     *
+     * This is the most reuse any CANDIDATE offered, which is decided upstream of planning,
+     * so it is independent of what the search then chose. 0 means no candidate offered any
+     * reuse at all, which points upstream at prefix matching rather than at the planner;
+     * a large value beside a root plan points at the planner.
+     *
+     * One scalar, not a per-target vector: a vector would allocate on the planning path and
+     * would stop this struct's defaulted comparison from being constexpr.
+     */
+    std::uint32_t best_reuse_prompt_tokens = 0;
+
     [[nodiscard]] friend constexpr bool
     operator==(const MaterializationDiagnostics&,
                const MaterializationDiagnostics&) noexcept = default;
