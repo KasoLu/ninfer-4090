@@ -1205,9 +1205,18 @@ public:
     // any physical state is destroyed. An aborted transaction leaves the session alive, so a
     // spurious observation costs one redundant (still valid) spill file.
     using EvictionObserver = std::function<void(std::uint32_t, const ContinuationHandle&)>;
+    // Fork-local: fires whenever a catalog cell stops holding the session it held, by any
+    // route - eviction, consumption, release, abort, cancel or cleanup. Session state the
+    // Engine keys by cell (the slot file binding) must die here, or it outlives its session
+    // and gets applied to whichever session lands in the cell next.
+    using SlotReleaseObserver = std::function<void(std::uint32_t)>;
 
     void set_eviction_observer(EvictionObserver observer) {
         eviction_observer_ = std::move(observer);
+    }
+
+    void set_slot_release_observer(SlotReleaseObserver observer) {
+        slot_release_observer_ = std::move(observer);
     }
 
     void clear_after_program_cleanup() noexcept {
@@ -1638,6 +1647,7 @@ private:
     }
 
     void clear_catalog_entry(CatalogEntry& entry) noexcept {
+        notify_slot_released(entry);
         entry.state = CatalogState::Vacant;
         entry.id    = 0;
         entry.summary.endpoint.reset();
@@ -1649,6 +1659,17 @@ private:
         entry.observations.clear();
         entry.retention = RetentionClass::RecentPrivate;
         advance_revision(entry.revision);
+    }
+
+    // catalog_ is contiguous, so the entry reference recovers its own cell index. Called
+    // before the entry is reset so an observer can still read it.
+    void notify_slot_released(const CatalogEntry& entry) const noexcept {
+        if (!slot_release_observer_ || catalog_.empty()) { return; }
+        const std::ptrdiff_t index = &entry - catalog_.data();
+        if (index < 0 || static_cast<std::size_t>(index) >= catalog_.size()) { return; }
+        try {
+            slot_release_observer_(static_cast<std::uint32_t>(index));
+        } catch (...) {}
     }
 
     void clear_shared_entry(SharedCatalogEntry& entry) noexcept {
@@ -3486,6 +3507,7 @@ private:
     Planner planner_;
     CapturePlanner capture_planner_;
     EvictionObserver eviction_observer_;
+    SlotReleaseObserver slot_release_observer_;
     RuntimeStats context_stats_;
     std::uint64_t next_continuation_id_  = 1;
     std::uint64_t next_shared_prefix_id_ = 1;

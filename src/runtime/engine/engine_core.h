@@ -90,6 +90,14 @@ public:
                    const typename ResourceManagement::ContinuationHandle& handle) {
                 spill_catalog_slot(slot, handle);
             });
+        // A slot file binding belongs to the SESSION that saved or restored it, and the cell is
+        // only where that session happens to live right now. Tie the binding's lifetime to the
+        // catalog entry so it can never be inherited by the next session in the cell: the
+        // pre-catalog lane implementation cleared it by hand on each destroying path, and the
+        // catalog port dropped those clears, which let an unrelated session spill over a bound
+        // session's file.
+        resources_.set_slot_release_observer(
+            [this](std::uint32_t slot) { clear_slot_session(slot); });
         std::promise<void> startup;
         std::future<void> started = startup.get_future();
         worker_                   = std::thread([this, startup = std::move(startup)]() mutable {
@@ -285,7 +293,9 @@ public:
     // drained. A non-empty expected_digest is a precondition on the slot's resident session,
     // checked atomically with the operation. session_path is the file the operation targets; a
     // successful save or restore binds the slot to it so an involuntary eviction can spill the
-    // session back (see spill_catalog_slot).
+    // session back (see spill_catalog_slot). The binding lives exactly as long as the catalog
+    // entry that owns it - the resource manager's slot-release observer clears it - so it can
+    // never outlive its session and be applied to the next one.
     [[nodiscard]] targets::qwen3_6::RetainedSessionSnapshot
     save_retained_lane(std::uint32_t slot, std::string_view model_binding,
                        std::string_view expected_digest, std::string_view session_path = {}) {
@@ -329,7 +339,7 @@ public:
             auto evicted = resources_.take_catalogued(slot);
             (void)instance_.program->release_continuation(std::move(evicted));
         }
-        slot_session_paths_[slot].clear();
+        clear_slot_session(slot);
         auto restored             = instance_.program->restore_continuation(snapshot, model_binding);
         const std::uint32_t tokens = instance_.program->continuation_depth(restored);
         std::string digest         = instance_.program->continuation_digest(restored);
@@ -353,7 +363,7 @@ public:
         const typename ResourceManagement::CatalogSlotView view = resources_.catalog_slot(slot);
         require_session_digest(view, expected_digest);
         // Explicit erase is a deletion request: never auto-save, and drop the binding.
-        slot_session_paths_[slot].clear();
+        clear_slot_session(slot);
         if (view.state != ResourceManagement::CatalogState::Catalogued ||
             view.handle == nullptr) {
             return 0;
@@ -434,6 +444,15 @@ private:
             // The session was going to be destroyed either way; losing the spill costs the
             // client one cold prefill, exactly the pre-feature behavior.
         }
+        // Both callers destroy the session immediately after this returns. The release observer
+        // clears the binding too; doing it here as well keeps the spill correct even for a
+        // destroying path that never reaches clear_catalog_entry.
+        clear_slot_session(slot);
+    }
+
+    void clear_slot_session(std::uint32_t slot) noexcept {
+        if (slot >= slot_session_paths_.size()) { return; }
+        slot_session_paths_[slot].clear();
     }
 
     enum class HostWorkClass : std::uint8_t {

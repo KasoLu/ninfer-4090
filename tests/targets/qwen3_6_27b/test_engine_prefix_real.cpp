@@ -1697,6 +1697,97 @@ int exercise_auto_save_evicted(const char* artifact) {
     return 0;
 }
 
+// Regression, D2 (2026-09-02): the spill target is a property of the SESSION, not of the
+// catalog cell. Pre-catalog code cleared the lane binding whenever the lane's session was
+// destroyed ("start the new session unbound either way so a later eviction can never write it
+// over the previous session's file"); the catalog port dropped that clear, so an unrelated
+// session that later occupied the same cell spilled over the bound session's file. In
+// production this turned a test snapshot into 3.5 GB of somebody else's conversation.
+//
+// Single-cell private catalog, so every new session evicts the previous one:
+//   A is saved to F, then evicted -> F holds A (correct spill).
+//   B never binds anything, then is evicted -> F must be untouched.
+// Under the defect B's eviction rewrites F, and the restore below comes back as B.
+int exercise_auto_save_binding_is_per_session(const char* artifact) {
+    ninfer::EngineOptions options                   = engine_options(artifact);
+    options.enable_vision                           = false;
+    options.auto_save_evicted                       = true;
+    options.context_cache.max_private_continuations = 1;
+    ninfer::Engine engine(options);
+
+    const std::string slot_file =
+        (std::filesystem::temp_directory_path() / "ninfer-auto-save-binding-test.bin").string();
+    struct FileGuard {
+        std::string path;
+        ~FileGuard() { (void)std::remove(path.c_str()); }
+    } guard{slot_file};
+
+    auto text_message = [](ninfer::ChatRole role, std::string text) {
+        ninfer::ChatMessage message;
+        message.role = role;
+        message.parts.push_back(ninfer::MessagePart{
+            .kind = ninfer::MessagePartKind::Text, .text = std::move(text), .media = {}});
+        return message;
+    };
+    auto chat = [&](std::vector<ninfer::ChatMessage> messages) {
+        ninfer::PromptInput input;
+        input.messages                = std::move(messages);
+        input.options.enable_thinking = false;
+        return input;
+    };
+    ninfer::RequestOptions request;
+    request.execution.requested_output_tokens = 8;
+    request.execution.sampling.temperature    = 0.0F;
+    request.execution.allow_prefix_reuse      = true;
+    request.stop.include_model_defaults       = false;
+
+    const ninfer::GenerationResult bound = engine.generate(
+        engine.prepare(chat({text_message(ninfer::ChatRole::User, "Name two planets. Be brief.")})),
+        request);
+    if (bound.slot < 0 || bound.session_digest.empty()) {
+        std::cerr << "binding fixture session A did not retain a catalogued session\n";
+        return 1;
+    }
+    const auto slot                    = static_cast<std::uint32_t>(bound.slot);
+    const ninfer::SlotSaveResult saved = engine.save_slot(slot, slot_file, bound.session_digest);
+    if (saved.tokens == 0) {
+        std::cerr << "binding fixture explicit save moved no tokens\n";
+        return 1;
+    }
+
+    // B evicts A. A is bound, so it spills back to F - the behavior the sibling exercise pins.
+    const ninfer::GenerationResult foreign = engine.generate(
+        engine.prepare(chat({text_message(ninfer::ChatRole::User, "Name two colors. Be brief.")})),
+        request);
+    if (foreign.reused_prompt_tokens != 0 || foreign.session_digest == bound.session_digest) {
+        std::cerr << "binding fixture session B did not displace session A\n";
+        return 1;
+    }
+
+    // C evicts B. B bound no file, and it must not inherit A's.
+    const ninfer::GenerationResult evictor = engine.generate(
+        engine.prepare(chat({text_message(ninfer::ChatRole::User, "Name two rivers. Be brief.")})),
+        request);
+    if (evictor.reused_prompt_tokens != 0) {
+        std::cerr << "binding fixture session C unexpectedly reused a resident session\n";
+        return 1;
+    }
+
+    // restore_slot drains the writer queue before reading, so a wrong spill is visible here.
+    const ninfer::SlotRestoreResult restored = engine.restore_slot(slot, slot_file);
+    if (restored.session_digest == foreign.session_digest) {
+        std::cerr << "an unbound session spilled over the bound session's file: " << slot_file
+                  << " came back as session B (" << restored.session_digest << ")\n";
+        return 1;
+    }
+    if (restored.session_digest != bound.session_digest) {
+        std::cerr << "bound session file no longer holds session A: restored "
+                  << restored.session_digest << " vs " << bound.session_digest << '\n';
+        return 1;
+    }
+    return 0;
+}
+
 int exercise_artifact(const char* artifact, std::string_view expected_target) {
     {
         ninfer::EngineOptions options             = engine_options(artifact);
@@ -1742,7 +1833,8 @@ int exercise_artifact(const char* artifact, std::string_view expected_target) {
         return result;
     }
     // Own Engine (and scope) per exercise: auto-save-on-eviction is a startup option.
-    return exercise_auto_save_evicted(artifact);
+    if (const int result = exercise_auto_save_evicted(artifact); result != 0) { return result; }
+    return exercise_auto_save_binding_is_per_session(artifact);
 }
 
 int main() {
@@ -1837,6 +1929,10 @@ int main() {
         // Fork-local session persistence rides the Qwen3.8 artifact in production; its
         // auto-save-on-eviction E2E must run whenever that artifact is available.
         if (const int result = exercise_auto_save_evicted(qwen38_groupwise); result != 0) {
+            return result;
+        }
+        if (const int result = exercise_auto_save_binding_is_per_session(qwen38_groupwise);
+            result != 0) {
             return result;
         }
     }
