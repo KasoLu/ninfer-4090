@@ -307,7 +307,7 @@ public:
         }
         require_session_digest(view, expected_digest);
         auto snapshot = instance_.program->save_continuation(*view.handle, model_binding);
-        if (!session_path.empty()) { slot_session_paths_[slot] = session_path; }
+        bind_slot_session(slot, session_path);
         return snapshot;
     }
 
@@ -352,7 +352,7 @@ public:
             (void)instance_.program->release_continuation(std::move(restored));
             throw;
         }
-        if (!session_path.empty()) { slot_session_paths_[slot] = session_path; }
+        bind_slot_session(slot, session_path);
         publish_runtime_stats();
         return {tokens, std::move(digest)};
     }
@@ -453,6 +453,25 @@ private:
     void clear_slot_session(std::uint32_t slot) noexcept {
         if (slot >= slot_session_paths_.size()) { return; }
         slot_session_paths_[slot].clear();
+    }
+
+    // A slot file is bound to at most ONE catalog cell. A session's live continuation migrates
+    // between cells turn to turn (a long-anchor or rewrite restore retains its source), so an
+    // older copy of the same session can stay retained in another cell, still bound to the
+    // same file, for days. When that stale copy was evicted it spilled over the newer save
+    // (D3, 2026-09-04: a 78,020-token file overwritten by a two-day-old 31,505-token copy,
+    // which pi then restored). The newest binding wins: whoever saves or restores a path owns
+    // it, and every other cell holding that path is unbound so its eviction can no longer
+    // write the file. The displaced copy then evicts silently, which is right - the client
+    // has just declared the file authoritative. Called under execution_mutex_.
+    void bind_slot_session(std::uint32_t slot, std::string_view session_path) {
+        if (session_path.empty() || slot >= slot_session_paths_.size()) { return; }
+        for (std::size_t other = 0; other < slot_session_paths_.size(); ++other) {
+            if (other != slot && slot_session_paths_[other] == session_path) {
+                slot_session_paths_[other].clear();
+            }
+        }
+        slot_session_paths_[slot] = std::string(session_path);
     }
 
     enum class HostWorkClass : std::uint8_t {

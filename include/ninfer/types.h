@@ -132,6 +132,9 @@ struct SlotAutoSaveEvent {
     std::size_t bytes    = 0;
     double seconds       = 0.0;
     std::string error; // empty on success
+    // Set when the spill was refused because the file already holds a deeper snapshot of
+    // this path (the token count on record). Nothing was written; error stays empty.
+    std::optional<std::uint32_t> skipped_behind_tokens;
 };
 
 struct ContextCacheOptions {

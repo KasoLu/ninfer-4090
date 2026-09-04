@@ -241,7 +241,12 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
         engine_options.auto_save_listener = [logger = logger_](
                                                 const ninfer::SlotAutoSaveEvent& event) {
             if (!logger) { return; }
-            if (event.error.empty()) {
+            if (event.skipped_behind_tokens) {
+                logger->info("{}", "slot auto-save SKIPPED file=" + event.path +
+                                       " n_spill=" + std::to_string(event.tokens) +
+                                       " n_file=" + std::to_string(*event.skipped_behind_tokens) +
+                                       " (a deeper snapshot already holds this file)");
+            } else if (event.error.empty()) {
                 logger->info("{}", "slot auto-save file=" + event.path +
                                        " n_saved=" + std::to_string(event.tokens) +
                                        " bytes=" + std::to_string(event.bytes));

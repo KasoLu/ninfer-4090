@@ -1902,6 +1902,130 @@ int exercise_auto_save_binding_is_per_session(const char* artifact) {
     return 0;
 }
 
+// D3: a stale resident copy of a session must not spill over a newer save of the same file.
+// The production shape: a session's live continuation moves to another cell when a restore
+// RETAINS its source (a long-anchor restore always does), leaving the older copy retained and
+// still bound to the session's file. When that stale copy was later displaced it spilled over
+// the file, rolling a 78k session back to a two-day-old 31k. Two layers each prevent it: the
+// newest binding unbinds every other cell holding the path, and the writer refuses a spill
+// shallower than what the file already holds. This exercise fails on a binary with neither.
+//
+// The stale copy is displaced the way production displaced it - a restore into its cell,
+// which spills a bound occupant involuntarily - rather than by admission pressure, whose
+// victim choice is the planner's and not this test's to assume. Three cells keep pressure
+// out of the fixture entirely.
+int exercise_auto_save_stale_copy_does_not_clobber(const char* artifact) {
+    ninfer::EngineOptions options                           = engine_options(artifact);
+    options.enable_vision                                   = false;
+    options.auto_save_evicted                               = true;
+    options.context_cache.max_private_continuations         = 3;
+    options.context_cache.max_long_anchors_per_continuation = 2;
+    options.context_cache.device_state_slots                = 8;
+    options.context_cache.host_state_slots                  = 8;
+    ninfer::Engine engine(options);
+
+    const std::string file_a =
+        (std::filesystem::temp_directory_path() / "ninfer-stale-copy-A.bin").string();
+    const std::string file_c =
+        (std::filesystem::temp_directory_path() / "ninfer-stale-copy-C.bin").string();
+    struct FileGuard {
+        std::string a, c;
+        ~FileGuard() {
+            (void)std::remove(a.c_str());
+            (void)std::remove(c.c_str());
+        }
+    } guard{file_a, file_c};
+
+    auto user = [](std::string text) {
+        ninfer::ChatMessage message;
+        message.role = ninfer::ChatRole::User;
+        message.parts.push_back(ninfer::MessagePart{
+            .kind = ninfer::MessagePartKind::Text, .text = std::move(text), .media = {}});
+        return message;
+    };
+    auto chat = [&](std::vector<ninfer::ChatMessage> messages) {
+        ninfer::PromptInput input;
+        input.messages                                = std::move(messages);
+        input.options.enable_thinking                 = false;
+        input.context_cache.automatic_private_anchors = 2; // anchors after messages 1 and 2
+        return input;
+    };
+    ninfer::RequestOptions request;
+    request.execution.requested_output_tokens = 8;
+    request.execution.sampling.temperature    = 0.0F;
+    request.execution.allow_prefix_reuse      = true;
+    request.stop.include_model_defaults       = false;
+
+    // An unrelated session C, saved to its own file: the thing we will restore OVER the stale
+    // copy later to displace it.
+    const ninfer::GenerationResult c = engine.generate(
+        engine.prepare(chat({user("Name two colors. Be brief.")})), request);
+    if (c.slot < 0 || c.session_digest.empty()) {
+        std::cerr << "stale-copy fixture: C did not retain a catalogued session\n";
+        return 1;
+    }
+    (void)engine.save_slot(static_cast<std::uint32_t>(c.slot), file_c, c.session_digest);
+
+    // Session A, first state: three short messages, saved to F.
+    const ninfer::GenerationResult a1 = engine.generate(
+        engine.prepare(chat({user("Name two planets. Be brief."), user("Now two moons. Be brief."),
+                             user("Now one comet. Be brief.")})),
+        request);
+    if (a1.slot < 0 || a1.slot == c.slot || a1.session_digest.empty()) {
+        std::cerr << "stale-copy fixture: A1 did not retain a catalogued session of its own\n";
+        return 1;
+    }
+    const auto slot_a1 = static_cast<std::uint32_t>(a1.slot);
+    const ninfer::SlotSaveResult saved_a1 = engine.save_slot(slot_a1, file_a, a1.session_digest);
+
+    // Session A, newer state: rewrite the third message. The divergence sits two messages back,
+    // so the only reuse candidate is the automatic anchor after message 2, and a long-anchor
+    // restore RETAINS its source: A1 stays resident in its cell, A2 lands in the third one.
+    const ninfer::GenerationResult a2 = engine.generate(
+        engine.prepare(chat({user("Name two planets. Be brief."), user("Now two moons. Be brief."),
+                             user("Instead, list twelve rivers, twelve mountains and twelve seas, "
+                                  "one per line, and be thorough about each of them.")})),
+        request);
+    if (a2.prefix_reuse_path != ninfer::PrefixReusePath::PrivateLongAnchor || a2.slot < 0 ||
+        a2.slot == a1.slot || a2.slot == c.slot || a2.session_digest == a1.session_digest) {
+        std::cerr << "stale-copy fixture: A2 did not fork A1 through a long anchor into a third "
+                     "cell (path="
+                  << static_cast<int>(a2.prefix_reuse_path) << " slots c/a1/a2=" << c.slot << '/'
+                  << a1.slot << '/' << a2.slot << ")\n";
+        return 1;
+    }
+    // The client saves the newer state to the SAME file. This is the moment the stale copy in
+    // A1's cell must lose its binding (layer 1) and the file's mark must rise (layer 2).
+    const ninfer::SlotSaveResult saved_a2 =
+        engine.save_slot(static_cast<std::uint32_t>(a2.slot), file_a, a2.session_digest);
+    if (saved_a2.tokens <= saved_a1.tokens) {
+        std::cerr << "stale-copy fixture: A2 (" << saved_a2.tokens
+                  << " tokens) is not deeper than A1 (" << saved_a1.tokens << ")\n";
+        return 1;
+    }
+
+    // Displace the stale copy exactly as production did: restore another session into its
+    // cell. restore_retained_lane spills a bound occupant involuntarily before adopting. On a
+    // binary without the fix, A1 is still bound to F and its spill overwrites the newer save.
+    const ninfer::SlotRestoreResult displaced = engine.restore_slot(slot_a1, file_c);
+    if (displaced.session_digest != c.session_digest) {
+        std::cerr << "stale-copy fixture: restoring C over A1's cell did not yield C\n";
+        return 1;
+    }
+
+    // Read F back. restore_slot drains the writer first, so a clobber is visible here. The
+    // occupant (C, bound to its own file) spills harmlessly to file_c on the way out.
+    const ninfer::SlotRestoreResult restored = engine.restore_slot(slot_a1, file_a);
+    if (restored.session_digest != a2.session_digest || restored.tokens != saved_a2.tokens) {
+        std::cerr << "a stale copy of the session rolled its slot file back: restored "
+                  << restored.tokens << " tokens (" << restored.session_digest << "), expected "
+                  << saved_a2.tokens << " (" << a2.session_digest << "); the old state had "
+                  << saved_a1.tokens << " (" << a1.session_digest << ")\n";
+        return 1;
+    }
+    return 0;
+}
+
 int exercise_artifact(const char* artifact, std::string_view expected_target) {
     {
         ninfer::EngineOptions options             = engine_options(artifact);
@@ -1951,7 +2075,10 @@ int exercise_artifact(const char* artifact, std::string_view expected_target) {
     }
     // Own Engine (and scope) per exercise: auto-save-on-eviction is a startup option.
     if (const int result = exercise_auto_save_evicted(artifact); result != 0) { return result; }
-    return exercise_auto_save_binding_is_per_session(artifact);
+    if (const int result = exercise_auto_save_binding_is_per_session(artifact); result != 0) {
+        return result;
+    }
+    return exercise_auto_save_stale_copy_does_not_clobber(artifact);
 }
 
 int main() {
@@ -2063,6 +2190,10 @@ int main() {
             return result;
         }
         if (const int result = exercise_auto_save_binding_is_per_session(qwen38_groupwise);
+            result != 0) {
+            return result;
+        }
+        if (const int result = exercise_auto_save_stale_copy_does_not_clobber(qwen38_groupwise);
             result != 0) {
             return result;
         }

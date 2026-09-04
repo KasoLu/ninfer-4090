@@ -7,6 +7,7 @@
 #include "runtime/contract/types.h"
 #include "runtime/engine/causal_score_core.h"
 #include "runtime/engine/engine_core.h"
+#include "runtime/engine/slot_spill_guard.h"
 #include "targets/registry.h"
 
 #include <chrono>
@@ -336,6 +337,7 @@ public:
     bool write_in_flight = false;
     bool writer_stop     = false;
     std::thread writer;
+    SlotSpillGuard spill_guard;
 
 private:
     void writer_loop() {
@@ -354,7 +356,14 @@ private:
             event.bytes        = item.snapshot.bytes.size();
             const auto started = std::chrono::steady_clock::now();
             try {
-                write_snapshot_file(item.path, item.snapshot.bytes);
+                if (const std::optional<std::uint32_t> deeper =
+                        spill_guard.blocks(item.path, item.snapshot.tokens)) {
+                    // A stale copy of the session must not roll the file back (D3).
+                    event.skipped_behind_tokens = deeper;
+                } else {
+                    write_snapshot_file(item.path, item.snapshot.bytes);
+                    spill_guard.note_spilled(item.path, item.snapshot.tokens);
+                }
             } catch (const std::exception& error) {
                 event.error = error.what();
             } catch (...) {
@@ -695,6 +704,7 @@ SlotSaveResult Engine::save_slot(std::uint32_t lane, const std::string& path,
         impl_->core);
 
     Impl::write_snapshot_file(path, snapshot.bytes);
+    impl_->spill_guard.note_authoritative(path, snapshot.tokens);
 
     SlotSaveResult result;
     result.tokens         = snapshot.tokens;
@@ -733,6 +743,8 @@ SlotRestoreResult Engine::restore_slot(std::uint32_t lane, const std::string& pa
             }
         },
         impl_->core);
+
+    impl_->spill_guard.note_authoritative(path, restored.first);
 
     SlotRestoreResult result;
     result.tokens         = restored.first;
