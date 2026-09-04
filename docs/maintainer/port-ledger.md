@@ -90,6 +90,94 @@ an RTX 5090"): it may be the sm_89 form of the Don-Chad `7afc8e17` row still ope
 which needs `DeviceContext::sm_count()`, our own per-SM occupancy figures and a
 `kMinSupportedSmCount`.
 
+## Inbound sweep 2026-09-04 (all remotes and forks)
+
+Survey of `neroued/master` (upstream), `Don-Chad/ninfer-3090` (the 3090 base),
+`UDPSendToFailed/ninfer-4090`, the 13 forks of this repository, and the recently active forks
+of upstream and of the 3090 base. Counts are commits absent from `rtx4090-port` at `4565c832`.
+Bodies were read from the commits, not inferred from subjects; applicability was checked
+against this tree.
+
+### Upstream `neroued/master`: 20 commits since the 2026-09-01 catch-up
+
+`5438b743` to `ad0f3d38`. Ranked by value to this fork:
+
+| Commit | What it does | Value | Merge risk |
+|---|---|---|---|
+| `a140e7ae` preserve exact agent prefix reuse (43 files) | Makes NInfer's own accepted output an exact endpoint for an unmodified replay: the Frontend detects the reconstruction boundary, the Engine carries accepted-prefix metadata, the Program commits identity atomically. Preserves JSON member order in tool schemas and tool arguments end to end. Consumes Claude Code's `x-anthropic-billing-header` System block before identity construction. Raises default shared capacity to `max(max_concurrency, 4)`. Fewer turns diverge at all, which complements the automatic anchors. | High | engine_core.h, anthropic_messages.h |
+| `b8786751` correct aliased state ownership (program_impl.h, 356 lines; 264 test lines) | Separates global physical occupancy from owner-exclusive resources and fixes borrowed-read lifetime for a Fork from a retained source. That is the path every long-anchor restore takes. | High, correctness | program_impl.h, heavy |
+| `3b50962b`, `0c5d570c`, `719d56ef` tool-call frontend | Schema-guided typed conversion of Qwen's untyped parameter text; embedded `<parameter=...>` markup preserved with fallback to content when unbalanced; structure recognition separated from normalization. Relevant to pi's tool loop. Not a repair for the `<function=command>` slip, which falls back to content by design today. | Medium | frontend, docs |
+| `550d0ac3` llama.cpp timing and prompt progress; `5f6d44e4` health reports engine readiness; `6e2786c5` readable operational logs | Each collides with a fork-local feature: our `timings` block, our `/health` port `60764d66`, our LOG-CONTRACT. Reconcile by hand. | Medium | serve, conflict-heavy |
+| `e51b585c` respect cooperative launch capacity | Sources the SM count from `DeviceContext` and keeps the 5090 route table. The generic form of the open `7afc8e17` row; our gating-proj plan hardcodes 128 SMs. | High for other Ada cards, low for the 4090 | gdn kernels |
+| `4ac73c47`, `21a0e85f`, `a2761ec1` KV cache | nvfp4 and k8v4 modes, fp16 V storage and PV compute, centralized format contracts. Ada has no FP4 tensor cores. fp16 V may move numerics and speed of every mode. | Low; bench first | same layer as our E8 modes |
+| the rest | httplib 0.54.1, dflash vision, media bench, rmsnorm and MoE perf (the 27B is dense), fixtures, funding | Low | none |
+
+### 3090 base `origin/master`: 36 commits of its own
+
+- `5820660d` sum the unsplit GDN gating projection's K reduction pairwise. Numerics:
+  `ninfer_gdn_gating_proj_test` exceeded the fp32 relative-L2 bound at T=3457 and T=4097. Our
+  `bf16_gdn_gating_proj_gemm_mma.cuh` has no pairwise reduction and differs from their post-fix
+  file. **High.** Run our test at those two T values first; port if it fails.
+- `7afc8e17` resident-CTA budget from the runtime SM count: still open. Take the upstream form
+  `e51b585c` instead.
+- `249d96c3` stop aborting startup on a device-wide memory reading: check whether our startup
+  has the same abort. Low.
+- `aea729f3` stream tool-call whitespace linearly: small. Low.
+- Everything else is MSVC and Windows portability, a NixOS flake, 3090 bench cohorts, the ECC
+  startup warning, and docs. Not applicable.
+
+### UDP `feat/rtx-4090-sm89-native`: 127 commits of its own
+
+- Already handled: `dd5206f0` (ported), `05a88712` (closed), `8488278c` and `e2556b50` (not
+  applicable), and `8bba5eb4` malformed UTF-8 repair, which this tree already has
+  (`consume_generated_utf8`, `kUtf8Replacement`).
+- `c15e0e9e` chunk KV snapshot staging into bounded page batches. Their save and restore
+  allocated one buffer the size of the whole snapshot and ran out of memory at 280K on 24 GB.
+  Our v3 serializer does not use that staging code; peak memory of a 5 GB save here is
+  unmeasured. Low. Measure before porting.
+- `5e76d11a` MTP restore stride: fixes their staging code. Our restores reuse MTP correctly in
+  production (96 to 99% reuse after restore). Not applicable unless it reproduces.
+- `378e0ad8` scale default max tokens to context size: policy; pi sets `max_tokens`. Low.
+- About 30 perf commits from 09-01 and 09-02 (small-T tensor-core routing, W8 and Q5 wave-tax
+  removal, GDN conv staging, decode grid alignment). Bench-first rule stands. Start with
+  `45a5ae57`.
+
+### Forks of this repository (13, compared against `rtx4090-port`)
+
+| Fork | Ahead | What is there | Decision |
+|---|---:|---|---|
+| xkeyC/ninfer-4090 | 5 | `69e6ae19` chunked host prefix reuse: `--host-prefix-cache-mib`, content-hashed 64-token KV page groups plus GDN state blocks stored once across branches, recency-and-frequency eviction, restore streamed to pinned staging. `14faf879` prefix cache hits in `usage`. `60a5c687` stream retained snapshot blocks. Measured: four agents rotating to 200K on a 4090 with a 20 GiB host cache, median TTFT 4.36 s against 150 s cold, 627 requests. | **High.** This addresses our "three sessions on two cells thrash" directly. About 2,000 lines on a base 177 commits behind ours: a design port, not a cherry-pick, after the upstream merge. `14faf879` alone is small and lets pi display cache hits. |
+| tensorninja/ninfer-4090 | 31 | `e3a129c3` record why a deferred continuation restore never returns: four `ContinuationDiagnostics` fields in the JSONL around the restore gate (4 files). The rest is LoRA training and a dashboard. | **High, small.** Fills our "a failed restore logs nothing" gap. Builds on their `c1e4eb1e` deferral semantics; check we have the equivalent. |
+| pxzleo/ninfer-4090-48g | 35 | A web UI (throughput charts, themes) and 48 GB card support. | Not applicable to a 24 GB card; a UI is a separate product decision. |
+| jomcgi | 2 | `chat_template_kwargs` aliases (ported as `6affed2e`), ghcr CI (declined). | Done. |
+| IronKinoko | 4 | Windows PowerShell packaging. | Not applicable. |
+| shantanusingh16 | 3 | `timings` (ported), llama-swap image, docs. | Done. |
+| pefman | 1 | A docker serve script. | No. |
+| KasoLu, aakash-chaddha, mhux2000, NeuronsReact, HermiG, MohitBurkule | 0 | | |
+
+### Siblings worth knowing about
+
+- `iamwavecut/ninfer-3090` `feat/kv-content-cache-upstream` (17 commits, 72 files, Aug 21 to 24,
+  164 behind the 3090 base): a content-addressed host KV cache with prefix and trajectory
+  restore, and coalescing of identical in-flight prompts. The same idea as xkeyC's block cache
+  on an older base. Read for design, do not port.
+- Other-hardware ports of upstream (gfx906, V100, RTX Pro 4000, Windows, C#): not applicable.
+
+### Recommended order for the next session
+
+1. Upstream catch-up merge to `ad0f3d38`. Items `a140e7ae`, `b8786751`, the tool-call trio and
+   `e51b585c` ride along; reconcile the three serve collisions by hand; bench the KV-cache
+   trio before accepting it. Same procedure as 2026-09-01: compile early, expect cluster-A
+   conflicts in engine_core.h and program_impl.h, where the A2 persistence, D2, D3 and the
+   automatic anchors all live.
+2. `5820660d`: run `ninfer_gdn_gating_proj_test` at T=3457 and T=4097 on our kernel; port if
+   it fails.
+3. tensorninja `e3a129c3` restore diagnostics.
+4. xkeyC `14faf879` cached tokens in `usage`. Evaluate the host prefix block cache as a design
+   port afterwards, with the four-agent 200K rotation as the acceptance test.
+5. The pending `fix/d1-planner-search-budget` rebase (D1b). Re-measure with the diag field
+   first: `a140e7ae` and `b8786751` may change the planner picture.
+
 ## Upstream catch-up backlog (as of 2026-09-01)
 
 `neroued/master` is 16 commits ahead of the `6b94b8c5` merge target, touching 309 files,
