@@ -291,14 +291,16 @@ GCC 13, and CMake 3.28 or newer; the Docker image builds with CUDA 13.1.
   holds at any `--max-concurrency`.
 - **Slot session save/restore.** `--slot-save-path DIR` (off by default) enables llama.cpp-style
   `POST /slots/{id}?action=save|restore|erase`: one idle slot's complete resident session -
-  paged Text and MTP KV, GDN linear-attention state, turn checkpoint, and prefix identity -
-  moves to or from disk, and a restored slot reuses the cache across server restarts instead of
-  re-prefilling (a 6.9k-token session restores in about 0.1 s against a multi-second reprefill).
+  paged Text and MTP KV, GDN linear-attention state, rewrite checkpoint, long anchors, and
+  prefix identity - moves to or from disk, and a restored slot reuses the cache across server
+  restarts instead of re-prefilling (a 6.9k-token session restores in about 0.1 s against a
+  multi-second reprefill).
   Sessions are identified by a stable `session_digest`; chat completions carry `id_slot` and the
   digest next to `timings`, and `save`/`erase` accept an `if_digest` precondition checked
-  atomically, so a client always persists exactly the session it means. Restore extends the
-  saved frontier (or its turn checkpoint); the GDN state cannot rewind further, and the DFlash
-  backend is not supported. Details in [docs/serving.md](docs/serving.md).
+  atomically, so a client always persists exactly the session it means. A restored session is
+  reusable from its endpoint, its rewrite checkpoint, or any retained long anchor; the GDN
+  state cannot rewind below the deepest retained checkpoint, and the DFlash backend is not
+  supported. Details in [docs/serving.md](docs/serving.md).
 - **Reuse-aware lane choice.** When prefix reuse ties (typically zero for a fresh session),
   admission picks the lane whose occupation costs least to replace - an empty lane before any
   retained session, then the shallowest - so a burst request no longer evicts a deep resident
@@ -313,14 +315,35 @@ GCC 13, and CMake 3.28 or newer; the Docker image builds with CUDA 13.1.
   retained anchors track the most recent boundaries and coverage reaches back exactly the
   cap: an edit deeper than `--max-long-anchors-per-continuation` boundaries still re-prefills
   from zero, so raise the cap and this flag together (and `--host-state-slots` with them) for
-  deeper history. Anchors ride the existing catalog, pressure planner and slot snapshots. This
-  replaces the retired `--turn-checkpoints` ring
+  deeper history. Measured on agent traffic, 94% of consecutive prompts are pure appends and
+  96.5% of the remaining history rewrites are two messages deep or less, so the default cap of
+  2 covers 99.8% of turns. The rare deeper edits replace the whole history from message one or
+  two, where no anchor can help. Anchors ride the existing catalog, pressure planner and slot
+  snapshots. This replaces the retired `--turn-checkpoints` ring
   ([docs/turn-checkpoint-ring.md](docs/turn-checkpoint-ring.md)).
 - **Auto-save on eviction.** `--auto-save-evicted` (off by default, requires
-  `--slot-save-path`) spills an involuntarily evicted session - checkpoint ring included -
-  back to the slot file it was last saved to or restored from, before the eviction destroys
-  it. Rotating more sessions than slots then loses nothing: the next restore recovers the
-  session at its latest frontier. Explicit `erase` never auto-saves.
+  `--slot-save-path`) spills an involuntarily evicted session - endpoint, rewrite checkpoint
+  and long anchors included - back to the slot file it was last saved to or restored from,
+  before the eviction destroys it. Rotating more sessions than slots then loses nothing: the
+  next restore recovers the session at its latest frontier. Explicit `erase` never auto-saves.
+  Two rules keep a spill from losing data. First, a slot file is bound to at most one slot at
+  a time: the most recent `save` or `restore` of a path owns it, and every other slot that held
+  the same path is unbound. A stale copy of a session, left behind when a restore retains its
+  source, therefore cannot write the file when it is evicted. Second, a spill never rolls a
+  file back: a spill with fewer tokens than the file already holds is refused and logged as
+  `slot auto-save SKIPPED`, while an explicit `save` always wins. Without these rules a
+  two-day-old copy of a live session once overwrote its 78k-token file, and the client resumed
+  the rolled-back state.
+- **Planner diagnostics in the request JSONL.** `--request-log-jsonl FILE` records, per
+  request, the reuse path the planner chose (`prefix_reuse_path`), the prefix tokens it reused,
+  and the materialization search behind the choice: `stop_reason`, `budget_exhausted`,
+  `selected_maximal_fallback`, `targets_evaluated`, and `best_reuse_prompt_tokens`, the most
+  reuse any candidate offered. That last field separates the two causes of a cold prefill. A
+  value of `0` means that no reuse candidate existed, so the cause sits upstream of the planner:
+  a missing anchor or a changed prefix. A large value beside `prefix_reuse_path=root` means
+  that a candidate existed and the planner rejected it, which points at the search itself.
+  `/metrics` carries only the llama.cpp-compatible subset, so this file is the only place these
+  fields appear. Field reference in [docs/serving.md](docs/serving.md).
 - **NVFP4-A4 test gating.** The A4 activation tests skip on hardware without FP4 tensor cores
   instead of aborting. The full remaining suite passes on the RTX 4090.
 - **E8 lattice KV quantization (ported).** The `rk8v4`/`rk4v4`/`rk4v4-e8`/`rk2v4-e8` KV modes
@@ -370,9 +393,18 @@ upstream engine, not the file. Verify the download against the SHA-256 published
 Qwen3.8-27B has three trained reasoning depths plus an off switch. OpenAI Chat Completions
 accepts a top-level `reasoning_effort` field (`low`, `medium`, `xhigh`) and a top-level
 `enable_thinking` boolean; hidden reasoning returns separately as `message.reasoning_content`.
-The `chat_template_kwargs` request field of llama.cpp is not supported and is rejected. For the
-CLI, pass `--reasoning-effort` or `--no-thinking`. Sampling defaults come from the model card and
-switch with the thinking mode.
+Only those three levels are accepted, plus `none` to turn thinking off. `high`, `minimal`, and
+`max` are rejected as `reasoning_effort_not_supported`, so a client that offers a `high` setting
+must map it to `xhigh`. A token budget for reasoning is separate from the effort level. It is
+set only through the Anthropic Messages path (`thinking.budget_tokens`) or server-wide with
+`--default-thinking-budget N`; the OpenAI paths have no field for it. Without a budget,
+reasoning is bounded only by the request's `max_tokens`, which is what the model card
+recommends, and the `model_thinking_tokens` field of the request JSONL reads zero, because that
+counter runs only under a budget. The `chat_template_kwargs` request field of llama.cpp is not
+supported and is rejected. For the CLI, pass `--reasoning-effort` or `--no-thinking`. Sampling
+defaults come from the model card and switch with the thinking mode: `temperature=1.0`,
+`top_p=0.95`, `top_k=20` in thinking mode; `temperature=0.7`, `top_p=0.80`, `top_k=20`,
+`presence_penalty=1.5` in non-thinking mode.
 
 ## Serving APIs
 
