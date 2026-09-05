@@ -267,7 +267,7 @@ smem K tile 仍是 `64×256` int8（`kCausalPromptI8KBytes`），`mma_s8`/swizzl
 **结论**：K6 档（3.05× KV 压缩，336 vs 1024 B/token/head）在所有带真值的客观指标上与 bf16 无差异（短答逐题一致），长生成正常——rk6v4-e8 无客观退化。
 
 **评测缺口（后续补）**：
-- Perplexity（NLL）是最客观的单标量，但 `apps/perplexity` 目前仅支持 `--kv-dtype bf16|int8|fp8`，需扩展到 rk 族后在 `eval/corpora/perplexity-1m` 1k 语料上补三档 PPL。
+- Perplexity（NLL）：`apps/perplexity` 的 `--kv-dtype` 已扩到全档位，quick（26 万 token）与 full（104 万 token，16 流）四档复测均完成，full 定稿见 §7.7——**已关闭**。
 - 检索门（needle-in-a-haystack / code-detail，README 的既有验收口径）尚未在 rk6v4-e8 下跑过。
 - 12 题短答样本量小且已达模型自身错误上限（三档同题同错），后续可扩题或换代码执行类验证。
 
@@ -300,8 +300,35 @@ dim 11 错取 quad3 高 2 位，K 平面 12.5% 维度被污染。写侧（append
 `kv6_roundtrip_check_kernel`（生产 `kv_cache_pack_i6_quad`→`kv_cache_unpack_i6x16` 往返，16×64 全码值全位置
 扫 + 4096 随机块，任何一位不一致 exit 1），防止再犯。
 
-**验证**（4090，修后重跑）：`ninfer_test_kv6_cosine` 回归绿；quick PPL 三档复测（bf16/rk8v4/rk4v4-e8
-不受影响，预期不变；rk6v4-e8 应落回 4.34–4.37 区间，与 rk4v4-e8 同量级）。
+**验证**（4090，修后重跑）：`ninfer_test_kv6_cosine` 回归门禁绿（i6 pack/unpack round-trip 0 mismatches）；quick PPL 四档复测（261167 scored tokens，`eval/corpora/perplexity-1m`），修复前后对照：
+
+| 模式 | 修复前 overall PPL | 修复后 overall PPL | 修复后 vs bf16 |
+|---|---:|---:|---:|
+| bf16（基线） | 4.3431 | 4.3431 | — |
+| rk8v4 | 4.3460 | 4.3460 | +0.067% |
+| rk4v4-e8 | 4.3614 | 4.3614 | +0.421% |
+| **rk6v4-e8** | **4.5222** | **4.3461** | **+0.070%** |
+
+修复后分域（bf16 → rk6v4-e8）：zh 5.0046→5.0112（+0.13%）、en_long 6.8924→6.8988（+0.09%）、en_ref 6.1943→6.1956（+0.02%）、code 1.6527→1.6533（+0.03%）。
+
+**结论**：K6 档 PPL 从 +4.124% 落回 +0.070%，与 bf16/rk8v4 同量级（quick 单跑噪声水平，无任何分域系统性劣化）；"6-bit K 精度 ≈ 8-bit K（rk8v4）、显著优于 4-bit K（rk4v4-e8）"的理论序被实测印证。quick 偏差贴近单跑噪声底，"追平 bf16"的结论以 full（16 流）语料复跑定稿。
+
+**Full 模式定稿**（16 流 ~4MB，1,044,557 scored tokens，ctx 4096/stride 2048，修复后四档全部重跑，2026-09-05）：
+
+| 模式 | overall PPL | vs bf16 |
+|---|---:|---:|
+| bf16（基线） | 4.6504 | — |
+| rk8v4 | 4.6551 | +0.101% |
+| rk4v4-e8 | 4.6677 | +0.372% |
+| **rk6v4-e8** | **4.6564** | **+0.130%** |
+
+分域（bf16 → rk6v4-e8）：zh 5.5868→5.5954（+0.15%）、en_long 7.9222→7.9319（+0.12%）、en_ref 6.3581→6.3683（+0.16%）、code 1.6518→1.6531（+0.08%）。
+
+对照一致性：四档 scored tokens 均为 1,044,557（完全一致）；16 流 SHA-256 全部一致；吞吐 1046–1056 tok/s 齐平——唯一变量是 KV 编码。
+
+注：full 基线（4.6504）高于 quick 基线（4.3431），因 full 取每域全部 4 个切片（quick 仅 00 流），语料整体更难，属语料选择差异；两模式内部的 vs-bf16 相对偏差结论一致。
+
+**定稿结论**：full 模式退化序 bf16 < rk8v4 < rk6v4-e8 < rk4v4-e8 严格随 K 侧 bit 数单调（8>6>4）；K6 比 rk8v4 高 +0.028%（quick 噪声下两者打平，full 样本×4 后拉出真实差距）——正是"只比 rk8v4 低一点点"的设计预期，104 万 token 实证。分域无系统性劣化（0.08%–0.16% 同一量级，code 域最小）。rk6v4-e8 以 3.05× KV 压缩（336 vs 1024 B/token/head）换 +0.13% PPL，精度代价可忽略。PPL 评测项（quick+full）就此关闭。
 
 ---
 
