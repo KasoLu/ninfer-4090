@@ -33,14 +33,14 @@ void causal_attention_prompt_attention_launch_for(const Tensor& q, const Tensor&
         const Tensor& cache_k_scale = cache.k_scale_pages;
         const Tensor& cache_v_scale = cache.v_scale_pages;
         const auto launch_i8 = [&]<bool PackedV, bool RotateK, bool RotateV, bool PackedK,
-                                   bool E8Root>() {
+                                   bool E8Root, bool K6 = false>() {
             static const cudaError_t attr_i8 = cudaFuncSetAttribute(
                 causal_attention_prompt_i8_kernel<Geometry, PackedV, RotateK, RotateV, PackedK,
-                                                  E8Root, Metadata>,
+                                                  E8Root, K6, Metadata>,
                 cudaFuncAttributeMaxDynamicSharedMemorySize, kCausalPromptI8SmemBytes);
             CUDA_CHECK(attr_i8);
             causal_attention_prompt_i8_kernel<Geometry, PackedV, RotateK, RotateV, PackedK, E8Root,
-                                              Metadata>
+                                              K6, Metadata>
                 <<<attention_grid, kCausalPromptI8Threads, kCausalPromptI8SmemBytes, stream>>>(
                     static_cast<const __nv_bfloat16*>(q.data),
                     static_cast<const std::int8_t*>(cache_k.data),
@@ -52,6 +52,8 @@ void causal_attention_prompt_attention_launch_for(const Tensor& q, const Tensor&
         };
         if (cache.e8_root) {
             launch_i8.template operator()<true, true, true, false, true>();
+        } else if (cache.k6_bit) {
+            launch_i8.template operator()<true, true, true, true, false, true>();
         } else if (cache.packed_k) {
             launch_i8.template operator()<true, true, true, true, false>();
         } else if (cache.packed_v) {

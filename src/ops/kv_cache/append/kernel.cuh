@@ -203,12 +203,12 @@ __launch_bounds__(256) __global__
 // Eight independent quantization units per CTA; one warp owns one
 // (token, kv_head, 64-d group), with two dimensions per lane.
 template <typename Geometry, bool PackedV, bool RotateK, bool RotateV, bool PackedK,
-          bool E8Lattice = false, bool E8Root = false, typename Metadata>
+          bool E8Lattice = false, bool E8Root = false, bool K6 = false, typename Metadata>
 __launch_bounds__(256) __global__
     void kv_cache_append_full_i8_kernel(const __nv_bfloat16* __restrict__ k,
                                               const __nv_bfloat16* __restrict__ v,
                                               const std::int32_t* __restrict__ positions,
-                                              Metadata metadata, std::int8_t* __restrict__ cache_k,
+                                              Metadata metadata, std::uint8_t* __restrict__ cache_k,
                                               std::uint8_t* __restrict__ cache_v,
                                               __half* __restrict__ scale_k,
                                               __half* __restrict__ scale_v, std::int32_t width) {
@@ -246,7 +246,7 @@ __launch_bounds__(256) __global__
     k_abs       = warp_max(k_abs, FullMask);
     v_abs       = warp_max(v_abs, FullMask);
 
-    const __half ksh = __float2half_rn(k_abs > 0.0f ? k_abs / ((PackedK || E8Root) ? 7.0f : 127.0f) : 0.0f);
+    const __half ksh = __float2half_rn(k_abs > 0.0f ? k_abs / (K6 ? 31.0f : ((PackedK || E8Root) ? 7.0f : 127.0f)) : 0.0f);
     const __half vsh = __float2half_rn(v_abs > 0.0f ? v_abs / (PackedV ? 7.0f : 127.0f) : 0.0f);
     const float ks   = __half2float(ksh);
     const float vs   = __half2float(vsh);
@@ -269,6 +269,43 @@ __launch_bounds__(256) __global__
             reinterpret_cast<std::uint8_t*>(cache_k)[k_base + s0 * 2 + 1] = c2_0;
             reinterpret_cast<std::uint8_t*>(cache_k)[k_base + s1 * 2 + 0] = c1_1;
             reinterpret_cast<std::uint8_t*>(cache_k)[k_base + s1 * 2 + 1] = c2_1;
+        }
+        const float v0_hi = __shfl_down_sync(FullMask, v0, 1);
+        const float v1_hi = __shfl_down_sync(FullMask, v1, 1);
+        if ((lane & 1) == 0) {
+            cache_v[kv_cache_i4_code_index<Geometry>(page, kv_head, d0 / 2, page_off)] =
+                kv_cache_pack_i4(kv_cache_i4_quant_code(v0, vinv), kv_cache_i4_quant_code(v0_hi, vinv));
+            cache_v[kv_cache_i4_code_index<Geometry>(page, kv_head, d1 / 2, page_off)] =
+                kv_cache_pack_i4(kv_cache_i4_quant_code(v1, vinv), kv_cache_i4_quant_code(v1_hi, vinv));
+        }
+    } else if constexpr (K6) {
+        float k0_scaled = k0 * kinv;
+        float k1_scaled = k1 * kinv;
+        e8_project_8d_warp(k0_scaled, k1_scaled, lane);
+        // NOTE: same deliberate half-coset approximation as the rk4v4-e8 path: the D8+0.5
+        // E8 coset is collapsed by the rintf() below and never reconstructed, since no
+        // coset bit exists in the packed i6 codes.
+        std::uint8_t c0 = kv_cache_i6_code_from_int(static_cast<int>(rintf(k0_scaled)));
+        std::uint8_t c1 = kv_cache_i6_code_from_int(static_cast<int>(rintf(k1_scaled)));
+        // Four consecutive lanes hold one 24-bit quad (3 bytes); each 4-lane leader writes
+        // one quad of the d0 half (24 B) and the d1 half (offset +24) of this group row.
+        const std::int64_t k_row =
+            paged_kv_page_head_offset<kKVCacheI6HeadExtent, Geometry::KVHeads>(page, kv_head) +
+            static_cast<std::int64_t>(page_off) * kKVCacheI6HeadExtent + group * 48;
+        if ((lane & 3) == 0) {
+            std::uint8_t quad0[4];
+            std::uint8_t quad1[4];
+            quad0[0] = c0;
+            quad1[0] = c1;
+#pragma unroll
+            for (int o = 1; o < 4; ++o) {
+                quad0[o] = static_cast<std::uint8_t>(__shfl_down_sync(FullMask, static_cast<int>(c0), o));
+                quad1[o] = static_cast<std::uint8_t>(__shfl_down_sync(FullMask, static_cast<int>(c1), o));
+            }
+            const int quad_off = (lane >> 2) * 3;
+            auto* k_bytes = reinterpret_cast<std::uint8_t*>(cache_k);
+            kv_cache_pack_i6_quad(quad0, &k_bytes[k_row + quad_off]);
+            kv_cache_pack_i6_quad(quad1, &k_bytes[k_row + 24 + quad_off]);
         }
         const float v0_hi = __shfl_down_sync(FullMask, v0, 1);
         const float v1_hi = __shfl_down_sync(FullMask, v1, 1);
@@ -341,11 +378,11 @@ __launch_bounds__(256) __global__
 // Large appends are scheduled in absolute eight-token tiles. Eight divides P=64, so each CTA is
 // page-local while an unknown base offset costs at most one empty tail CTA in the launch envelope.
 template <typename Geometry, bool PackedV, bool RotateK, bool RotateV, bool PackedK,
-          bool E8Lattice = false, bool E8Root = false, typename Metadata>
+          bool E8Lattice = false, bool E8Root = false, bool K6 = false, typename Metadata>
 __launch_bounds__(256) __global__ void kv_cache_append_full_i8_page_kernel(
     const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
     const std::int32_t* __restrict__ positions, Metadata metadata,
-    std::int8_t* __restrict__ cache_k, std::uint8_t* __restrict__ cache_v,
+    std::uint8_t* __restrict__ cache_k, std::uint8_t* __restrict__ cache_v,
     __half* __restrict__ scale_k, __half* __restrict__ scale_v, std::int32_t width) {
     constexpr int TokensPerTile = 8;
     constexpr unsigned FullMask = 0xffffffffu;
@@ -382,7 +419,7 @@ __launch_bounds__(256) __global__ void kv_cache_append_full_i8_page_kernel(
     }
     const float k_abs = warp_max(fmaxf(fabsf(k0), fabsf(k1)), FullMask);
     const float v_abs = warp_max(fmaxf(fabsf(v0), fabsf(v1)), FullMask);
-    const __half ksh  = __float2half_rn(k_abs > 0.0f ? k_abs / ((PackedK || E8Root) ? 7.0f : 127.0f) : 0.0f);
+    const __half ksh  = __float2half_rn(k_abs > 0.0f ? k_abs / (K6 ? 31.0f : ((PackedK || E8Root) ? 7.0f : 127.0f)) : 0.0f);
     const __half vsh  = __float2half_rn(v_abs > 0.0f ? v_abs / (PackedV ? 7.0f : 127.0f) : 0.0f);
     const float ks    = __half2float(ksh);
     const float vs    = __half2float(vsh);
@@ -409,6 +446,43 @@ __launch_bounds__(256) __global__ void kv_cache_append_full_i8_page_kernel(
             reinterpret_cast<std::uint8_t*>(cache_k)[k_base + s0 * 2 + 1] = c2_0;
             reinterpret_cast<std::uint8_t*>(cache_k)[k_base + s1 * 2 + 0] = c1_1;
             reinterpret_cast<std::uint8_t*>(cache_k)[k_base + s1 * 2 + 1] = c2_1;
+        }
+        const float v0_hi = __shfl_down_sync(FullMask, v0, 1);
+        const float v1_hi = __shfl_down_sync(FullMask, v1, 1);
+        if ((lane & 1) == 0) {
+            cache_v[kv_cache_i4_code_index<Geometry>(physical_page, kv_head, d0 / 2, page_off)] =
+                kv_cache_pack_i4(kv_cache_i4_quant_code(v0, vinv), kv_cache_i4_quant_code(v0_hi, vinv));
+            cache_v[kv_cache_i4_code_index<Geometry>(physical_page, kv_head, d1 / 2, page_off)] =
+                kv_cache_pack_i4(kv_cache_i4_quant_code(v1, vinv), kv_cache_i4_quant_code(v1_hi, vinv));
+        }
+    } else if constexpr (K6) {
+        float k0_scaled = k0 * kinv;
+        float k1_scaled = k1 * kinv;
+        e8_project_8d_warp(k0_scaled, k1_scaled, lane);
+        // NOTE: same deliberate half-coset approximation as the rk4v4-e8 path: the D8+0.5
+        // E8 coset is collapsed by the rintf() below and never reconstructed, since no
+        // coset bit exists in the packed i6 codes.
+        std::uint8_t c0 = kv_cache_i6_code_from_int(static_cast<int>(rintf(k0_scaled)));
+        std::uint8_t c1 = kv_cache_i6_code_from_int(static_cast<int>(rintf(k1_scaled)));
+        // Four consecutive lanes hold one 24-bit quad (3 bytes); each 4-lane leader writes
+        // one quad of the d0 half (24 B) and the d1 half (offset +24) of this group row.
+        const std::int64_t k_row =
+            paged_kv_page_head_offset<kKVCacheI6HeadExtent, Geometry::KVHeads>(physical_page, kv_head) +
+            static_cast<std::int64_t>(page_off) * kKVCacheI6HeadExtent + group * 48;
+        if ((lane & 3) == 0) {
+            std::uint8_t quad0[4];
+            std::uint8_t quad1[4];
+            quad0[0] = c0;
+            quad1[0] = c1;
+#pragma unroll
+            for (int o = 1; o < 4; ++o) {
+                quad0[o] = static_cast<std::uint8_t>(__shfl_down_sync(FullMask, static_cast<int>(c0), o));
+                quad1[o] = static_cast<std::uint8_t>(__shfl_down_sync(FullMask, static_cast<int>(c1), o));
+            }
+            const int quad_off = (lane >> 2) * 3;
+            auto* k_bytes = reinterpret_cast<std::uint8_t*>(cache_k);
+            kv_cache_pack_i6_quad(quad0, &k_bytes[k_row + quad_off]);
+            kv_cache_pack_i6_quad(quad1, &k_bytes[k_row + 24 + quad_off]);
         }
         const float v0_hi = __shfl_down_sync(FullMask, v0, 1);
         const float v1_hi = __shfl_down_sync(FullMask, v1, 1);
