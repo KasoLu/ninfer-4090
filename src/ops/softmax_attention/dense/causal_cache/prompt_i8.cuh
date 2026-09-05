@@ -118,7 +118,7 @@ __device__ __forceinline__ int4 causal_prompt_i8_dequant_f16x8(const std::int8_t
 #endif
 
 template <typename Geometry, bool PackedV, bool RotateK, bool RotateV, bool PackedK,
-          bool E8Root = false, typename Metadata>
+          bool E8Root = false, bool K6 = false, typename Metadata>
 __global__ __maxnreg__(NINFER_CAUSAL_PROMPT_I8_MAXNREG) void causal_attention_prompt_i8_kernel(
     const __nv_bfloat16* __restrict__ q, const std::int8_t* __restrict__ cache_k,
     const std::uint8_t* __restrict__ cache_v, const __half* __restrict__ cache_k_scale,
@@ -261,6 +261,12 @@ __global__ __maxnreg__(NINFER_CAUSAL_PROMPT_I8_MAXNREG) void causal_attention_pr
                     e8_root_decode_8d_int8(c1_1, c2_1, dec8_1);
                     *reinterpret_cast<uint64_t*>(&kd[0]) = *reinterpret_cast<const uint64_t*>(dec8_0);
                     *reinterpret_cast<uint64_t*>(&kd[8]) = *reinterpret_cast<const uint64_t*>(dec8_1);
+                    const std::int64_t voff =
+                        kv_cache_i4_code_index<Geometry>(physical_page, kv_head, d / 2, key_l);
+                    kv_cache_unpack_i4x16(&cache_v[voff], vd);
+                } else if constexpr (K6) {
+                    const std::int64_t koff = kv_cache_i6_code_index<Geometry>(physical_page, kv_head, d, key_l);
+                    kv_cache_unpack_i6x16(&reinterpret_cast<const std::uint8_t*>(cache_k)[koff], kd);
                     const std::int64_t voff =
                         kv_cache_i4_code_index<Geometry>(physical_page, kv_head, d / 2, key_l);
                     kv_cache_unpack_i4x16(&cache_v[voff], vd);

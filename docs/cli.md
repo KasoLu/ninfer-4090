@@ -204,7 +204,7 @@ The table lists executable defaults. The examples above select FP8 KV and MTP3.
 | `--prefill-chunk N` | positive text-prefill chunk, in multiples of 128 | `1024` |
 | `--max-new N` | requested output-token limit | `128` |
 | `--device N` | CUDA device index | `0` |
-| `--kv-dtype bf16\|int8\|fp8\|rk8v4\|rk4v4\|rk4v4-e8\|rk2v4-e8` | KV-cache storage; rotated and E8-lattice modes trade key/value precision for capacity | `bf16` |
+| `--kv-dtype bf16\|int8\|fp8\|rk8v4\|rk6v4-e8\|rk4v4\|rk4v4-e8\|rk2v4-e8` | KV-cache storage; rotated and E8-lattice modes trade key/value precision for capacity | `bf16` |
 | `--spec mtp\|dflash` | speculative backend | off |
 | `--draft-tokens N` | MTP `1..5`; DFlash `1..15` | unset |
 | `--lm-head-draft` | optimized proposal head | off |
@@ -253,6 +253,8 @@ Use `--kv-dtype int8` for the maximum-precision profile. `--kv-dtype fp8` select
 E4M3 D256 KV storage. The compressed modes store Hadamard-rotated keys and 4-bit values:
 
 - `rk8v4` keeps 8-bit keys.
+- `rk6v4-e8` packs keys to 6 bits on the E8 Conway-Sloane lattice, between `rk8v4` and
+  `rk4v4` in capacity (336 B/token/kv_head; 192 B keys + 128 B values + 16 B scales).
 - `rk4v4` packs keys to 4 bits.
 - `rk4v4-e8` selects 4-bit key codes on the E8 Conway-Sloane lattice. This is the
   recommended long-context mode on the RTX 4090 and fits the full native 262,144

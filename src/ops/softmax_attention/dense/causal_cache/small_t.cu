@@ -121,7 +121,8 @@ void launch_tc_partial_bf16(const Tensor& q, CacheInput input, const Tensor& pos
 }
 
 template <typename Geometry, int TokenTile, bool PackedV, bool RotateK, bool RotateV,
-          bool PackedK, bool E8Lattice, bool E8Root, bool MultiBatch, bool Masked, typename CacheInput>
+          bool PackedK, bool E8Lattice, bool E8Root, bool MultiBatch, bool Masked, bool K6 = false,
+          typename CacheInput>
 void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, float scale,
                           PagedKVBatchLayerView cache, const CausalSmallTInvocation& invocation,
                           std::int32_t logical_capacity, std::int32_t implementation_window,
@@ -142,14 +143,14 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
                                                          MinBlocksPerSm, KeyBlock, DynamicArena,
                                                          PackedV, RotateK, RotateV, PackedK,
                                                          E8Lattice, E8Root, MultiBatch, Masked,
-                                                         CacheInput>,
+                                                         K6, CacheInput>,
                 cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kDynamicBytes));
             CUDA_CHECK(attr);
         }
         causal_attention_small_t_i8_tiled_kernel<Geometry, TokenTile, WarpsPerCta, MinBlocksPerSm,
                                                  KeyBlock, DynamicArena, PackedV, RotateK, RotateV,
                                                  PackedK, E8Lattice, E8Root, MultiBatch, Masked,
-                                                 CacheInput>
+                                                 K6, CacheInput>
             <<<grid, WarpsPerCta * 32, kDynamicBytes, stream>>>(
                 static_cast<const __nv_bfloat16*>(q.data), input,
                 static_cast<const std::int32_t*>(pos.data), static_cast<std::int8_t*>(cache_k.data),
@@ -231,6 +232,7 @@ PagedKVBatchLayerView single_row_batch_view(const PagedKVLayerView& cache) {
         .packed_k      = cache.packed_k,
         .e8_lattice    = cache.e8_lattice,
         .e8_root       = cache.e8_root,
+        .k6_bit        = cache.k6_bit,
     };
 }
 
@@ -280,7 +282,12 @@ void causal_attention_small_t_launch_for(const Tensor& q, CacheInput input, cons
                                          MultiBatch, Masked>(                                      \
                         q, input, pos, scale, cache, invocation, logical_capacity,                 \
                         implementation_window, splits, partial_acc, partial_m, partial_l, stream); \
-                } else if (cache.e8_lattice) {                                                     \
+                } else if (cache.k6_bit) {                                                        \
+                    launch_tc_partial_i8<Geometry, (TOKENS), true, true, true, true, true, false,  \
+                                         MultiBatch, Masked, true>(                                \
+                        q, input, pos, scale, cache, invocation, logical_capacity,                 \
+                        implementation_window, splits, partial_acc, partial_m, partial_l, stream); \
+                } else if (cache.e8_lattice) {                                                       \
                     launch_tc_partial_i8<Geometry, (TOKENS), true, true, true, true, true, false,  \
                                          MultiBatch, Masked>(                                      \
                         q, input, pos, scale, cache, invocation, logical_capacity,                 \

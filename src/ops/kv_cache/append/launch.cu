@@ -55,7 +55,7 @@ void launch_full(const Tensor& k, const Tensor& v, const Tensor& positions, Cach
         Tensor& cache_k_scale = cache.k_scale_pages;
         Tensor& cache_v_scale = cache.v_scale_pages;
         const auto launch_fill = [&]<bool PackedV, bool RotateK, bool RotateV, bool PackedK,
-                                     bool E8Lattice, bool E8Root>() {
+                                     bool E8Lattice, bool E8Root, bool K6 = false>() {
             if (tokens >= 32) {
                 constexpr int TokensPerTile = 8;
                 const int max_tiles = static_cast<int>(div_up(tokens + TokensPerTile, TokensPerTile));
@@ -63,12 +63,12 @@ void launch_full(const Tensor& k, const Tensor& v, const Tensor& positions, Cach
                                      static_cast<unsigned>(Geometry::KVHeads),
                                      static_cast<unsigned>(kKVCacheInt8Groups));
                 kv_cache_append_full_i8_page_kernel<Geometry, PackedV, RotateK, RotateV, PackedK,
-                                                    E8Lattice, E8Root, Metadata>
+                                                    E8Lattice, E8Root, K6, Metadata>
                     <<<fill_grid, kBlock, 0, stream>>>(
                         static_cast<const __nv_bfloat16*>(k.data),
                         static_cast<const __nv_bfloat16*>(v.data),
                         static_cast<const std::int32_t*>(positions.data), metadata,
-                        static_cast<std::int8_t*>(cache_k.data),
+                        static_cast<std::uint8_t*>(cache_k.data),
                         static_cast<std::uint8_t*>(cache_v.data),
                         static_cast<__half*>(cache_k_scale.data),
                         static_cast<__half*>(cache_v_scale.data), tokens);
@@ -79,12 +79,12 @@ void launch_full(const Tensor& k, const Tensor& v, const Tensor& positions, Cach
                 const int fill_grid =
                     static_cast<int>(div_up(fill_units, static_cast<std::int64_t>(FillWarps)));
                 kv_cache_append_full_i8_kernel<Geometry, PackedV, RotateK, RotateV, PackedK,
-                                               E8Lattice, E8Root, Metadata>
+                                               E8Lattice, E8Root, K6, Metadata>
                     <<<fill_grid, kBlock, 0, stream>>>(
                         static_cast<const __nv_bfloat16*>(k.data),
                         static_cast<const __nv_bfloat16*>(v.data),
                         static_cast<const std::int32_t*>(positions.data), metadata,
-                        static_cast<std::int8_t*>(cache_k.data),
+                        static_cast<std::uint8_t*>(cache_k.data),
                         static_cast<std::uint8_t*>(cache_v.data),
                         static_cast<__half*>(cache_k_scale.data),
                         static_cast<__half*>(cache_v_scale.data), tokens);
@@ -92,6 +92,8 @@ void launch_full(const Tensor& k, const Tensor& v, const Tensor& positions, Cach
         };
         if (cache.e8_root) {
             launch_fill.template operator()<true, true, true, false, false, true>();
+        } else if (cache.k6_bit) {
+            launch_fill.template operator()<true, true, true, true, true, false, true>();
         } else if (cache.e8_lattice) {
             launch_fill.template operator()<true, true, true, true, true, false>();
         } else if (cache.packed_k) {

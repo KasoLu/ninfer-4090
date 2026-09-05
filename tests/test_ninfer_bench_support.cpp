@@ -119,6 +119,10 @@ int test_cli_contract() {
         parse_for_test({"ninfer_bench", "--weights", "model.ninfer", "--kv-dtype", "rk2v4-e8"});
     failures += expect(k2_parsed.kv_cache == ninfer::KvCacheStorage::RK2V4E8, "rk2v4-e8 KV");
 
+    const qb::BenchOptions k6_parsed =
+        parse_for_test({"ninfer_bench", "--weights", "model.ninfer", "--kv-dtype", "rk6v4-e8"});
+    failures += expect(k6_parsed.kv_cache == ninfer::KvCacheStorage::RK6V4E8, "rk6v4-e8 KV");
+
     const auto defaults = qb::expand_tests(qb::BenchOptions{});
     failures +=
         expect(defaults.size() == 2 && defaults[0].label == "pp512" && defaults[1].label == "tg128",

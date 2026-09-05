@@ -387,6 +387,19 @@ set_target_properties(ninfer_test_e8_codec PROPERTIES CUDA_ARCHITECTURES "89")
 add_test(NAME ninfer_test_e8_codec COMMAND ninfer_test_e8_codec)
 set_tests_properties(ninfer_test_e8_codec PROPERTIES SKIP_RETURN_CODE 77)
 
+# rk6v4e8 codec-level cosine benchmark (synthetic data; reproduces production
+# append-kernel arithmetic, so it must compile against the shipped headers).
+add_executable(ninfer_test_kv6_cosine
+  ${PROJECT_SOURCE_DIR}/tools/test_kv/test_kv6_cosine.cu)
+target_include_directories(ninfer_test_kv6_cosine PRIVATE
+  ${PROJECT_SOURCE_DIR}/tools/test_kv
+  ${PROJECT_SOURCE_DIR}/src
+  ${PROJECT_SOURCE_DIR}/include)
+target_link_libraries(ninfer_test_kv6_cosine PRIVATE CUDA::cudart)
+set_target_properties(ninfer_test_kv6_cosine PROPERTIES CUDA_ARCHITECTURES "89")
+add_test(NAME ninfer_test_kv6_cosine COMMAND ninfer_test_kv6_cosine)
+set_tests_properties(ninfer_test_kv6_cosine PROPERTIES SKIP_RETURN_CODE 77)
+
 # These tests deliberately compile against the exact target's internal contracts; the target does
 # not export impl/ to ordinary consumers.
 set(ninfer_qwen3_6_27b_internal_tests

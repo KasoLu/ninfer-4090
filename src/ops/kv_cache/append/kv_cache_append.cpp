@@ -61,12 +61,14 @@ std::uint32_t validate_full_cache(const PagedKVLayerView& cache, std::int32_t kv
     // Fork-local packed/rotated/E8 modes store U8 code planes at halved (or, for E8-root keys,
     // quartered) leading extents; the mode flags ride PagedKVLayerView beside the base dtype.
     if (cache.k_pages.dtype !=
-            ((cache.packed_k || cache.e8_root) ? DType::U8 : profile.code_dtype) ||
+            ((cache.packed_k || cache.e8_root || cache.k6_bit) ? DType::U8 : profile.code_dtype) ||
         cache.v_pages.dtype != (cache.packed_v ? DType::U8 : profile.code_dtype)) {
         throw std::invalid_argument("kv_cache_append: invalid cache code dtype");
     }
     const std::int32_t k_dim =
-        cache.e8_root ? kFullHeadDim / 4 : (cache.packed_k ? kFullHeadDim / 2 : kFullHeadDim);
+        cache.k6_bit   ? kFullHeadDim * 3 / 4
+                       : cache.e8_root ? kFullHeadDim / 4
+                                       : (cache.packed_k ? kFullHeadDim / 2 : kFullHeadDim);
     const std::int32_t v_dim = cache.packed_v ? kFullHeadDim / 2 : kFullHeadDim;
     require_shape(cache.k_pages, k_dim, kPagedKVPageSize, kv_heads, physical_pages,
                   kAppendOp, "cache k pages");

@@ -33,6 +33,7 @@ struct PagedKVLayerView {
     bool packed_k             = false;
     bool e8_lattice           = false;
     bool e8_root              = false;
+    bool k6_bit               = false;
 };
 
 /** Non-owning multi-sequence view consumed by batched growing-cache Ops. */
@@ -52,6 +53,7 @@ struct PagedKVBatchLayerView {
     bool packed_k             = false;
     bool e8_lattice           = false;
     bool e8_root              = false;
+    bool k6_bit               = false;
 };
 
 // A plane is storage-only. Target code assigns K/V/layer meaning to plane indices.

@@ -26,6 +26,7 @@ struct DecoderStateSpec {
     bool kv_packed_k                        = false;
     bool kv_e8_lattice                      = false;
     bool kv_e8_root                         = false;
+    bool kv_k6_bit                          = false;
     bool enable_mtp                         = false;
     std::int32_t kv_table_rows              = 1;
     std::uint32_t text_physical_page_groups = 0;
@@ -47,6 +48,7 @@ struct PagedKVCacheLayout {
     bool packed_k             = false;
     bool e8_lattice           = false;
     bool e8_root              = false;
+    bool k6_bit               = false;
 
     [[nodiscard]] std::size_t payload_bytes() const noexcept { return pages.payload_bytes(); }
 };
@@ -115,6 +117,7 @@ private:
     bool packed_k_             = false;
     bool e8_lattice_           = false;
     bool e8_root_              = false;
+    bool k6_bit_              = false;
 };
 
 struct DecoderStateLayout {

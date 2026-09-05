@@ -353,6 +353,8 @@ GCC 13, and CMake 3.28 or newer; the Docker image builds with CUDA 13.1.
   bit-exactly against the upstream microbenchmark (96.155% / 98.678% cosine); their 1 GiB
   CUDA-graph allowance bump was deliberately not taken (it would evict the INT8 168K profile).
   Method and measurements in [docs/udp-fork-comparison.md](docs/udp-fork-comparison.md).
+  This fork additionally adds `rk6v4-e8` (6-bit E8-lattice keys + 4-bit values, 336 B/token/kv_head)
+  on the same codec; design in [RK6V4E8.md](RK6V4E8.md).
 - **Configurable vision scratchpad (ported).** `--vision-max-tokens` comes from the same fork
   and sizes the vision encode workspace (default 8192 tokens, formerly hardcoded 32768). This
   fork additionally wires the processor media budget to the same limit, so an over-limit

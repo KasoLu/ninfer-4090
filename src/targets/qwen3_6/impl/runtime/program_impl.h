@@ -754,6 +754,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
       kv_quant_group(plan.kv_quant_group),
       kv_packed_v(plan.kv_packed_v), kv_rotate_k(plan.kv_rotate_k), kv_rotate_v(plan.kv_rotate_v),
       kv_packed_k(plan.kv_packed_k), kv_e8_lattice(plan.kv_e8_lattice), kv_e8_root(plan.kv_e8_root),
+      kv_k6_bit(plan.kv_k6_bit),
       proposal_head(plan.proposal_head),
       vision_enabled(plan.features.vision), use_cuda_graph(plan.use_cuda_graph),
       causal_scoring(plan.causal_scoring), kv_payload_bytes(plan.persistent.kv_payload_bytes),
@@ -12244,13 +12245,15 @@ MemorySummary ProgramImplCore::memory_summary() const noexcept {
         break;
     case DType::I8:
         // This fork's packed/rotated/E8 modes all report through the I8 storage family.
-        out.kv_cache = kv_e8_root ? KvCacheStorage::RK2V4E8
-                       : (kv_e8_lattice
-                              ? KvCacheStorage::RK4V4E8
-                              : (kv_packed_k
-                                     ? KvCacheStorage::RotatedInt4KeyInt4ValueGroup64
-                                     : (kv_rotate_v ? KvCacheStorage::RotatedInt8KeyInt4ValueGroup64
-                                                    : KvCacheStorage::Int8Group64)));
+        out.kv_cache = kv_k6_bit ? KvCacheStorage::RK6V4E8
+                       : (kv_e8_root
+                              ? KvCacheStorage::RK2V4E8
+                              : (kv_e8_lattice
+                                     ? KvCacheStorage::RK4V4E8
+                                     : (kv_packed_k
+                                            ? KvCacheStorage::RotatedInt4KeyInt4ValueGroup64
+                                            : (kv_rotate_v ? KvCacheStorage::RotatedInt8KeyInt4ValueGroup64
+                                                           : KvCacheStorage::Int8Group64))));
         break;
     case DType::FP8_E4M3FN:
         out.kv_cache = KvCacheStorage::Fp8E4M3Row256;

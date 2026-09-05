@@ -48,6 +48,7 @@ constexpr std::uint32_t kKvFlagRotateV   = 1U << 2;
 constexpr std::uint32_t kKvFlagPackedK   = 1U << 3;
 constexpr std::uint32_t kKvFlagE8Lattice = 1U << 4;
 constexpr std::uint32_t kKvFlagE8Root    = 1U << 5;
+constexpr std::uint32_t kKvFlagK6Bit     = 1U << 6;
 
 class SnapshotWriter {
 public:
@@ -429,7 +430,8 @@ ProgramImplCore::save_continuation(const ContinuationHandle& continuation,
     config.kv_flags       = (kv_packed_v ? kKvFlagPackedV : 0U) |
                       (kv_rotate_k ? kKvFlagRotateK : 0U) | (kv_rotate_v ? kKvFlagRotateV : 0U) |
                       (kv_packed_k ? kKvFlagPackedK : 0U) |
-                      (kv_e8_lattice ? kKvFlagE8Lattice : 0U) | (kv_e8_root ? kKvFlagE8Root : 0U);
+                      (kv_e8_lattice ? kKvFlagE8Lattice : 0U) | (kv_e8_root ? kKvFlagE8Root : 0U) |
+                      (kv_k6_bit ? kKvFlagK6Bit : 0U);
     config.speculative_backend = static_cast<std::uint32_t>(speculative_backend);
     config.draft_window        = draft_window;
     config.page_size           = static_cast<std::uint32_t>(kPagedKVPageSize);
@@ -629,7 +631,8 @@ ProgramImplCore::restore_continuation(std::span<const std::uint8_t> snapshot,
     const std::uint32_t expected_flags =
         (kv_packed_v ? kKvFlagPackedV : 0U) | (kv_rotate_k ? kKvFlagRotateK : 0U) |
         (kv_rotate_v ? kKvFlagRotateV : 0U) | (kv_packed_k ? kKvFlagPackedK : 0U) |
-        (kv_e8_lattice ? kKvFlagE8Lattice : 0U) | (kv_e8_root ? kKvFlagE8Root : 0U);
+        (kv_e8_lattice ? kKvFlagE8Lattice : 0U) | (kv_e8_root ? kKvFlagE8Root : 0U) |
+        (kv_k6_bit ? kKvFlagK6Bit : 0U);
     if (config.kv_dtype != static_cast<std::uint32_t>(kv_dtype) ||
         config.kv_quant_group != kv_quant_group || config.kv_flags != expected_flags ||
         config.page_size != static_cast<std::uint32_t>(kPagedKVPageSize) ||

@@ -16,7 +16,8 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers,
                               std::uint32_t capacity, std::int32_t kv_heads, std::int32_t head_dim,
                               DType dtype, std::int32_t quant_group, std::int32_t table_rows,
                               std::uint32_t physical_page_groups, bool packed_v, bool rotate_k,
-                              bool rotate_v, bool packed_k, bool e8_lattice, bool e8_root) {
+                              bool rotate_v, bool packed_k, bool e8_lattice, bool e8_root,
+                              bool k6_bit) {
     if (layers == 0 || capacity == 0 || kv_heads <= 0 || head_dim <= 0 || table_rows <= 0) {
         throw std::invalid_argument("Paged KV cache dimensions must be positive");
     }
@@ -38,6 +39,9 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers,
     if (e8_lattice && !packed_k) {
         throw std::invalid_argument("E8 lattice requires packed K storage");
     }
+    if (k6_bit && (!packed_k || !e8_lattice || !packed_v || !rotate_k || !rotate_v || e8_root)) {
+        throw std::invalid_argument("K6-bit keys require packed E8 lattice keys and packed rotated V");
+    }
 
     const std::uint32_t logical_pages = page_count(capacity);
     if (physical_page_groups < logical_pages) {
@@ -47,9 +51,10 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers,
     KVPageGeometry geometry;
     geometry.planes.reserve(static_cast<std::size_t>(layers) * (scaled ? 4ULL : 2ULL));
     for (std::uint32_t layer = 0; layer < layers; ++layer) {
-        const std::int32_t k_head_extent = e8_root ? head_dim / 4 : (packed_k ? head_dim / 2 : head_dim);
+        const std::int32_t k_head_extent =
+            k6_bit ? head_dim * 3 / 4 : (e8_root ? head_dim / 4 : (packed_k ? head_dim / 2 : head_dim));
         const std::int32_t v_head_extent = packed_v ? head_dim / 2 : head_dim;
-        const DType k_plane_dtype = (packed_k || e8_root) ? DType::U8 : dtype;
+        const DType k_plane_dtype = (packed_k || e8_root || k6_bit) ? DType::U8 : dtype;
         const DType v_plane_dtype = packed_v ? DType::U8 : dtype;
         geometry.planes.push_back({k_plane_dtype, k_head_extent, kv_heads, 256});
         geometry.planes.push_back({v_plane_dtype, v_head_extent, kv_heads, 256});
@@ -78,6 +83,7 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers,
         .packed_k    = packed_k,
         .e8_lattice  = e8_lattice,
         .e8_root     = e8_root,
+        .k6_bit      = k6_bit,
     };
 }
 
@@ -89,13 +95,13 @@ DecoderStateLayout plan_decoder_state(LayoutBuilder& builder, const DecoderState
                                 spec.attention_head_dim, spec.kv_dtype, spec.kv_quant_group,
                                 spec.kv_table_rows, spec.text_physical_page_groups,
                                 spec.kv_packed_v, spec.kv_rotate_k, spec.kv_rotate_v,
-                                spec.kv_packed_k, spec.kv_e8_lattice, spec.kv_e8_root);
+                                spec.kv_packed_k, spec.kv_e8_lattice, spec.kv_e8_root, spec.kv_k6_bit);
     if (spec.enable_mtp) {
         layout.mtp_kv = plan_cache(builder, spec.mtp_layers, spec.capacity, spec.kv_heads,
                                    spec.attention_head_dim, spec.kv_dtype, spec.kv_quant_group,
                                    spec.kv_table_rows, spec.mtp_physical_page_groups,
                                    spec.kv_packed_v, spec.kv_rotate_k, spec.kv_rotate_v,
-                                   spec.kv_packed_k, spec.kv_e8_lattice, spec.kv_e8_root);
+                                   spec.kv_packed_k, spec.kv_e8_lattice, spec.kv_e8_root, spec.kv_k6_bit);
     }
     return layout;
 }
@@ -105,7 +111,8 @@ PagedKVCache::PagedKVCache(DeviceSpan backing, const PagedKVCacheLayout& layout)
       layers_(layout.layers), max_context_(layout.max_context), kv_heads_(layout.kv_heads),
       head_dim_(layout.head_dim), dtype_(layout.dtype), quant_group_(layout.quant_group),
       packed_v_(layout.packed_v), rotate_k_(layout.rotate_k), rotate_v_(layout.rotate_v),
-      packed_k_(layout.packed_k), e8_lattice_(layout.e8_lattice), e8_root_(layout.e8_root) {}
+      packed_k_(layout.packed_k), e8_lattice_(layout.e8_lattice), e8_root_(layout.e8_root),
+      k6_bit_(layout.k6_bit) {}
 
 PagedKVCacheView::PagedKVCacheView(const PagedKVCache& cache, Tensor block_table) noexcept
     : cache_(&cache), block_table_(block_table) {}
@@ -147,6 +154,7 @@ PagedKVLayerView PagedKVCache::layer_view(std::uint32_t layer, Tensor block_tabl
         .packed_k      = packed_k_,
         .e8_lattice    = e8_lattice_,
         .e8_root       = e8_root_,
+        .k6_bit        = k6_bit_,
     };
 }
 
@@ -171,6 +179,7 @@ PagedKVBatchLayerView PagedKVCache::batch_layer_view(std::uint32_t layer) const 
         .packed_k      = packed_k_,
         .e8_lattice    = e8_lattice_,
         .e8_root       = e8_root_,
+        .k6_bit        = k6_bit_,
     };
 }
 
