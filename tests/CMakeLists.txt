@@ -84,6 +84,9 @@ target_include_directories(ninfer_perplexity_evaluation_test PRIVATE
 ninfer_add_test(ninfer_kv_cache_test
   SOURCES test_kv_cache.cpp
   LIBRARIES ninfer_core)
+ninfer_add_test(ninfer_kv_mode_test
+  SOURCES test_kv_mode.cpp
+  LIBRARIES ninfer_core)
 ninfer_add_test(ninfer_state_store_test
   SOURCES test_state_store.cpp
   LIBRARIES ninfer_core)

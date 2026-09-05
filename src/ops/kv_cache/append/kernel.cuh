@@ -292,16 +292,27 @@ __launch_bounds__(256) __global__
         const std::int64_t k_row =
             paged_kv_page_head_offset<kKVCacheI6HeadExtent, Geometry::KVHeads>(page, kv_head) +
             static_cast<std::int64_t>(page_off) * kKVCacheI6HeadExtent + group * 48;
+        // Gather the 4-lane quad with full-mask shuffles from explicit source
+        // lanes: every lane of the warp converges on each __shfl_sync, the only
+        // mask form this codebase relies on. The per-quad sub-mask
+        // __shfl_down_sync variant deadlocked on sm_89 (4090 hang 2026-09-04):
+        // shfl_down offsets 1..3 make the group's non-leader lanes read source
+        // lanes outside their sub-mask, which is undefined behavior. The
+        // explicit-source gather below is bit-identical for the leader reads.
+        const int c0i = static_cast<int>(c0);
+        const int c1i = static_cast<int>(c1);
+        const int qbase = lane & ~3;
+        std::uint8_t quad0[4];
+        std::uint8_t quad1[4];
+        quad0[0] = static_cast<std::uint8_t>(__shfl_sync(FullMask, c0i, qbase));
+        quad0[1] = static_cast<std::uint8_t>(__shfl_sync(FullMask, c0i, qbase + 1));
+        quad0[2] = static_cast<std::uint8_t>(__shfl_sync(FullMask, c0i, qbase + 2));
+        quad0[3] = static_cast<std::uint8_t>(__shfl_sync(FullMask, c0i, qbase + 3));
+        quad1[0] = static_cast<std::uint8_t>(__shfl_sync(FullMask, c1i, qbase));
+        quad1[1] = static_cast<std::uint8_t>(__shfl_sync(FullMask, c1i, qbase + 1));
+        quad1[2] = static_cast<std::uint8_t>(__shfl_sync(FullMask, c1i, qbase + 2));
+        quad1[3] = static_cast<std::uint8_t>(__shfl_sync(FullMask, c1i, qbase + 3));
         if ((lane & 3) == 0) {
-            std::uint8_t quad0[4];
-            std::uint8_t quad1[4];
-            quad0[0] = c0;
-            quad1[0] = c1;
-#pragma unroll
-            for (int o = 1; o < 4; ++o) {
-                quad0[o] = static_cast<std::uint8_t>(__shfl_down_sync(FullMask, static_cast<int>(c0), o));
-                quad1[o] = static_cast<std::uint8_t>(__shfl_down_sync(FullMask, static_cast<int>(c1), o));
-            }
             const int quad_off = (lane >> 2) * 3;
             auto* k_bytes = reinterpret_cast<std::uint8_t*>(cache_k);
             kv_cache_pack_i6_quad(quad0, &k_bytes[k_row + quad_off]);
@@ -469,16 +480,27 @@ __launch_bounds__(256) __global__ void kv_cache_append_full_i8_page_kernel(
         const std::int64_t k_row =
             paged_kv_page_head_offset<kKVCacheI6HeadExtent, Geometry::KVHeads>(physical_page, kv_head) +
             static_cast<std::int64_t>(page_off) * kKVCacheI6HeadExtent + group * 48;
+        // Gather the 4-lane quad with full-mask shuffles from explicit source
+        // lanes: every lane of the warp converges on each __shfl_sync, the only
+        // mask form this codebase relies on. The per-quad sub-mask
+        // __shfl_down_sync variant deadlocked on sm_89 (4090 hang 2026-09-04):
+        // shfl_down offsets 1..3 make the group's non-leader lanes read source
+        // lanes outside their sub-mask, which is undefined behavior. The
+        // explicit-source gather below is bit-identical for the leader reads.
+        const int c0i = static_cast<int>(c0);
+        const int c1i = static_cast<int>(c1);
+        const int qbase = lane & ~3;
+        std::uint8_t quad0[4];
+        std::uint8_t quad1[4];
+        quad0[0] = static_cast<std::uint8_t>(__shfl_sync(FullMask, c0i, qbase));
+        quad0[1] = static_cast<std::uint8_t>(__shfl_sync(FullMask, c0i, qbase + 1));
+        quad0[2] = static_cast<std::uint8_t>(__shfl_sync(FullMask, c0i, qbase + 2));
+        quad0[3] = static_cast<std::uint8_t>(__shfl_sync(FullMask, c0i, qbase + 3));
+        quad1[0] = static_cast<std::uint8_t>(__shfl_sync(FullMask, c1i, qbase));
+        quad1[1] = static_cast<std::uint8_t>(__shfl_sync(FullMask, c1i, qbase + 1));
+        quad1[2] = static_cast<std::uint8_t>(__shfl_sync(FullMask, c1i, qbase + 2));
+        quad1[3] = static_cast<std::uint8_t>(__shfl_sync(FullMask, c1i, qbase + 3));
         if ((lane & 3) == 0) {
-            std::uint8_t quad0[4];
-            std::uint8_t quad1[4];
-            quad0[0] = c0;
-            quad1[0] = c1;
-#pragma unroll
-            for (int o = 1; o < 4; ++o) {
-                quad0[o] = static_cast<std::uint8_t>(__shfl_down_sync(FullMask, static_cast<int>(c0), o));
-                quad1[o] = static_cast<std::uint8_t>(__shfl_down_sync(FullMask, static_cast<int>(c1), o));
-            }
             const int quad_off = (lane >> 2) * 3;
             auto* k_bytes = reinterpret_cast<std::uint8_t*>(cache_k);
             kv_cache_pack_i6_quad(quad0, &k_bytes[k_row + quad_off]);
