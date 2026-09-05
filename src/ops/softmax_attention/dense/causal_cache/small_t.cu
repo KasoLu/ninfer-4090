@@ -10,6 +10,8 @@
 #include "ninfer/ops/softmax_attention.h"
 
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
@@ -127,7 +129,7 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
                           PagedKVBatchLayerView cache, const CausalSmallTInvocation& invocation,
                           std::int32_t logical_capacity, std::int32_t implementation_window,
                           std::int32_t splits, Tensor& partial_acc, Tensor& partial_m,
-                          Tensor& partial_l, cudaStream_t stream) {
+                          Tensor& partial_l, std::int32_t k6_bisect, cudaStream_t stream) {
     const dim3 grid(Geometry::KVHeads, splits, invocation.batch_size);
     Tensor& cache_k       = cache.k_pages;
     Tensor& cache_v       = cache.v_pages;
@@ -165,7 +167,8 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
                     : static_cast<const std::int32_t*>(invocation.table_rows->data),
                 cache.block_tables.ne[0], invocation.full_width, invocation.column_begin,
                 logical_capacity, scale, static_cast<__nv_bfloat16*>(partial_acc.data),
-                static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data));
+                static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data),
+                k6_bisect);
     };
     if constexpr (TokenTile == 6) {
         // Small grids need more warps per CTA. From 2K to 8K, Bc=64 halves key
@@ -235,6 +238,22 @@ PagedKVBatchLayerView single_row_batch_view(const PagedKVLayerView& cache) {
         .k6_bit        = cache.k6_bit,
     };
 }
+// Debug-only bisection switch for the RK6V4E8 small-t decode hang on 4090
+// (2026-09): NINFER_K6_BISECT selects which K6 code path the small-t i8 kernel
+// executes. 0 (default) is the production full-K6 path; the other arms swap
+// the proven rk4v4-e8 4-bit path in on one side to bisect the hang.
+//   1: i6 write + i4 read    2: i4-E8 write + i6 read
+//   3: i4 write + i4 read    4: dispatch the PackedK/E8Lattice instantiation
+int k6_bisect_arm() {
+    static const int arm = [] {
+        int v = 0;
+        if (const char* e = std::getenv("NINFER_K6_BISECT")) { v = std::atoi(e); }
+        if (v < 0 || v > 4) { v = 0; }
+        if (v != 0) { std::fprintf(stderr, "[k6-bisect] arm=%d\n", v); }
+        return v;
+    }();
+    return arm;
+}
 
 } // namespace
 
@@ -271,6 +290,10 @@ void causal_attention_small_t_launch_for(const Tensor& q, CacheInput input, cons
     const auto splits =
         causal_small_t_launch_capacity<Geometry>(envelope, invocation.width, cache.dtype);
 
+    // Bisection arm 4 (2026-09 4090 hang hunt): run the proven PackedK/E8Lattice
+    // instantiation on the K6 cache to separate kernel code path from context.
+    const std::int32_t k6_bisect = k6_bisect_arm();
+    if (k6_bisect == 4 && cache.k6_bit) { cache.k6_bit = false; }
     // BF16 keeps its row-tile warp count; INT8 selects its producer/consumer
     // geometry inside launch_tc_partial_i8.
 #define NINFER_CAUSAL_SMALL_T_DISPATCH(TOKENS, WARPS)                                              \
@@ -281,32 +304,38 @@ void causal_attention_small_t_launch_for(const Tensor& q, CacheInput input, cons
                     launch_tc_partial_i8<Geometry, (TOKENS), true, true, true, false, false, true,  \
                                          MultiBatch, Masked>(                                      \
                         q, input, pos, scale, cache, invocation, logical_capacity,                 \
-                        implementation_window, splits, partial_acc, partial_m, partial_l, stream); \
-                } else if (cache.k6_bit) {                                                        \
+                        implementation_window, splits, partial_acc, partial_m, partial_l,          \
+                        k6_bisect, stream);                                                        \
+                } else if (cache.k6_bit) {                                                         \
                     launch_tc_partial_i8<Geometry, (TOKENS), true, true, true, true, true, false,  \
                                          MultiBatch, Masked, true>(                                \
                         q, input, pos, scale, cache, invocation, logical_capacity,                 \
-                        implementation_window, splits, partial_acc, partial_m, partial_l, stream); \
-                } else if (cache.e8_lattice) {                                                       \
+                        implementation_window, splits, partial_acc, partial_m, partial_l,          \
+                        k6_bisect, stream);                                                        \
+                } else if (cache.e8_lattice) {                                                     \
                     launch_tc_partial_i8<Geometry, (TOKENS), true, true, true, true, true, false,  \
                                          MultiBatch, Masked>(                                      \
                         q, input, pos, scale, cache, invocation, logical_capacity,                 \
-                        implementation_window, splits, partial_acc, partial_m, partial_l, stream); \
+                        implementation_window, splits, partial_acc, partial_m, partial_l,          \
+                        k6_bisect, stream);                                                        \
                 } else if (cache.packed_k) {                                                       \
                     launch_tc_partial_i8<Geometry, (TOKENS), true, true, true, true, false, false, \
                                          MultiBatch, Masked>(                                      \
                         q, input, pos, scale, cache, invocation, logical_capacity,                 \
-                        implementation_window, splits, partial_acc, partial_m, partial_l, stream); \
+                        implementation_window, splits, partial_acc, partial_m, partial_l,          \
+                        k6_bisect, stream);                                                        \
                 } else if (cache.packed_v) {                                                       \
                     launch_tc_partial_i8<Geometry, (TOKENS), true, true, true, false, false, false,\
                                          MultiBatch, Masked>(                                      \
                         q, input, pos, scale, cache, invocation, logical_capacity,                 \
-                        implementation_window, splits, partial_acc, partial_m, partial_l, stream); \
+                        implementation_window, splits, partial_acc, partial_m, partial_l,          \
+                        k6_bisect, stream);                                                        \
                 } else {                                                                           \
                     launch_tc_partial_i8<Geometry, (TOKENS), false, false, false, false, false,    \
                                          false, MultiBatch, Masked>(                               \
                         q, input, pos, scale, cache, invocation, logical_capacity,                 \
-                        implementation_window, splits, partial_acc, partial_m, partial_l, stream); \
+                        implementation_window, splits, partial_acc, partial_m, partial_l,          \
+                        k6_bisect, stream);                                                        \
                 }                                                                                  \
             } else {                                                                               \
                 launch_tc_partial_bf16<Geometry, (TOKENS), (WARPS), MultiBatch, Masked>(           \
