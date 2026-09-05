@@ -217,7 +217,7 @@ __device__ __forceinline__ void kv_cache_unpack_i6x16(const std::uint8_t* src12,
     const std::uint32_t b2 = w3[2];
     const std::uint32_t q0 = b0 & 0xffffffu;
     const std::uint32_t q1 = ((b0 >> 24) & 0xffu) | ((b1 & 0xffffu) << 8);
-    const std::uint32_t q2 = ((b1 >> 16) & 0xffffu) | (((b2 >> 24) & 0xffu) << 16);
+    const std::uint32_t q2 = ((b1 >> 16) & 0xffffu) | ((b2 & 0xffu) << 16);
     const std::uint32_t q3 = (b2 >> 8) & 0xffffffu;
 #pragma unroll
     for (int j = 0; j < 4; ++j) {

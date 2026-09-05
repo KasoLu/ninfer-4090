@@ -2,3 +2,9 @@
 # default whitespace checks.
 /third_party/spdlog/include/** -whitespace
 /third_party/spdlog/src/** -whitespace
+
+# Pin line endings so SHA-256-pinned evaluation corpora survive any checkout.
+# The perplexity-1m corpus is verified byte-exact against its manifest; CRLF
+# re-encoding on Windows checkouts breaks the hash check.
+eval/corpora/ -text
+
