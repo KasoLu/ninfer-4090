@@ -39,10 +39,10 @@
 - 为什么"看起来数据对、纯 hang 无精度错"：leader（lane&3==0）读的 source 全在自己 sub_mask 内，值正确；挂死发生在非 leader lane 的越界读上，所以是纯死锁。
 - 为什么 be17531d 的"修复"没修好：那次只是把 shuffle 移出 `if (leader)` 分支（让 32 lane 都执行、解决"FullMask 在 leader 分支里等不到"的第一次死锁），但**mask 本身仍非 uniform** → 第二次 hang。
 
-### 定位证据链（都已存档，供复查）
+### 定位证据链（供复查；根目录调试产物已 2026-09-05 清理）
 - `CUDA_LAUNCH_BLOCKING=1 + LD_PRELOAD ktrace`（ktrace v3，钩 `__cudaLaunchKernel`/`cudaLaunchKernelExC`/`cudaStreamSynchronize`/`cudaEventSynchronize`）：最后一条 launch = **`kv_cache_append_full_i8_page_kernel`（grid=9x4x4, block=256, K6 写分支）**，其后 stream sync 无返回 → 自旋者锁定为 **append kernel 的 K6 写分支（prefill 内，64 token prompt 走 page kernel）**。
 - 一次性解释所有旧疑点：small_t 四臂（NINFER_K6_BISECT）全卡（只切 decode 路径，没碰 append kernel）；rk4v4-e8 探针正常（PackedK 分支用 uniform FullMask）；compute-sanitizer 空日志 = GPU kernel 自旋（非 host 死循环）；`ctest -R kv_cache`（含 PageMajorK6 几何 {U8,192,2,256}+{U8,128,2,256}+{FP16,4,2,256}×2）在 4090 全过 = 非几何/内存池问题。
-- 开发机留档：`tools/test_kv/kt_block.log`（+ `kt_k6.log`/`kt_nograph.log`/`kt_k6b.log`）、`tools/test_kv/ktrace.c`（v3，已提交 c91dfd5f）、`tools/test_kv/kt_addrs.txt`、`bt_match.py`（用法 `python bt_match.py ninfer_disasm.txt ninfer_syms_raw.txt <log>`，三参）、`bt_sym.py`、`ninfer_disasm.txt`/`ninfer_syms_raw.txt`。废弃可删：`t1c.qdstrm`/`probe.qdstrm`。
+- 开发机留档：`tools/test_kv/ktrace.c`（v3，已提交 c91dfd5f）、`tools/test_kv/kt_block.log`（.gitignore 忽略的本地日志，仍在盘上；kt_k6/kt_nograph/kt_k6b.log 系列已不在盘上）。根目录死锁调试产物（`bt_match.py`/`bt_sym.py`/`kt_addrs.txt`/`kt_k6b_sym.txt`/`ninfer_disasm.txt`/`ninfer_syms_raw.txt`/`ninfer_syms.txt`/`t1c.qdstrm`/`probe.qdstrm`）已于 2026-09-05 全部删除（用户拍板）；如需复查 `ktrace` 证据链，按 §2 的 `CUDA_LAUNCH_BLOCKING=1 + LD_PRELOAD ktrace` 方法在 4090 重跑即可。
 
 ---
 

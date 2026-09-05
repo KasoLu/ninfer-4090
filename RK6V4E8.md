@@ -268,7 +268,7 @@ smem K tile 仍是 `64×256` int8（`kCausalPromptI8KBytes`），`mma_s8`/swizzl
 
 **评测缺口（后续补）**：
 - Perplexity（NLL）：`apps/perplexity` 的 `--kv-dtype` 已扩到全档位，quick（26 万 token）与 full（104 万 token，16 流）四档复测均完成，full 定稿见 §7.7——**已关闭**。
-- 检索门（needle-in-a-haystack / code-detail，README 的既有验收口径）尚未在 rk6v4-e8 下跑过。
+- 检索门（needle-in-a-haystack / code-detail，README 的既有验收口径）：三类门在 bf16 + rk8v4 + rk6v4-e8 下全部通过（rk6v4-e8 / rk8v4 均三门全，rk6v4-e8 A 门含满配 262144 单针门；rk4v4-e8 仅 A 门），零失败，实测见 §7.8——**已关闭**。
 - 12 题短答样本量小且已达模型自身错误上限（三档同题同错），后续可扩题或换代码执行类验证。
 
 ---
@@ -329,6 +329,30 @@ dim 11 错取 quad3 高 2 位，K 平面 12.5% 维度被污染。写侧（append
 注：full 基线（4.6504）高于 quick 基线（4.3431），因 full 取每域全部 4 个切片（quick 仅 00 流），语料整体更难，属语料选择差异；两模式内部的 vs-bf16 相对偏差结论一致。
 
 **定稿结论**：full 模式退化序 bf16 < rk8v4 < rk6v4-e8 < rk4v4-e8 严格随 K 侧 bit 数单调（8>6>4）；K6 比 rk8v4 高 +0.028%（quick 噪声下两者打平，full 样本×4 后拉出真实差距）——正是"只比 rk8v4 低一点点"的设计预期，104 万 token 实证。分域无系统性劣化（0.08%–0.16% 同一量级，code 域最小）。rk6v4-e8 以 3.05× KV 压缩（336 vs 1024 B/token/head）换 +0.13% PPL，精度代价可忽略。PPL 评测项（quick+full）就此关闭。
+
+### 7.8 检索门（needle-in-a-haystack / code-detail，2026-09-05 实测，README 既有验收口径）
+
+在 `ninfer-4090-kaso-dev` 容器（4090，sm_89）用 `apps/ninfer` + `tools/bench/make_needle_probes.py` 生成探针，greedy、`--no-thinking`。canary：single-needle 密码 `XK7Q-93LM-TW4Z-PQ8R`；5-needle 五组 `XK7Q-93LM-TW4Z-PQ8R / VB2N-61HD-RY7C-MX5K / ZT8F-34WS-QE9J-LU1D / CW5G-72XP-NO3B-TA6H / YR4M-18KC-ZD6V-SB2Q`；code-detail C++ canary `kCanaryValue=402182u`、`computeCanary()=402182×7+13=2815287`。
+
+| 门 | 档位 | ctx | prompt tok | KV payload | 期望答案 | 判定 |
+|---|---|---:|---:|---:|---|:--:|
+| A single | bf16 | 81920 | 41,141 | 5.00 GiB | `XK7Q-93LM-TW4Z-PQ8R` | ✅ |
+| A single | rk4v4-e8 | 212992 | 109,640 | 3.45 GiB | `XK7Q-93LM-TW4Z-PQ8R` | ✅ |
+| A single | rk8v4 | 212992 | 109,640 | 5.08 GiB | `XK7Q-93LM-TW4Z-PQ8R` | ✅ |
+| A single | rk6v4-e8 | 212992 | 109,640 | 4.27 GiB | `XK7Q-93LM-TW4Z-PQ8R` | ✅ |
+| A single | rk6v4-e8 | **262144** | 130,151 | 5.25 GiB | `XK7Q-93LM-TW4Z-PQ8R` | ✅（满配 260K 口径）|
+| B 5-needle | bf16 | 49152 | 18,934 | 3.00 GiB | 5 组全对有序 | ✅ |
+| B 5-needle | rk6v4-e8 | 122880 | 59,113 | 2.46 GiB | 5 组全对有序 | ✅ |
+| B 5-needle | rk8v4 | 122880 | 59,113 | 2.93 GiB | 5 组全对有序 | ✅ |
+| C code | bf16 | 65536 | 40,446 | 4.00 GiB | `402182 2815287` | ✅ |
+| C code | rk6v4-e8 | 172032 | 145,878 | 3.45 GiB | `402182 2815287` | ✅ |
+| C code | rk8v4 | 172032 | 145,878 | 4.10 GiB | `402182 2815287` | ✅ |
+
+B 门 5 组 passphrase 各档（bf16/rk6v4-e8/rk8v4）均按 #1→#5 顺序逐行输出、C 门各档均精确输出两个十进制数，全部 `stop-token` 自然收尾、无多余文字。12/13 次运行通过判分；1 次为修复前预期失败：`C/rk6v4-e8@172032` 用旧探针（`--cpl-code 3.0`，478,800 字符）时报 `error: prepared prompt exceeds Engine max_context 172032`，重生成 `/tmp/needles_code172`（`--cpl-code 2.2`，9851 行，145,878 prompt tok）后即 PASS——该失败反证了 cpl 修复（commit d5829161）的必要性与正确性。rk8v4 各门为后续补齐：B/C（2026-09-05 晚）与 K6 同探针、同口径（prompt tok 完全一致 59,113 / 145,878），KV payload 2.93/4.10 GiB（K6 同门 2.46/3.45 GiB）；A 门（single@212992）同探针同口径补齐（prompt tok 109,640，与 rk4v4-e8/rk6v4-e8 同 ctx 完全一致，KV 5.08 GiB）——rk8v4 三门现已全齐，逐 token 同深度可比。
+
+**结论**：rk6v4-e8 与 rk8v4 在三类检索门（single-needle / 5-needle / code-detail）全部零失败（rk8v4 A 门已同探针同口径补齐），与 bf16 行为一致——长程检索无退化，§7.6 检索门缺口关闭。K6 在满配 262144（README 260K 口径）下通过 single-needle（130,151 prompt tok、KV 5.25 GiB、`free after startup 894 MiB`），是 24 GB 卡上唯一能满上下文并通过最深单针门的档位；B/C 门 K6/rk8v4 @118K/@168K 亦超过 bf16 物理上限（bf16 KV ~79 B/token，118K/168K + 16 GiB 权重超 24 GB），是量化压缩比（K6 336 B/token/head）的直接红利。
+
+**口径限制（如实标注）**：① 档位覆盖矩阵：rk6v4-e8 三门全（A 门含满配 262144）；rk8v4 三门全齐（与 K6 同探针同口径）；rk4v4-e8 仅 A 门——故"K6 与 rk8v4 检索打平"现已在三门全部成立，"K6 与 bf16 各门一致"同样成立；② bf16 参照行探针深度比 rk 行浅（A@81920/B@49152/C@65536，受 24 GB 显存强制降档）——结论是"各门 K6/rk8v4 与 bf16 都通过、无失败"，而非"同深度下各档检索能力完全相同"。
 
 ---
 
