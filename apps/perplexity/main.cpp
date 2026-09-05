@@ -54,7 +54,8 @@ std::string usage_text() {
     return "usage: ninfer-perplexity <model.ninfer> "
            "(--corpus <manifest.json> [--quick] | --text <utf8-file>)\n"
            "       [--context N] [--stride N] [--device N]\n"
-           "       [--kv-dtype bf16|int8|fp8] [--output <directory>]\n";
+           "       [--kv-dtype bf16|int8|fp8|rk8v4|rk4v4|rk4v4-e8|rk2v4-e8|rk6v4-e8] [--output "
+           "<directory>]\n";
 }
 
 [[noreturn]] void usage_error(std::string_view message) {
@@ -106,8 +107,19 @@ Options parse_options(int argc, char** argv) {
                 out.kv = ninfer::KvCacheStorage::Int8Group64;
             } else if (dtype == "fp8") {
                 out.kv = ninfer::KvCacheStorage::Fp8E4M3Row256;
+            } else if (dtype == "rk8v4") {
+                out.kv = ninfer::KvCacheStorage::RotatedInt8KeyInt4ValueGroup64;
+            } else if (dtype == "rk4v4") {
+                out.kv = ninfer::KvCacheStorage::RotatedInt4KeyInt4ValueGroup64;
+            } else if (dtype == "rk4v4-e8") {
+                out.kv = ninfer::KvCacheStorage::RK4V4E8;
+            } else if (dtype == "rk2v4-e8") {
+                out.kv = ninfer::KvCacheStorage::RK2V4E8;
+            } else if (dtype == "rk6v4-e8") {
+                out.kv = ninfer::KvCacheStorage::RK6V4E8;
             } else {
-                usage_error("--kv-dtype must be bf16, int8, or fp8");
+                usage_error(
+                    "--kv-dtype must be bf16|int8|fp8|rk8v4|rk4v4|rk4v4-e8|rk2v4-e8|rk6v4-e8");
             }
         } else if (option == "--output") {
             out.output = std::filesystem::path(value("--output"));
@@ -133,6 +145,16 @@ std::string kv_name(ninfer::KvCacheStorage value) {
         return "int8-g64";
     case ninfer::KvCacheStorage::Fp8E4M3Row256:
         return "fp8-e4m3-r256";
+    case ninfer::KvCacheStorage::RotatedInt8KeyInt4ValueGroup64:
+        return "rk8v4";
+    case ninfer::KvCacheStorage::RotatedInt4KeyInt4ValueGroup64:
+        return "rk4v4";
+    case ninfer::KvCacheStorage::RK4V4E8:
+        return "rk4v4-e8";
+    case ninfer::KvCacheStorage::RK2V4E8:
+        return "rk2v4-e8";
+    case ninfer::KvCacheStorage::RK6V4E8:
+        return "rk6v4-e8";
     }
     throw std::logic_error("unknown KV dtype");
 }
