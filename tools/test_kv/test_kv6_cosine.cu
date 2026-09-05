@@ -14,7 +14,9 @@
 //   rk4v4e8  : K E8-lattice projection + rintf -> i4 codes, /7 scale
 //   rk6v4e8  : K E8-lattice projection + rintf -> i6 codes, /31 scale
 //
-// Exit code 0 = ran (no pass/fail threshold; inspect printed numbers).
+// Exit code 0 = passed the production i6 pack/unpack round-trip regression and
+// ran the bench (no cosine threshold; inspect printed numbers); non-zero =
+// round-trip mismatch or CUDA failure.
 // Exit code 77 = no CUDA device (test harness SKIP convention).
 
 #include "kv_cache_cosine_bench.cuh"
@@ -78,6 +80,107 @@ GroupStats collect_stats(float* d_cos, int groups) {
 
 }  // namespace
 
+// ---------------------------------------------------------------------------
+// Production i6 codec round-trip regression (pack quad -> unpack i6x16).
+// Hard-fail gate before the cosine bench: catches byte-layout slips in
+// kv_cache_unpack_i6x16. The 2026-09 bug took quad2's high byte from byte11
+// instead of byte8, corrupting dims 10/11 of every 16-dim block and
+// degrading rk6v4e8 PPL ~10x vs rk4v4-e8; the cosine bench (which decodes
+// with its own reference arithmetic) could not see it.
+// ---------------------------------------------------------------------------
+__global__ void kv6_roundtrip_check_kernel(const std::uint8_t* d_codes, std::uint8_t* d_bad,
+                                           int blocks) {
+    const int b = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (b >= blocks) { return; }
+    const std::uint8_t* src = d_codes + static_cast<std::size_t>(b) * 16;
+    std::uint8_t packed[12];
+    #pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        ninfer::ops::kv_cache_pack_i6_quad(&src[4 * j], &packed[3 * j]);
+    }
+    std::int8_t dec[16];
+    ninfer::ops::kv_cache_unpack_i6x16(packed, dec);
+    int bad = 0;
+    #pragma unroll
+    for (int m = 0; m < 16; ++m) {
+        const int expected = (static_cast<int>(src[m]) ^ 32) - 32;
+        if (static_cast<int>(dec[m]) != expected) { ++bad; }
+    }
+    d_bad[b] = static_cast<std::uint8_t>(bad);
+}
+
+bool run_kv6_roundtrip_check() {
+    constexpr int kSweepBlocks = 16 * 64;  // every code value at every position
+    constexpr int kRandBlocks  = 4096;
+    const int blocks = kSweepBlocks + kRandBlocks;
+    std::uint8_t* h_codes = new std::uint8_t[static_cast<std::size_t>(blocks) * 16];
+    for (int p = 0; p < 16; ++p) {
+        for (int v = 0; v < 64; ++v) {
+            std::uint8_t* row = h_codes + static_cast<std::size_t>(p * 64 + v) * 16;
+            for (int m = 0; m < 16; ++m) {
+                row[m] = static_cast<std::uint8_t>((v + m) & 0x3Fu);
+            }
+        }
+    }
+    std::mt19937 rng(0x616e31u);
+    std::uniform_int_distribution<int> dist(0, 63);
+    for (int b = kSweepBlocks; b < blocks; ++b) {
+        std::uint8_t* row = h_codes + static_cast<std::size_t>(b) * 16;
+        for (int m = 0; m < 16; ++m) { row[m] = static_cast<std::uint8_t>(dist(rng)); }
+    }
+    std::uint8_t* d_codes = nullptr;
+    std::uint8_t* d_bad = nullptr;
+    if (cudaMalloc(&d_codes, static_cast<std::size_t>(blocks) * 16) != cudaSuccess ||
+        cudaMalloc(&d_bad, blocks) != cudaSuccess) {
+        std::fprintf(stderr, "kv6 round-trip: cudaMalloc failed: %s\n",
+                     cudaGetErrorString(cudaGetLastError()));
+        return false;
+    }
+    if (cudaMemcpy(d_codes, h_codes, static_cast<std::size_t>(blocks) * 16,
+                   cudaMemcpyHostToDevice) != cudaSuccess) {
+        std::fprintf(stderr, "kv6 round-trip h2d failed: %s\n",
+                     cudaGetErrorString(cudaGetLastError()));
+        return false;
+    }
+    const int threads = 128;
+    kv6_roundtrip_check_kernel<<<(blocks + threads - 1) / threads, threads>>>(d_codes, d_bad,
+                                                                               blocks);
+    if (cudaDeviceSynchronize() != cudaSuccess) {
+        std::fprintf(stderr, "kv6 round-trip kernel failed: %s\n",
+                     cudaGetErrorString(cudaGetLastError()));
+        return false;
+    }
+    std::uint8_t* h_bad = new std::uint8_t[blocks];
+    if (cudaMemcpy(h_bad, d_bad, blocks, cudaMemcpyDeviceToHost) != cudaSuccess) {
+        std::fprintf(stderr, "kv6 round-trip d2h failed: %s\n",
+                     cudaGetErrorString(cudaGetLastError()));
+        return false;
+    }
+    int bad_blocks = 0;
+    int bad_codes = 0;
+    int first_block = -1;
+    for (int b = 0; b < blocks; ++b) {
+        if (h_bad[b] != 0) {
+            if (first_block < 0) { first_block = b; }
+            ++bad_blocks;
+            bad_codes += h_bad[b];
+        }
+    }
+    cudaFree(d_codes);
+    cudaFree(d_bad);
+    delete[] h_bad;
+    delete[] h_codes;
+    if (bad_blocks > 0) {
+        std::fprintf(stderr,
+                    "FAIL: kv6 i6 pack/unpack round-trip mismatch: %d/%d blocks, %d codes "
+                    "(first block %d); kv_cache_unpack_i6x16 byte layout is broken\n",
+                    bad_blocks, blocks, bad_codes, first_block);
+        return false;
+    }
+    std::printf("i6 pack/unpack round-trip: %d blocks, 0 mismatches (sweep + random)\n", blocks);
+    return true;
+}
+
 int main() {
     int device_count = 0;
     if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
@@ -92,6 +195,8 @@ int main() {
                 kGroups);
     std::printf("%-22s %12s %12s %12s   %12s %12s %12s\n", "mode", "K mean", "K min", "K p99",
                 "V mean", "V min", "V p99");
+
+    if (!run_kv6_roundtrip_check()) { return 1; }
 
     // Host-side standard-normal source, deterministic seed.
     const int dims = kGroups * 64;

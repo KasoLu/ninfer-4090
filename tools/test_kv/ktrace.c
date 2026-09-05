@@ -35,15 +35,20 @@ struct dim3_t {
     unsigned y;
     unsigned z;
 };
-// cudaLaunchConfig_t mirrors: {void* gridDim; void* blockDim; void* dynamicSmemBytes;
-// cudaStream_t stream; void* attrs; size_t numAttrs;}
+// cudaLaunchConfig_t mirrors the real CUDA 13 layout byte-for-byte:
+// dim3 gridDim (12B); dim3 blockDim (12B); size_t dynamicSmemBytes (8B);
+// stream (8B); attrs (8B); unsigned numAttrs (4B) -> 56B total. The v1/v2
+// mirror used void* for gridDim/blockDim and size_t for numAttrs (48B), which
+// made log_launch dereference a garbage pointer (dim3 fields reinterpreted as
+// an address) and segfault the traced process; the crash was a tracer bug,
+// not a ninfer fault.
 struct launch_config_t {
-    void* gridDim;
-    void* blockDim;
-    void* dynamicSmemBytes;
+    dim3_t gridDim;
+    dim3_t blockDim;
+    std::size_t dynamicSmemBytes;
     cudaStream_t stream;
     void* attrs;
-    size_t numAttrs;
+    unsigned numAttrs;
 };
 
 static uint64_t g_seq = 0;
@@ -122,11 +127,9 @@ cudaError_t cudaLaunchKernelExC(const struct launch_config_t* config, const void
         fflush(g_out);
         return 0;
     }
-    size_t smem = 0;
-    if (config && config->dynamicSmemBytes) { smem = *(size_t*)config->dynamicSmemBytes; }
-    log_launch("cudaLaunchKernelExC", (void*)func, config ? (dim3_t*)config->gridDim : NULL,
-               config ? (dim3_t*)config->blockDim : NULL, smem,
-               config ? (void*)config->stream : NULL);
+    const std::size_t smem = config ? config->dynamicSmemBytes : 0;
+    log_launch("cudaLaunchKernelExC", (void*)func, config ? &config->gridDim : NULL,
+               config ? &config->blockDim : NULL, smem, config ? config->stream : NULL);
     (void)args;
     return real(config, func, args);
 }

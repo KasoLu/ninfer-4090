@@ -273,6 +273,38 @@ smem K tile 仍是 `64×256` int8（`kCausalPromptI8KBytes`），`mma_s8`/swizzl
 
 ---
 
+### 7.7 PPL 异常根因：`kv_cache_unpack_i6x16` 字节错位（2026-09 已修复）
+
+`--kv-dtype` 白名单扩到全档后，quick PPL（261167 scored tokens，`eval/corpora/perplexity-1m`）实测：
+
+| 模式 | overall PPL | vs bf16 |
+|---|---|---|
+| bf16 | 4.3431 | — |
+| rk8v4 | 4.3460 | +0.067% |
+| rk4v4-e8 | 4.3614 | +0.421% |
+| rk6v4-e8 | 4.5222 | **+4.124%**（分域：zh 5.0046→5.1866，en_long 6.8924→7.1136，en_ref 6.1943→6.5719，code 1.6527→1.7119） |
+
+rk6v4-e8 比 4-bit 差 10×，明显偏离“6-bit 应介于 4-bit 与 bf16 之间”的理论序。
+
+**根因**（`src/ops/kv_cache/int8_g64_codec.cuh:220` 原行）：
+`q2 = ((b1 >> 16) & 0xffffu) | (((b2 >> 24) & 0xffu) << 16)` —— quad2 的高字节取 `b2` 的 byte11（属于 quad3），
+正确应为 `b2` 的 byte0（即 `b2 & 0xffu`）。后果：每个 16-dim 块的 dim 10 错取 quad3 低 6 位、
+dim 11 错取 quad3 高 2 位，K 平面 12.5% 维度被污染。写侧（append full/page kernel + small_t 写支的
+`kv_cache_pack_i6_quad` + `__shfl_sync` quad gather）、布局（`kKVCacheI6HeadExtent=192` 与
+`decoder_state.cpp` 的 `k6_bit ? head_dim*3/4` 一致）、prompt 读侧偏移全部核对无误——仅此一处字节错位。
+
+**为何旧评测没抓到**：`test_kv6_cosine` 用 bench 头内联参考解码（不复用生产 unpack），合成高斯余弦下
+每 dim 1/32 的污染被高斯分布稀释；12 题短答样本小。PPL 是全 token 级 NLL，放大后显形。
+
+**修复**：一行 `| ((b2 & 0xffu) << 16)`；并在 `tools/test_kv/test_kv6_cosine.cu` 加硬门禁回归
+`kv6_roundtrip_check_kernel`（生产 `kv_cache_pack_i6_quad`→`kv_cache_unpack_i6x16` 往返，16×64 全码值全位置
+扫 + 4096 随机块，任何一位不一致 exit 1），防止再犯。
+
+**验证**（4090，修后重跑）：`ninfer_test_kv6_cosine` 回归绿；quick PPL 三档复测（bf16/rk8v4/rk4v4-e8
+不受影响，预期不变；rk6v4-e8 应落回 4.34–4.37 区间，与 rk4v4-e8 同量级）。
+
+---
+
 ## 8. 边界与已知取舍
 
 - **head_dim=256 硬依赖**：i8 系全部 kernel 断言 256/64 几何（`kKVCacheAppendFullHeadDim=256`、
