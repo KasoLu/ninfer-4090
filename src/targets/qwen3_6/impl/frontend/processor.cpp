@@ -781,15 +781,19 @@ EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat&
     };
     if (rendered.rewrite_checkpoint) {
         const TokenBoundaryResult& boundary = tokenized.boundaries.at(boundary_index++);
-        if (!boundary.exact_frontier) {
-            throw std::logic_error("rewrite checkpoint is not an exact token boundary");
+        // Builtin templates always place the checkpoint on an exact token boundary, but a
+        // checkpoint probed from an opaque custom Jinja template may fall inside a token.
+        // The stable frontier (the end of the last complete pre-tokenized word) still
+        // marks a self-consistent prefix, so fall back to it; when even that is empty the
+        // checkpoint is dropped and the request degrades to full-prompt reuse instead of
+        // failing.
+        std::optional<std::size_t> frontier = boundary.exact_frontier;
+        if (!frontier) { frontier = boundary.stable_frontier; }
+        if (frontier && *frontier != 0) {
+            encoded.rewrite_checkpoint = RewriteCheckpointSpec{
+                .kind = rendered.rewrite_checkpoint->kind,
+                .frontier = to_frontier(*frontier, "rewrite checkpoint")};
         }
-        const std::uint32_t frontier = to_frontier(*boundary.exact_frontier, "rewrite checkpoint");
-        if (frontier == 0) {
-            throw std::logic_error("rewrite checkpoint has an empty token prefix");
-        }
-        encoded.rewrite_checkpoint =
-            RewriteCheckpointSpec{.kind = rendered.rewrite_checkpoint->kind, .frontier = frontier};
     }
     encoded.rewrite_execution_frontiers.reserve(rendered.rewrite_execution_boundaries.size());
     for (std::size_t remaining = rendered.rewrite_execution_boundaries.size(); remaining != 0;

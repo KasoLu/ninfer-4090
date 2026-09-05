@@ -7,6 +7,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
 #include <utility>
@@ -129,6 +130,15 @@ struct RenderedChat {
     // One rendered byte boundary per requested cache marker.
     std::vector<std::optional<std::size_t>> cache_boundaries;
 };
+// P1 fix (upstream PR #42 review): derive from the rendered prompt text whether
+// generation starts in the reasoning channel. True only when the last reasoning
+// marker in the text is an *opening* tag (e.g. the default template's trailing
+// "<think>\n"); pre-closed blocks (thinking disabled) and prompts with no
+// reasoning markers at all (plain custom templates) start in the content
+// channel, so custom Jinja templates that do not emit the default thinking
+// prologue cannot misclassify the whole generation as reasoning.
+[[nodiscard]] bool prompt_starts_in_reasoning(std::string_view text);
+
 
 enum class ChatTemplateSemantics : std::uint8_t {
     ThinkingToggle,
@@ -138,16 +148,23 @@ enum class ChatTemplateSemantics : std::uint8_t {
 class CompiledChatTemplate {
 public:
     [[nodiscard]] static CompiledChatTemplate resolve(std::string_view source);
+    [[nodiscard]] static CompiledChatTemplate compile_jinja(std::string source,
+                                                             std::string source_name);
 
     [[nodiscard]] PromptCapabilities capabilities() const noexcept;
     [[nodiscard]] RenderedChat render(const std::vector<ChatMessage>& messages,
                                       ChatRenderOptions options = {}) const;
 
 private:
+    class JinjaTemplate;
+
     explicit CompiledChatTemplate(ChatTemplateSemantics semantics) noexcept
         : semantics_(semantics) {}
+    explicit CompiledChatTemplate(std::shared_ptr<const JinjaTemplate> jinja_template) noexcept
+        : jinja_template_(std::move(jinja_template)) {}
 
-    ChatTemplateSemantics semantics_;
+    ChatTemplateSemantics semantics_ = ChatTemplateSemantics::ThinkingToggle;
+    std::shared_ptr<const JinjaTemplate> jinja_template_;
 };
 
 } // namespace ninfer::targets::qwen3_6::frontend_internal

@@ -25,6 +25,7 @@
 #include <future>
 #include <iostream>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <span>
 #include <string>
@@ -35,6 +36,7 @@
 namespace {
 
 using Frontend          = ninfer::targets::qwen3_6::Frontend;
+using FrontendOptions   = ninfer::targets::qwen3_6::FrontendOptions;
 using FrontendFactory   = ninfer::targets::qwen3_6::FrontendTestAccess;
 using FrontendResources = ninfer::targets::qwen3_6::FrontendResources;
 using PublishedOutput   = ninfer::targets::qwen3_6::PublishedOutput;
@@ -2296,6 +2298,44 @@ int test_media_preparation_cancellation() {
     return check(false, "cancelled media preparation completed successfully");
 }
 
+int test_custom_template_reasoning_channel() {
+    // P1 fix (upstream PR #42 review): a custom Jinja template that does not emit the
+    // default thinking prologue must not classify the turn as starting in reasoning,
+    // even when enable_thinking is on.
+    const std::string source =
+        "{%- for message in messages -%}"
+        "{{- message.role ~ ': ' ~ message.content -}}"
+        "{%- endfor -%}"
+        "{{- 'assistant:' -}}";
+    FrontendOptions options;
+    options.vision_enabled = false;
+    options.max_context    = std::numeric_limits<std::uint32_t>::max();
+    const std::filesystem::path template_file =
+        std::filesystem::temp_directory_path() / "ninfer_jinja_reasoning_channel_test.jinja";
+    {
+        std::ofstream out(template_file, std::ios::binary);
+        out << source;
+    }
+    options.chat_template_path = template_file;
+    const Frontend frontend =
+        FrontendFactory::create_component(resources(source), options);
+
+    ninfer::ChatMessage message;
+    message.role = ninfer::ChatRole::User;
+    message.parts.push_back(
+        ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "x", .media = {}});
+    ninfer::PromptInput input;
+    input.messages.push_back(std::move(message));
+    input.options.enable_thinking = true;
+
+    const auto prepared = frontend.prepare(std::move(input));
+    const auto& data    = FrontendFactory::inspect(prepared);
+    (void)std::filesystem::remove(template_file);
+    return check(!data.starts_in_reasoning,
+                 "custom template without thinking prologue classified the turn as starting "
+                 "in reasoning");
+}
+
 } // namespace
 
 int main() {
@@ -2318,6 +2358,7 @@ int main() {
     failures += test_ordered_instruction_turns();
     failures += test_assistant_continuation();
     failures += test_reasoning_effort_chat_template();
+    failures += test_custom_template_reasoning_channel();
     failures += test_rewrite_checkpoint_trace();
     failures += test_adjacent_tool_message_boundary();
     failures += test_official_resource_guards();

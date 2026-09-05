@@ -2,11 +2,13 @@
 
 #include "targets/qwen3_6/impl/frontend/digest.h"
 
+#include <minja/minja.hpp>
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -363,7 +365,348 @@ std::string_view resolve_reasoning_instructions(ChatTemplateSemantics semantics,
     throw std::invalid_argument("invalid reasoning effort");
 }
 
+std::string render_role(ChatRole role) {
+    switch (role) {
+    case ChatRole::System:
+        return "system";
+    case ChatRole::Developer:
+        return "developer";
+    case ChatRole::User:
+        return "user";
+    case ChatRole::Assistant:
+        return "assistant";
+    case ChatRole::Tool:
+        return "tool";
+    }
+    throw std::invalid_argument("unsupported chat role value");
+}
+
+std::string_view render_reasoning_effort(ReasoningEffort effort) {
+    switch (effort) {
+    case ReasoningEffort::Low:
+        return "low";
+    case ReasoningEffort::Medium:
+        return "medium";
+    case ReasoningEffort::XHigh:
+        return "xhigh";
+    }
+    throw std::invalid_argument("invalid reasoning effort");
+}
+
+OrderedJson render_template_content(const ChatMessage& message) {
+    if (!message.has_media()) { return OrderedJson(message.rendered_content().text); }
+
+    OrderedJson content = OrderedJson::array();
+    for (const ChatPart& part : message.parts) {
+        switch (part.kind) {
+        case ChatPartKind::Text:
+            content.push_back(OrderedJson{{"type", "text"}, {"text", part.text}});
+            break;
+        case ChatPartKind::Image:
+            content.push_back(OrderedJson{{"type", "image"}});
+            break;
+        case ChatPartKind::Video:
+            content.push_back(OrderedJson{{"type", "video"}});
+            break;
+        }
+    }
+    return content;
+}
+
+OrderedJson render_template_tool_calls(const ChatMessage& message) {
+    OrderedJson calls = OrderedJson::array();
+    for (const ToolCall& call : message.tool_calls) {
+        OrderedJson arguments = OrderedJson::object();
+        if (!call.arguments_json.empty()) {
+            try {
+                arguments = OrderedJson::parse(call.arguments_json);
+            } catch (const std::exception& error) {
+                throw std::invalid_argument("invalid tool call arguments: " +
+                                            std::string(error.what()));
+            }
+            if (!arguments.is_object()) {
+                throw std::invalid_argument("tool call arguments must be a JSON object");
+            }
+        }
+        calls.push_back(OrderedJson{{"id", call.id},
+                                    {"type", "function"},
+                                    {"function",
+                                     OrderedJson{{"name", call.name},
+                                                 {"arguments", std::move(arguments)}}}});
+    }
+    return calls;
+}
+
+minja::Value jinja_context(const std::vector<ChatMessage>& messages,
+                           const ChatRenderOptions& options) {
+    OrderedJson jinja_messages = OrderedJson::array();
+    for (const ChatMessage& message : messages) {
+        jinja_messages.push_back(OrderedJson{{"role", render_role(message.role)},
+                                              {"content", render_template_content(message)},
+                                              {"reasoning_content", message.reasoning_content},
+                                              {"tool_calls", render_template_tool_calls(message)},
+                                              {"tool_call_id", message.tool_call_id}});
+    }
+
+    OrderedJson tools = OrderedJson::array();
+    for (const std::string& tool : options.tool_jsons) {
+        try {
+            tools.push_back(OrderedJson::parse(tool));
+        } catch (const std::exception& error) {
+            throw std::invalid_argument("invalid tool JSON: " + std::string(error.what()));
+        }
+    }
+
+    OrderedJson values{{"messages", std::move(jinja_messages)},
+                       {"tools", std::move(tools)},
+                       {"add_generation_prompt", options.add_generation_prompt},
+                       {"enable_thinking", options.enable_thinking},
+                       {"add_vision_id", options.add_vision_id},
+                       {"chat_template_kwargs", OrderedJson::object()}};
+    if (options.reasoning_effort) {
+        values["reasoning_effort"] = render_reasoning_effort(*options.reasoning_effort);
+    }
+    if (options.preserve_thinking) {
+        values["preserve_thinking"] = *options.preserve_thinking;
+        values["chat_template_kwargs"]["preserve_thinking"] = *options.preserve_thinking;
+    }
+    return minja::Value(values);
+}
+
 } // namespace
+namespace {
+
+// Local hardening (upstream PR #42 review, P2): strip Jinja comments before
+// capability detection so a token mentioned only in a comment ({# #} block
+// comments or # line comments inside {{ }} / {% %} blocks) is not counted as
+// template usage. Heuristic: string literals are respected, line comments run
+// to end of line.
+std::string strip_jinja_comments(std::string source) {
+    // 1) {# ... #} block comments (may span multiple lines).
+    size_t pos = 0;
+    while (true) {
+        const size_t begin = source.find("{#", pos);
+        if (begin == std::string::npos) { break; }
+        const size_t end = source.find("#}", begin + 2);
+        if (end == std::string::npos) {
+            source.erase(begin);  // Unterminated comment; template compilation would have rejected it anyway.
+            break;
+        }
+        source.erase(begin, (end + 2) - begin);
+    }
+
+    // 2) # line comments inside {{ ... }} / {% ... %} blocks.
+    size_t scan = 0;
+    while (scan < source.size()) {
+        const size_t brace = source.find('{', scan);
+        if (brace == std::string::npos) { break; }
+        const size_t open = brace + 1;
+        if (open < source.size() && (source[open] == '{' || source[open] == '%')) {
+            const char close_char = source[open] == '{' ? '}' : '%';
+            // Locate the block end, skipping string literals and # comments (which run to end of line).
+            size_t end = open + 1;
+            bool in_single = false;
+            bool in_double = false;
+            while (end < source.size()) {
+                const char c = source[end];
+                if (in_single) {
+                    if (c == '\'') { in_single = false; }
+                    ++end;
+                    continue;
+                }
+                if (in_double) {
+                    if (c == '"') { in_double = false; }
+                    ++end;
+                    continue;
+                }
+                if (c == '\'') { in_single = true; ++end; continue; }
+                if (c == '"') { in_double = true; ++end; continue; }
+                if (c == '#') {
+                    const size_t newline = source.find('\n', end);
+                    end = (newline == std::string::npos) ? source.size() : newline + 1;
+                    in_single = in_double = false;
+                    continue;
+                }
+                if (c == close_char && end + 1 < source.size() && source[end + 1] == close_char) { break; }
+                ++end;
+            }
+            const size_t body_end = (end < source.size()) ? end : source.size();
+            // Blank comment text with spaces line by line so offsets stay stable.
+            for (size_t i = brace + 2; i < body_end;) {
+                if (source[i] == '\n') { ++i; continue; }
+                const size_t line_end = source.find('\n', i);
+                const size_t line_stop = (line_end == std::string::npos) ? source.size() : line_end;
+                size_t hash = std::string::npos;
+                bool s1 = false, s2 = false;
+                for (size_t j = i; j < line_stop; ++j) {
+                    const char c = source[j];
+                    if (s1) { if (c == '\'') { s1 = false; } }
+                    else if (s2) { if (c == '"') { s2 = false; } }
+                    else if (c == '\'') { s1 = true; }
+                    else if (c == '"') { s2 = true; }
+                    else if (c == '#') { hash = j; break; }
+                }
+                if (hash != std::string::npos) {
+                    for (size_t j = hash; j < line_stop; ++j) { source[j] = ' '; }
+                }
+                i = line_end;
+            }
+            scan = (end + 2 < source.size()) ? end + 2 : source.size();
+        } else {
+            scan = brace + 1;
+        }
+    }
+    return source;
+}
+
+}  // namespace
+
+bool prompt_starts_in_reasoning(std::string_view text) {
+    struct MarkerPair
+    {
+        std::string_view open;
+        std::string_view close;
+    };
+    static constexpr MarkerPair kMarkers[] = {
+        {"<think>", "</think>"},
+        {"<|think|>", "</|think|>"},
+        {"<thinking>", "</thinking>"},
+    };
+    bool       found        = false;
+    bool       last_is_open = false;
+    std::size_t last_pos    = 0;
+    for (const auto& marker : kMarkers) {
+        const std::string_view pieces[2] = {marker.open, marker.close};
+        for (const std::string_view piece : pieces) {
+            const auto pos = text.rfind(piece);
+            if (pos == std::string_view::npos) { continue; }
+            if (!found || pos > last_pos) {
+                last_pos     = pos;
+                last_is_open = (piece == marker.open);
+                found        = true;
+            }
+        }
+    }
+    return found && last_is_open;
+}
+
+class CompiledChatTemplate::JinjaTemplate {
+public:
+    JinjaTemplate(std::string source, std::string source_name)
+        : source_name_(std::move(source_name)),
+          supports_reasoning_effort_(strip_jinja_comments(source).find("reasoning_effort") != std::string::npos) {
+        try {
+            template_ = minja::Parser::parse(source, minja::Options{.trim_blocks           = true,
+                                                                      .lstrip_blocks         = true,
+                                                                      .keep_trailing_newline = false});
+        } catch (const std::exception& error) {
+            throw std::invalid_argument("failed to compile Jinja chat template '" + source_name_ +
+                                        "': " + error.what());
+        }
+    }
+
+    [[nodiscard]] RenderedChat render(const std::vector<ChatMessage>& messages,
+                                      const ChatRenderOptions& options) const {
+        if (options.reasoning_effort && !supports_reasoning_effort_) {
+            throw std::invalid_argument(
+            "custom Jinja chat template does not reference reasoning_effort");
+        }
+        try {
+            RenderedChat rendered;
+            rendered.text =
+                template_->render(minja::Context::make(jinja_context(messages, options)));
+            // A custom template exposes no byte frontier per message or cache marker:
+            // report honest sizes with no resolved offsets so size guards downstream
+            // (frontend context-cache preparation, media encoding) stay satisfied and
+            // marker resolution degrades to "no independent boundary" instead of
+            // failing on empty vectors.
+            rendered.message_boundaries.assign(messages.size() + 1U, std::nullopt);
+            rendered.cache_boundaries.assign(options.cache_markers.size(), std::nullopt);
+            // A custom Jinja template is an opaque byte generator, so unlike the builtin
+            // renderer the exact frontier that ends the last real user query cannot be
+            // pointed at directly. Probe that frontier by rendering the message prefix up
+            // to and including the query (the whole history when thinking is preserved)
+            // without the generation suffix, then publish a rewrite checkpoint at the
+            // probe boundary -- but only when the probe text is a byte prefix of the full
+            // render. Templates whose output depends on later messages fail the probe and
+            // keep no checkpoint, degrading to full-prompt reuse exactly as before.
+            rendered.rewrite_checkpoint =
+                probe_rewrite_checkpoint(messages, options, rendered.text);
+            return rendered;
+        } catch (const std::exception& error) {
+            throw std::invalid_argument("failed to render Jinja chat template '" + source_name_ +
+                                        "': " + error.what());
+        }
+    }
+
+    [[nodiscard]] PromptCapabilities capabilities() const noexcept {
+        PromptCapabilities result;
+        result.enable_thinking = true;
+        if (supports_reasoning_effort_) {
+            result.reasoning_effort.low            = true;
+            result.reasoning_effort.medium         = true;
+            result.reasoning_effort.xhigh          = true;
+            result.reasoning_effort.default_effort = ReasoningEffort::Medium;
+        }
+        return result;
+    }
+
+private:
+    // Mirror the builtin renderer's closed-turn publication policy on an opaque custom
+    // template: a request that closes the turn and appends a generation prompt publishes
+    // one rewrite checkpoint so a successor may reuse the stable history. When thinking is
+    // preserved the successor replays the response from the generation boundary
+    // (ResponseReplay); otherwise the caller may close the turn and branch with a new user
+    // message, which rewrites everything rendered after the last real user query
+    // (TurnClosure). Both boundaries are probed by re-rendering without the generation
+    // suffix -- the message prefix up to and including the last real user query for the
+    // turn-closure point, the whole history for the response-replay point.
+    [[nodiscard]] std::optional<RewriteCheckpointByteSpec>
+    probe_rewrite_checkpoint(const std::vector<ChatMessage>& messages,
+                             const ChatRenderOptions& options,
+                             const std::string& full_text) const {
+        if (options.continuation == PromptContinuationMode::ContinueFinalAssistant ||
+            !options.add_generation_prompt) {
+            return std::nullopt;
+        }
+        try {
+            const bool preserve_thinking = options.preserve_thinking.value_or(false);
+            ChatRenderOptions probe_options = options;
+            probe_options.add_generation_prompt = false;
+            std::size_t probe_end = messages.size();
+            if (!preserve_thinking) {
+                try {
+                    probe_end =
+                        static_cast<std::size_t>(last_real_user_query(messages)) + 1U;
+                } catch (const std::invalid_argument&) {
+                    // The history contains no user query yet the template accepted it:
+                    // there is no stable branch point, so probe the whole history.
+                    probe_end = messages.size();
+                }
+            }
+            const std::string probe_text = template_->render(minja::Context::make(
+                jinja_context(std::vector<ChatMessage>(messages.begin(),
+                                                       messages.begin() +
+                                                           static_cast<std::ptrdiff_t>(probe_end)),
+                              probe_options)));
+            if (probe_text.empty() || probe_text.size() > full_text.size() ||
+                !starts_with(full_text, probe_text)) {
+                return std::nullopt;
+            }
+            return RewriteCheckpointByteSpec{
+                .kind   = preserve_thinking ? RewriteCheckpointKind::ResponseReplay
+                                            : RewriteCheckpointKind::TurnClosure,
+                .offset = probe_text.size()};
+        } catch (const std::exception&) {
+            // A failing probe must never fail a successful full render.
+            return std::nullopt;
+        }
+    }
+
+    std::string source_name_;
+    bool supports_reasoning_effort_ = false;
+    std::shared_ptr<minja::TemplateNode> template_;
+};
 
 bool ChatMessage::has_media() const noexcept {
     for (const ChatPart& part : parts) {
@@ -423,7 +766,17 @@ CompiledChatTemplate CompiledChatTemplate::resolve(std::string_view source) {
                                 sha256_hex(digest) + ")");
 }
 
+CompiledChatTemplate CompiledChatTemplate::compile_jinja(std::string source,
+                                                         std::string source_name) {
+    if (source.empty()) {
+        throw std::invalid_argument("Jinja chat template '" + source_name + "' is empty");
+    }
+    return CompiledChatTemplate(
+        std::make_shared<const JinjaTemplate>(std::move(source), std::move(source_name)));
+}
+
 PromptCapabilities CompiledChatTemplate::capabilities() const noexcept {
+    if (jinja_template_) { return jinja_template_->capabilities(); }
     PromptCapabilities result;
     result.enable_thinking = true;
     if (semantics_ == ChatTemplateSemantics::ReasoningEffort) {
@@ -438,6 +791,7 @@ PromptCapabilities CompiledChatTemplate::capabilities() const noexcept {
 RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messages,
                                           ChatRenderOptions options) const {
     if (messages.empty()) { throw std::invalid_argument("chat messages must not be empty"); }
+    if (jinja_template_) { return jinja_template_->render(messages, options); }
 
     const bool continue_final_assistant =
         options.continuation == PromptContinuationMode::ContinueFinalAssistant;

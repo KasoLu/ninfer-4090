@@ -81,9 +81,6 @@ ninfer_add_test(ninfer_perplexity_evaluation_test
           ${PROJECT_SOURCE_DIR}/apps/perplexity/evaluation.cpp)
 target_include_directories(ninfer_perplexity_evaluation_test PRIVATE
   ${PROJECT_SOURCE_DIR}/apps/perplexity)
-ninfer_add_test(ninfer_cli_options_test
-  SOURCES test_cli_options.cpp ${PROJECT_SOURCE_DIR}/apps/cli/options.cpp)
-target_include_directories(ninfer_cli_options_test PRIVATE ${PROJECT_SOURCE_DIR}/apps/cli)
 ninfer_add_test(ninfer_kv_cache_test
   SOURCES test_kv_cache.cpp
   LIBRARIES ninfer_core)
@@ -107,6 +104,12 @@ ninfer_add_test(ninfer_qwen3_6_frontend_test
   NEEDS_SOURCE_DIR
   LIBRARIES ninfer_engine ninfer_core)
 target_include_directories(ninfer_qwen3_6_frontend_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/impl)
+ninfer_add_test(ninfer_qwen3_6_jinja_template_test
+  SOURCES targets/qwen3_6/test_jinja_chat_template.cpp
+  LIBRARIES ninfer_engine ninfer_core)
+target_include_directories(ninfer_qwen3_6_jinja_template_test PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/impl)
 ninfer_add_test(ninfer_qwen3_6_runtime_mechanisms_test
@@ -195,6 +198,11 @@ ninfer_add_test(ninfer_slot_files_test
 ninfer_add_test(ninfer_slot_spill_guard_test
   SOURCES test_slot_spill_guard.cpp
   LIBRARIES ninfer_core)
+ninfer_add_test(ninfer_cli_options_test
+  SOURCES test_cli_options.cpp
+          ${PROJECT_SOURCE_DIR}/apps/cli/options.cpp
+  LIBRARIES ninfer_core)
+target_include_directories(ninfer_cli_options_test PRIVATE ${PROJECT_SOURCE_DIR}/apps/cli)
 ninfer_add_test(ninfer_request_log_test
   SOURCES test_request_log.cpp
   LIBRARIES ninfer_serve)

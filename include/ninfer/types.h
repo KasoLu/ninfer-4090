@@ -163,6 +163,8 @@ struct ContextCostOptions {
 struct EngineOptions {
     std::filesystem::path artifact_path;
     EnginePurpose purpose              = EnginePurpose::Generation;
+    // Optional self-contained Jinja chat template loaded once with this Engine.
+    std::filesystem::path chat_template_path;
     int device                         = 0;
     std::uint32_t max_context          = 2048; // Logical ceiling of one request or score window.
     KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(2048);

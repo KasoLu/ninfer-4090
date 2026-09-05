@@ -1,7 +1,7 @@
 # AGENTS.md
 
 本文件是工作区 agent 上下文：描述 NInfer-4090 仓库的代码现状（本仓库为自上游 fork 后建立的独立
-仓库，HEAD `914e0500`，工作树另含来自旧仓库 `ninfer-4090` 的未暂存 patch，见「仓库现状与分支」）
+仓库。旧仓库 `ninfer-4090` 的后续工作（jinja chat template 移植）已以 patch 形式落入本仓库并提交，见「仓库现状与分支」）。
 与协作约定。
 
 ## 项目
@@ -85,8 +85,8 @@ docs/                  用户指南（cli.md、serving.md、performance.md、per
 model-cards/           5 个已发布工件的模型卡（Qwen3.6-27B、Qwen3.6-27B-nvfp4、Qwen3.6-35B-A3B、Qwen3.8-27B、Qwen3.8-27B-nvfp4）
 scripts/               下载（download-qwen38.sh/.bat → $NINFER_MODEL_DIR/qwen3_8_27b.ninfer，HF 来源）、
                            运行配置（run-qwen38-c1/c8/vision .sh/.bat）、v0.4.0–v0.6.0 发布打包、check-linux-scripts.sh
-third_party/           cpp-httplib、nlohmann、utf8proc、minja（Jinja 模板引擎，随 PR #42 patch 引入，未提交）
-build/                 现有已配置构建目录（sm_89）
+third_party/           cpp-httplib、nlohmann、utf8proc、minja（Jinja 模板引擎，随 jinja chat template 引入）
+build/                 构建目录（git 忽略；docker 内全新 configure，Ninja 生成器 + sm_89）
 dist/                  Windows 发布包输出目录（内容被 Git 忽略）
 ```
 
@@ -414,16 +414,16 @@ ninfer-serve models/qwen3_8_27b.ninfer \
 ### 仓库现状与分支（截至 `914e0500`）
 
 - 本仓库自上游 fork 后建立为**独立仓库**：`origin = https://github.com/KasoLu/ninfer-4090.git`
-  （默认分支 `rtx4090-port`）；本地仅 `chat-template`（当前分支，与 `rtx4090-port` 完全同位，
-  HEAD = `914e0500`，领先 0 提交）和 `rtx4090-port` 两个分支。旧仓库（`C:\Workspace\codes\ninfer-4090`，
+  （默认分支 `rtx4090-port`）；本地仅 `chat-template`（当前分支，领先 `rtx4090-port` jinja 移植与文档更新提交）和
+  `rtx4090-port` 两个分支。旧仓库（`C:\Workspace\codes\ninfer-4090`，
   remotes 为 `sergiuszm/ninfer-4090` / `UDPSendToFailed/ninfer-4090`）的 `master`/`release/*`/
   `recon/*` 分支与 `k4090` 远端均已不存在。
 - **旧仓库的后续工作未随 fork 带入**：其 `chat-template` 分支上的 PR #42 两笔提交（`5dac17ec`
-  移植、`f81d4d32` 评论修复）在本仓库不存在（`git cat-file` 验证）。全部内容以 patch 形式重新落在
-  本仓库**未暂存工作树**：20 个已跟踪文件修改（+667/−356）+ 5 项未跟踪文件（明细见下）。
+  移植、`f81d4d32` 评论修复）在本仓库不存在（`git cat-file` 验证）。全部内容以 patch 形式重新落回本仓库
+  并已提交：功能提交 `b259ac0c`（jinja chat template，含 6 处本地评论修复）、`98785557`（linear_swiglu 测试无 GPU skip 码修复）、本文件更新（明细见下）。
   提交历史与旧仓库 `rtx4090-port` 一致（见下条）。
-- 近期提交（新→旧）：`docs: correct the logging-replatform risk note`、`docs: record the /health port and the admission review`、`fix(serve): report the engine's real state on /health`、`docs: record the 2026-09-01 fork and upstream sweep`、`test(ops): verify i8 keys in the full-cache append`、`refactor(serve): retire --turn-checkpoints`、`test(serve): guard the effort alias and models payload`、`test: run session-persistence E2E on Qwen3.8 artifact`、`feat(runtime): persist checkpoints in slot snapshots`、`fix(ops): accept packed and E8 KV modes in append`、`feat(runtime): port session slots to catalog`、`Merge upstream neroued/master into rtx4090-port`、`docs: record inbound ports from downstream forks`、`fix(docker): remove CUDA forward-compat libs so GeForce cards can run`、`feat(serve): accept enable_thinking and reasoning_effort under chat_template_kwargs`、`fix(runtime): preserve reusable checkpoints under pressure`、`bench(ttft): cover shared prefix value scheduling`、`feat(runtime): add value-aware shared prefix scheduling`、`test(nvfp4): cover a width the fused SwiGLU route newly reaches`、`feat(profiling): instrument engine execution with nvtx`。
-- **未暂存 patch 内容**（源自旧仓库，已在本仓库逐一验证落地，等待提交）：
+- 近期提交（新→旧）：`test(ops): propagate the no-GPU skip code in linear_swiglu tests`、`feat(frontend): introduce a self-contained Jinja chat template`、`docs: correct the logging-replatform risk note`、`docs: record the /health port and the admission review`、`fix(serve): report the engine's real state on /health`、`docs: record the 2026-09-01 fork and upstream sweep`、`test(ops): verify i8 keys in the full-cache append`、`refactor(serve): retire --turn-checkpoints`、`test(serve): guard the effort alias and models payload`、`test: run session-persistence E2E on Qwen3.8 artifact`、`feat(runtime): persist checkpoints in slot snapshots`、`fix(ops): accept packed and E8 KV modes in append`、`feat(runtime): port session slots to catalog`、`Merge upstream neroued/master into rtx4090-port`、`docs: record inbound ports from downstream forks`、`fix(docker): remove CUDA forward-compat libs so GeForce cards can run`、`feat(serve): accept enable_thinking and reasoning_effort under chat_template_kwargs`、`fix(runtime): preserve reusable checkpoints under pressure`、`bench(ttft): cover shared prefix value scheduling`、`feat(runtime): add value-aware shared prefix scheduling`、`test(nvfp4): cover a width the fused SwiGLU route newly reaches`、`feat(profiling): instrument engine execution with nvtx`。
+- **旧仓库 patch 内容**（源自旧仓库，已在本仓库逐一验证落地并提交）：
   - **上游 PR #42 移植**（Neroued/ninfer，Jinja chat template 支持，作者 Doelfke，head `3f8154ea`，
     closed 未合并；净 diff 已覆盖 #41/#43 全部，无需额外 cherry-pick）：vendored `third_party/minja/`
     （LICENSE + minja.hpp 132 KB/3069 行，与 PR head 逐字节一致 + 下方本地修复）、
@@ -537,8 +537,8 @@ ninfer-serve models/qwen3_8_27b.ninfer \
 ### 开发机构建与测试（本机无 GPU）
 
 - 本机是开发机、**无 NVIDIA 显卡**：nvcc 编译与 ctest 一律在 Docker 镜像 `ninfer-local-build:latest`（nvidia/cuda 13.1.2 基座、CUDA 13.1.2、`/usr/local/cuda/bin` 在 PATH、无默认工作目录）内执行，不在宿主机直接编译或跑 GPU 测试。
-- 容器内源码挂载点为 `/src`（`build/CMakeCache.txt` 的 `CMAKE_HOME_DIRECTORY=/src`）：docker run 时把仓库根目录挂到 `/src`，复用仓库内已配置的 `build/` 树（Ninja：`build.ninja` + `compile_commands.json`），命令为 `cmake --build /src/build --parallel`、`ctest --test-dir /src/build`。
-- 现有构建树已锁定 **sm_89（只编 4090）**，与根 CMakeLists 的 `FATAL_ERROR` 校验一致：`CMAKE_BUILD_TYPE=Release`、`CMAKE_CUDA_ARCHITECTURES=89`、`CMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc`、`CMAKE_CXX_COMPILER=/usr/bin/c++`、`NINFER_BUILD_APPS=ON`、`NINFER_BUILD_BENCHMARKS=OFF`；重新 configure 时必须继续传 `-DCMAKE_CUDA_ARCHITECTURES=89`。
+- 容器内源码挂载点为 `/src`（`build/CMakeCache.txt` 的 `CMAKE_HOME_DIRECTORY=/src`）：docker run 时把仓库根目录挂到 `/src`，复用 `build/` 树（Ninja：`build.ninja` + `compile_commands.json`），命令为 `cmake --build /src/build --parallel`、`ctest --test-dir /src/build`；`build/` 不存在时先 `cmake -S /src -B /src/build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON -DCMAKE_CUDA_ARCHITECTURES=89`（容器内 cmake 默认生成器是 Unix Makefiles，必须显式 `-G Ninja`，否则 `ninja` 找不到 `build.ninja`）
+- `build/` 树锁定 **sm_89（只编 4090）**，与根 CMakeLists 的 `FATAL_ERROR` 校验一致：`CMAKE_BUILD_TYPE=Release`、`CMAKE_CUDA_ARCHITECTURES=89`、`CMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc`、`CMAKE_CXX_COMPILER=/usr/bin/c++`、`NINFER_BUILD_APPS=ON`、`NINFER_BUILD_BENCHMARKS=OFF`；重新 configure 时必须继续传 `-G Ninja -DCMAKE_CUDA_ARCHITECTURES=89`
 - 构建流水线（移植/功能改动均照此执行）：
   1. 先跑**语法检测门禁**（可并行；只编译 `src/` 的全部 TU、不做链接，快速暴露语法与头文件错误）；
   2. 门禁通过后再启动真正的完整编译（链接 apps 与测试）；

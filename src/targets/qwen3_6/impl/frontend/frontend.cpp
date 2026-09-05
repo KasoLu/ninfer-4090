@@ -19,6 +19,8 @@
 #include <cctype>
 #include <cstddef>
 #include <cstdint>
+#include <fstream>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -224,8 +226,26 @@ void validate_tokenizer_config(const FrontendResources& resources) {
     }
 }
 
-fi::CompiledChatTemplate compile_chat_template(const FrontendResources& resources) {
+std::string read_chat_template_file(const std::filesystem::path& path) {
+    std::ifstream stream(path, std::ios::binary);
+    if (!stream) {
+        throw std::invalid_argument("failed to open Jinja chat template '" + path.string() + "'");
+    }
+    const std::string source((std::istreambuf_iterator<char>(stream)),
+                             std::istreambuf_iterator<char>());
+    if (stream.bad()) {
+        throw std::invalid_argument("failed to read Jinja chat template '" + path.string() + "'");
+    }
+    return source;
+}
+
+fi::CompiledChatTemplate compile_chat_template(const FrontendResources& resources,
+                                               const FrontendOptions& options) {
     validate_tokenizer_config(resources);
+    if (!options.chat_template_path.empty()) {
+        return fi::CompiledChatTemplate::compile_jinja(
+            read_chat_template_file(options.chat_template_path), options.chat_template_path.string());
+    }
     return fi::CompiledChatTemplate::resolve(resources.chat_template_jinja);
 }
 
@@ -859,7 +879,7 @@ PreparedContextCache prepare_context_cache(
 class Frontend::Impl {
 public:
     Impl(const FrontendResources& resources, bool registered_checkpoint, FrontendOptions options)
-        : chat_template(compile_chat_template(resources)),
+        : chat_template(compile_chat_template(resources, options)),
           tokenizer(std::make_shared<const fi::Tokenizer>(
               fi::TokenizerResources{.tokenizer_json         = resources.tokenizer_json,
                                      .tokenizer_config_json  = resources.tokenizer_config_json,
@@ -1377,6 +1397,7 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
     result.tool_call_output    = tool_call_output;
     std::vector<std::optional<std::uint32_t>> message_boundaries;
     std::vector<std::optional<std::uint32_t>> cache_boundaries;
+    bool reasoning_prologue = false;
     if (has_media) {
         fi::Processor processor(*impl_->tokenizer, impl_->chat_template, impl_->processor,
                                 impl_->media_cache);
@@ -1418,6 +1439,7 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
     } else {
         const fi::RenderedChat rendered =
             impl_->chat_template.render(messages, render_options(options, rendered_markers));
+        reasoning_prologue = fi::prompt_starts_in_reasoning(rendered.text);
         const auto tokenize_started = Clock::now();
         fi::EncodedChat encoded     = fi::encode_rendered_chat(
             *impl_->tokenizer, rendered, static_cast<std::size_t>(impl_->max_context) + 1U);
@@ -1441,8 +1463,13 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
         std::move(cache_hints), message_count, message_boundaries, rendered_markers,
         cache_boundaries, result.vision_items, engine_tool_marker_index, leading_boundary,
         checked_token_count(result.token_ids.size()));
+    // P1 fix (upstream PR #42 review): for text prompts the starting channel is derived from the
+    // rendered prompt (last reasoning marker open), so a custom template without a thinking
+    // prologue cannot classify the whole generation as reasoning. The media path does not retain
+    // rendered text and keeps the option-based derivation.
     result.starts_in_reasoning =
-        options.continuation == PromptContinuationMode::NewAssistantTurn && options.enable_thinking;
+        options.continuation == PromptContinuationMode::NewAssistantTurn &&
+        (has_media ? options.enable_thinking : reasoning_prologue);
     result.prepare.seconds = std::chrono::duration<double>(Clock::now() - start).count();
     return PreparedPrompt(std::move(prepared));
 }
