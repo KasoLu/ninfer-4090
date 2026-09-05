@@ -67,7 +67,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         const std::int32_t* block_tables, const std::int32_t* valid_columns,
         const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t full_width,
         std::int32_t column_begin, std::int32_t logical_capacity, float scale,
-        __nv_bfloat16* partial_acc, float* partial_m, float* partial_l) {
+        __nv_bfloat16* partial_acc, float* partial_m, float* partial_l, std::int32_t k6_bisect) {
     constexpr int Wc                   = WarpsPerCta;
     constexpr int RowCount             = TokenTile * Geometry::GroupSize;
     constexpr int RowTiles             = (RowCount + 15) / 16;
@@ -256,35 +256,69 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                         kv_cache_pack_i4(kv_cache_i4_quant_code(vv1, v_inv), kv_cache_i4_quant_code(vv1_hi, v_inv));
                 }
             } else if constexpr (K6) {
+                // NOTE: same deliberate half-coset approximation as the rk4v4-e8 path above: the
+                // D8+0.5 E8 coset is collapsed by the rintf() below and never reconstructed,
+                // since no coset bit exists in the packed codes.
                 float kv0_scaled = kv0 * k_inv;
                 float kv1_scaled = kv1 * k_inv;
                 e8_project_8d_warp(kv0_scaled, kv1_scaled, lane);
-                // NOTE: same deliberate half-coset approximation as the rk4v4-e8 path above: the
-                // D8+0.5 E8 coset is collapsed by the rintf() below and never reconstructed,
-                // since no coset bit exists in the packed i6 codes.
-                std::uint8_t c0 = kv_cache_i6_code_from_int(static_cast<int>(rintf(kv0_scaled)));
-                std::uint8_t c1 = kv_cache_i6_code_from_int(static_cast<int>(rintf(kv1_scaled)));
-                // Four consecutive lanes hold one 24-bit quad (3 bytes); each 4-lane leader
-                // writes one quad of the d0 half (24 B) and the d1 half (offset +24).
-                const std::int64_t k_row =
-                    paged_kv_page_head_offset<kKVCacheI6HeadExtent, Geometry::KVHeads>(physical_page, kv_head) +
-                    static_cast<std::int64_t>(page_offset) * kKVCacheI6HeadExtent + grp * 48;
-                if ((lane & 3) == 0) {
+                if (k6_bisect == 2 || k6_bisect == 3) {
+                    // Bisection arms 2/3 (2026-09 4090 hang hunt): write K with the proven
+                    // rk4v4-e8 4-bit E8-lattice path instead of the 6-bit codes.
+                    const std::int8_t c0 =
+                        static_cast<std::int8_t>(max(-8, min(7, static_cast<int>(rintf(kv0_scaled)))));
+                    const std::int8_t c1 =
+                        static_cast<std::int8_t>(max(-8, min(7, static_cast<int>(rintf(kv1_scaled)))));
+                    const std::int8_t c0_hi =
+                        static_cast<std::int8_t>(__shfl_down_sync(FullMask, static_cast<int>(c0), 1));
+                    const std::int8_t c1_hi =
+                        static_cast<std::int8_t>(__shfl_down_sync(FullMask, static_cast<int>(c1), 1));
+                    if ((lane & 1) == 0) {
+                        reinterpret_cast<std::uint8_t*>(cache_k_i8)[
+                            kv_cache_i4_code_index<Geometry>(physical_page, kv_head, d0 / 2,
+                                                             page_offset)] =
+                            kv_cache_pack_i4(c0, c0_hi);
+                        reinterpret_cast<std::uint8_t*>(cache_k_i8)[
+                            kv_cache_i4_code_index<Geometry>(physical_page, kv_head, d1 / 2,
+                                                             page_offset)] =
+                            kv_cache_pack_i4(c1, c1_hi);
+                    }
+                } else {
+                    // RK6V4E8 6-bit quad packing (production path).
+                    std::uint8_t c0 = kv_cache_i6_code_from_int(static_cast<int>(rintf(kv0_scaled)));
+                    std::uint8_t c1 = kv_cache_i6_code_from_int(static_cast<int>(rintf(kv1_scaled)));
+                    // Four consecutive lanes hold one 24-bit quad (3 bytes); each 4-lane leader
+                    // writes one quad of the d0 half (24 B) and the d1 half (offset +24).
+                    const std::int64_t k_row = paged_kv_page_head_offset<kKVCacheI6HeadExtent,
+                                                                         Geometry::KVHeads>(
+                        physical_page, kv_head) +
+                        static_cast<std::int64_t>(page_offset) * kKVCacheI6HeadExtent + grp * 48;
+                    // Gather the 4-lane quad with full-mask shuffles from explicit source
+                    // lanes: every lane of the warp converges on each __shfl_sync, the only
+                    // mask form this codebase relies on. The per-quad sub-mask
+                    // __shfl_down_sync variant deadlocked on sm_89 (4090 hang 2026-09-04):
+                    // shfl_down offsets 1..3 make the group's non-leader lanes read source
+                    // lanes outside their sub-mask, which is undefined behavior. The
+                    // explicit-source gather below is bit-identical for the leader reads.
+                    const int c0i = static_cast<int>(c0);
+                    const int c1i = static_cast<int>(c1);
+                    const int qbase = lane & ~3;
                     std::uint8_t quad0[4];
                     std::uint8_t quad1[4];
-                    quad0[0] = c0;
-                    quad1[0] = c1;
-#pragma unroll
-                    for (int o = 1; o < 4; ++o) {
-                        quad0[o] =
-                            static_cast<std::uint8_t>(__shfl_down_sync(FullMask, static_cast<int>(c0), o));
-                        quad1[o] =
-                            static_cast<std::uint8_t>(__shfl_down_sync(FullMask, static_cast<int>(c1), o));
+                    quad0[0] = static_cast<std::uint8_t>(__shfl_sync(FullMask, c0i, qbase));
+                    quad0[1] = static_cast<std::uint8_t>(__shfl_sync(FullMask, c0i, qbase + 1));
+                    quad0[2] = static_cast<std::uint8_t>(__shfl_sync(FullMask, c0i, qbase + 2));
+                    quad0[3] = static_cast<std::uint8_t>(__shfl_sync(FullMask, c0i, qbase + 3));
+                    quad1[0] = static_cast<std::uint8_t>(__shfl_sync(FullMask, c1i, qbase));
+                    quad1[1] = static_cast<std::uint8_t>(__shfl_sync(FullMask, c1i, qbase + 1));
+                    quad1[2] = static_cast<std::uint8_t>(__shfl_sync(FullMask, c1i, qbase + 2));
+                    quad1[3] = static_cast<std::uint8_t>(__shfl_sync(FullMask, c1i, qbase + 3));
+                    if ((lane & 3) == 0) {
+                        const int quad_off = (lane >> 2) * 3;
+                        auto* k_bytes = reinterpret_cast<std::uint8_t*>(cache_k_i8);
+                        kv_cache_pack_i6_quad(quad0, &k_bytes[k_row + quad_off]);
+                        kv_cache_pack_i6_quad(quad1, &k_bytes[k_row + 24 + quad_off]);
                     }
-                    const int quad_off = (lane >> 2) * 3;
-                    auto* k_bytes = reinterpret_cast<std::uint8_t*>(cache_k_i8);
-                    kv_cache_pack_i6_quad(quad0, &k_bytes[k_row + quad_off]);
-                    kv_cache_pack_i6_quad(quad1, &k_bytes[k_row + 24 + quad_off]);
                 }
                 const float vv0_hi = __shfl_down_sync(FullMask, vv0, 1);
                 const float vv1_hi = __shfl_down_sync(FullMask, vv1, 1);
@@ -298,6 +332,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                         kv_cache_pack_i4(kv_cache_i4_quant_code(vv1, v_inv),
                                          kv_cache_i4_quant_code(vv1_hi, v_inv));
                 }
+                
             } else if constexpr (PackedK) {
                 std::int8_t c0 = 0, c1 = 0;
                 if constexpr (E8Lattice) {
@@ -479,13 +514,24 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                         physical_page, kv_head, d / 2, key & kPagedKVPageMask);
                     kv_cache_unpack_i4x16(&cache_v_codes[voff], &v_i8[key_l * D + d]);
                 } else if constexpr (K6) {
-                    const std::int64_t koff = kv_cache_i6_code_index<Geometry>(
-                        physical_page, kv_head, d, key & kPagedKVPageMask);
                     std::int8_t* dst = &k_i8[key_l * D + causal_small_t_tc_swz(key_l, dc * 8) * 2];
-                    kv_cache_unpack_i6x16(&reinterpret_cast<const std::uint8_t*>(cache_k_i8)[koff], dst);
+                    if (k6_bisect == 1 || k6_bisect == 3) {
+                        // Bisection arms 1/3 (2026-09 4090 hang hunt): read K with the proven
+                        // 4-bit path instead of the 6-bit codes.
+                        const std::int64_t koff = kv_cache_i4_code_index<Geometry>(
+                            physical_page, kv_head, d / 2, key & kPagedKVPageMask);
+                        const auto* k_bytes = reinterpret_cast<const std::uint8_t*>(cache_k_i8);
+                        kv_cache_unpack_i4x16(&k_bytes[koff], dst);
+                    } else {
+                        const std::int64_t koff = kv_cache_i6_code_index<Geometry>(
+                            physical_page, kv_head, d, key & kPagedKVPageMask);
+                        const auto* k_bytes = reinterpret_cast<const std::uint8_t*>(cache_k_i8);
+                        kv_cache_unpack_i6x16(&k_bytes[koff], dst);
+                    }
                     const std::int64_t voff = kv_cache_i4_code_index<Geometry>(
                         physical_page, kv_head, d / 2, key & kPagedKVPageMask);
                     kv_cache_unpack_i4x16(&cache_v_codes[voff], &v_i8[key_l * D + d]);
+                
                 } else if constexpr (PackedK) {
                     const std::int64_t koff = kv_cache_i4_code_index<Geometry>(
                         physical_page, kv_head, d / 2, key & kPagedKVPageMask);
