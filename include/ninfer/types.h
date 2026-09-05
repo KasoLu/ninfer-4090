@@ -23,8 +23,11 @@ inline constexpr std::size_t kMaximumContextCacheSessionKeyBytes = 256;
 inline constexpr std::size_t kMaximumPromptMediaBytes    = 256ULL << 20;
 inline constexpr std::size_t kDefaultMediaCacheBytes     = 1ULL << 30;
 inline constexpr std::size_t kDefaultMediaLiveBytes      = 2ULL << 30;
-inline constexpr std::uint32_t kDefaultHostStateSlots    = 8;
-inline constexpr std::size_t kDefaultHostKvCapacityBytes = 8ULL << 30;
+// Host-tier context cache (pinned host RAM, not VRAM). Defaults are disabled: pinned
+// capacity is fixed at startup and large defaults exhaust low-memory hosts (e.g. WSL2),
+// so deployments opt in explicitly via --host-state-slots / --host-kv-mib.
+inline constexpr std::uint32_t kDefaultHostStateSlots    = 0;
+inline constexpr std::size_t kDefaultHostKvCapacityBytes = 0;
 
 enum class KvCacheStorage : std::uint8_t {
     BFloat16,
@@ -139,8 +142,8 @@ struct SlotAutoSaveEvent {
 
 struct ContextCacheOptions {
     // Engine resolves every optional once at construction. With C=max_concurrency, the enabled
-    // defaults are H=C, R=8, Host KV=8 GiB, P=2C, S=C and L=2; Engine::options() returns those
-    // effective values.
+    // defaults are H=C, host StateImages=0, Host KV=0 (pinned RAM tiers are opt-in), P=2C, S=C
+    // and L=2; Engine::options() returns those effective values.
     bool enabled = true;
     // Extra Device checkpoint StateImage slots H. Total Device StateImage capacity is C + H.
     std::optional<std::uint32_t> device_state_slots;

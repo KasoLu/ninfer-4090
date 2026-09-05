@@ -134,11 +134,11 @@ state image (about 147 MiB of host memory on Qwen3.8-27B), so size `--host-state
 for `continuations x (2 + anchors)`. The old `--turn-checkpoints` ring is retired
 and ignored; see [docs/turn-checkpoint-ring.md](docs/turn-checkpoint-ring.md).
 
-Extra requests beyond the slots wait in the admission queue, and the queue deadline
-defaults to 30 seconds. A deep prefill can hold a slot longer than that, so
-parallel agent clients would fail with `request_queue_timeout`. The
-`--pending-timeout-ms 600000` line raises the deadline to 10 minutes. On a
-streaming request the timeout arrives as an in-band SSE error event after HTTP 200;
+Extra requests beyond the slots wait in the admission queue; the queue deadline
+default is now 10 minutes (`--pending-timeout-ms 600000`). An extreme deep prefill
+can still hold a slot past that, and a parallel agent client then fails with
+`request_queue_timeout`.
+On a streaming request the timeout arrives as an in-band SSE error event after HTTP 200;
 a client that does not parse error events sees a stream that ends without a
 `finish_reason`. See [docs/serving.md](docs/serving.md) for the full queue
 contract.
