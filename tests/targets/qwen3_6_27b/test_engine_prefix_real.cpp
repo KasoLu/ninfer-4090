@@ -1921,7 +1921,9 @@ int exercise_auto_save_stale_copy_does_not_clobber(const char* artifact) {
     options.context_cache.max_private_continuations         = 3;
     options.context_cache.max_long_anchors_per_continuation = 2;
     options.context_cache.device_state_slots                = 8;
-    options.context_cache.host_state_slots                  = 8;
+    options.context_cache.host_state_slots                  = 2; // The fixture is fully
+    // device-resident (device_state_slots = 8 covers every retained state image); 8 host
+    // slots would pin ~1.17 GiB, which low-RAM hosts (the 24 GB 4090 box) cannot allocate.
     ninfer::Engine engine(options);
 
     const std::string file_a =

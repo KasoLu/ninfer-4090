@@ -96,6 +96,8 @@ std::string serve_usage_text(const char* argv0) {
            std::to_string(kDefaultMaxTokens) +
            " when omitted\n"
            "       --max-request-mib defaults to 384 and is enforced before JSON parsing\n"
+           "       --host defaults to 0.0.0.0, --port to 1234, --pending-timeout-ms to 600000\n"
+           "       (10-minute preparation-plus-admission deadline); --max-pending-requests to 16\n"
            "       --media-cache-mib defaults to 1024; 0 disables retained media reuse\n"
            "       --media-live-mib defaults to 2048 and bounds all live BF16 patch payloads\n"
            "       --media-preprocess-threads defaults to 0 (auto, at most 16 workers)\n"

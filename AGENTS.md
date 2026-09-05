@@ -390,7 +390,7 @@ ctest --test-dir build --output-on-failure
 
 ```bash
 ninfer-serve models/qwen3_8_27b.ninfer \
-  --host 0.0.0.0 --port 8080 \
+  --host 0.0.0.0 --port 1234 \
   --max-context 262144 --kv-capacity 262144 \
   --max-concurrency 1 --max-pending-requests 16 \
   --pending-timeout-ms 600000 \
@@ -460,28 +460,28 @@ ninfer-serve models/qwen3_8_27b.ninfer \
     （#41/#42/#43 评论全文）、`HANDOFF_pr42_fixes.md`（交接文档；其中 remote 名、docker 挂载路径、
     「已提交/工作树干净」等描述均指旧仓库，引用时注意过期）、`tests/targets/qwen3_6/test_jinja_chat_template.cpp`、
     `third_party/minja/`。
-- **20w 上下文 OOM 诊断结论**（与 PR #42 无关；fork 后在本仓库可直接动手修复）：
-  - 现象：老基线 `981b685` 能跑 20w 上下文 + rk8v4（单流 `max-concurrency=1`），pull 新代码后
-    OOM。根因**不是 paged kvcache**：`89d78af0`（paged 迁移）是 `981b685` 的祖先，新旧 KV 架构
-    相同，且 C=1 时物理页数 = 逻辑页数、无超额分配（paged 无开关可禁，flat 路径已移除）。
-  - 真凶 = **context cache（prefix caching）默认开启**：`include/ninfer/types.h:103` `bool enabled = true`；
-    Qwen3.6 为 GDN 混合架构，线性注意力状态无法从 KV 重建，每份 StateImage 快照 ~147 MiB（与上下文
-    长度无关）设备端常驻，另有私续会话链（P=2C）+ 共享前缀（S=C）+ long anchors（L=2）；保留的
-    会话链各持 KV 页预留（20w 时 GB 级/链）。
-  - 用户实测：`--no-prefix-reuse`（serve 唯一总开关）可恢复 20w 但每轮全量重 prefill；瘦身配置
-    `--device-state-slots 0 --host-state-slots 2 --max-private-continuations 1 --max-shared-prefixes 0
-    --max-long-anchors-per-continuation 0` 仍 OOM（砍 StateImage 槽不够，KV 页预留才是主消耗）。
-  - 修复方向：降低 context cache 设备端常驻默认值（`enabled` 默认 false，或设备槽默认 0 由 host
-    承接），或给 serve 加「单流模式」预设，使「保 prefix reuse + 20w 上下文」同时成立。
+- **20w 上下文 OOM 诊断结论**（4090 一键诊断实测定案，2026-09-03，与 PR #42 无关）：
+  - 现象：context cache（prefix reuse）ON 时 serve 启动即死；`--no-prefix-reuse` 或砍设备侧
+    （`--device-state-slots 0 --no-cuda-graph`）、降上下文（60k）、换 KV 模式（rk4v4-e8）全部无效，
+    因为申请量与这些轴全无关。
+  - **真凶 = pinned 主机内存**：错误行是 `cudaMallocHost failed: cudaErrorMemoryAllocation: out of
+    memory`（失败时 nvidia-smi 仅 701 MiB，根本不是显存 OOM）。context cache 默认
+    `kDefaultHostKvCapacityBytes=8GiB` + `kDefaultHostStateSlots=8×~147MiB` → 启动固定申请
+    ~9.2 GiB pinned RAM；32GB WSL2 机器读完 18.2GB 模型文件后可支配内存不足 → 权重加载完 ~1.5s
+    进程死。`--no-prefix-reuse` 只是顺带把这两项 host 容量清零（engine.cpp 规范化分支），从来不是治 GPU。
+  - **修复**：host 两层改为默认 0、`--host-state-slots`/`--host-kv-mib` 显式 opt-in
+    （types.h 默认值清零）；arena.cu 的 pinned 失败消息带请求字节数，低内存/WSL 机器可自解释。
+    reuse ON 的设备端增量 ≈ +1 个 StateImage 缓存槽（~147MiB），200k rk8v4 预计余量 ~173MiB
+    （对照 no-reuse 实测 slack=319.77MiB），100k rk4v4-e8 余量更大。
+  - 4090 生产建议：去掉 `--no-prefix-reuse`，直接吃新默认（reuse ON + host=0）；确需 host 层再按
+    机器空闲内存显式给 `--host-kv-mib`/`--host-state-slots`。
   - 旗标语义备忘（`src/serve/serve_options.cpp:241-271`）：`--device-state-slots` = 设备端额外
     StateImage 槽（总容量 C 活跃 + N）；`--host-state-slots`/`--host-kv-mib` = pinned CPU 内存
     （不占 VRAM）；`--max-private-continuations` = 请求结束后保留的会话延续链数；`--max-shared-prefixes`
     = 多请求共享前缀目录（单 agent 无用）；`--max-long-anchors-per-continuation` = 每链内标记点锚，
     仅在客户端显式声明 `cache_boundary_after`（kind=PrivateLongAnchor）时创建，L=0 时 marker 一律
     忽略（`program_impl.h:7610`）。
-  - CLI 路径不受影响：`apps/cli/main.cpp:311` 对 CLI 硬禁用 context cache。
-- **已知不一致 / 陈旧点**（动手前先留意）：
-  - README 仍写 `--turn-checkpoints 32` 用法，但本分支近期提交已 `retire --turn-checkpoints`——README 落后于工作分支。
+  - CLI 路径不受影响：`apps/cli/main.cpp:311` 对 CLI 硬禁用 context cache。- **已知不一致 / 陈旧点**（动手前先留意）：
   - `.clangd` 指向 `sm_120a` + `/usr/local/cuda-13.1`（上游 5090 配置残留，与本 fork 的 sm_89 不符）。
   - `vcpkg.json` 版本串 `0.1.0` 与 `VERSION` `0.6.1-rtx3090` 不一致。
   - 根目录 `test-cpu-remote.log` 是临时测试日志；`misc/` 只有 `__pycache__`。
@@ -544,3 +544,11 @@ ninfer-serve models/qwen3_8_27b.ninfer \
   2. 门禁通过后再启动真正的完整编译（链接 apps 与测试）；
   3. 最后跑完 **CPU 相关的全部 ctest**，所有涉及 GPU 的 case 一律跳过（既有形态见根目录 `test-cpu-remote.log`：87 项、GPU op 项全部 Skipped）。
 - 新移植/功能必须补充对应测试 case 后才算完成。
+
+### 4090 远端测试机（密码 SSH，Win10 + Docker Desktop）
+
+- SSH：`192.168.137.2:22`，用户 `ninfer`（home = C:/Users/ninfer，只能操作该目录）；密码 `NinFer-Build2026-x7`。仅支持密码登录（key 认证实测不可用）；本机无 plink，自动化用 Python paramiko（已装），交互可用 `ssh ninfer@192.168.137.2` 每次输密码。
+- 开发容器：`ninfer-4090-kaso-dev`（ID 6d40787966745b186677bb19d4630d767c84fae764a8e204eb281e025d45c1be），镜像 `ninfer-4090-devel:0903`（内容 = 仓库根 Dockerfile.toolchain：CUDA 13.1.2-devel + apt 工具链 + python3，已剥 compat）；仓库 bind 到 /ninfer-4090-kaso（与 WORKDIR 一致），构建树在该目录 build/ 下；端口映射 1234:1234；日常 `docker start -ai ninfer-4090-kaso-dev` 回到 bash 操作。
+- 容器时区：Dockerfile.toolchain / Dockerfile.runtime 已内置 `ENV TZ=Asia/Shanghai`（容器不带时区时 glibc 本地时间 = UTC，spdlog 日志会显示 UTC）。该 ENV 在容器创建时固化：重建镜像后需 `docker rm` + 重新 `docker run`（旧容器 `docker start` 不拾取新 ENV，容器 ID 也会变）；临时验证旧容器可用 `docker exec -e TZ=Asia/Shanghai -it ninfer-4090-kaso-dev date`（应显示 +0800）。
+- GPU 独占约束（重要）：4090 宿主机常驻一个推理服务容器（用户本人管理）。任何会加载模型吃显存的操作（跑 ninfer-serve、引擎级 GPU 测试）之前，必须先请用户关闭该推理端容器，否则 24GB 显存必 OOM。不加载模型的操作（构建、CPU ctest、docker build）不受影响。
+- 远端仓库目录只放源码与构建树；模型工件在用户侧（$NINFER_MODEL_DIR / bind 的 /models），不要往仓库目录塞权重。

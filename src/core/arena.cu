@@ -240,7 +240,11 @@ PinnedHostBuffer::PinnedHostBuffer(std::size_t size_bytes) {
     void* ptr             = nullptr;
     const cudaError_t err = cudaMallocHost(&ptr, size_bytes);
     if (err != cudaSuccess) {
-        throw std::runtime_error(cuda_error_message("cudaMallocHost failed", err));
+        throw std::runtime_error(cuda_error_message("cudaMallocHost failed", err) +
+                                 ": requested " + std::to_string(size_bytes) +
+                                 " bytes of pinned host memory (context-cache host tiers "
+                                 "consume pinned RAM, not VRAM; lower the configured host "
+                                 "capacities on low-memory hosts)");
     }
 
     data_ = ptr;

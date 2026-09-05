@@ -23,8 +23,8 @@ struct ServeOptions {
     bool help_requested = false;
     std::string artifact_path;
     std::filesystem::path chat_template_path;
-    std::string host = "127.0.0.1";
-    int port         = 8080;
+    std::string host = "0.0.0.0";
+    int port         = 1234;
     std::string api_key;                          // empty => no auth
     std::optional<std::string> model_id_override; // unset => artifact identity.model_id
     std::string request_log_jsonl;                // empty => structured request logging disabled
@@ -33,7 +33,7 @@ struct ServeOptions {
     KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(8192);
     std::uint32_t max_concurrency      = 1;
     std::uint32_t max_pending_requests = 16;
-    std::uint32_t pending_timeout_ms   = 30000;
+    std::uint32_t pending_timeout_ms   = 600000;
     std::uint32_t prefill_chunk        = 1024;
     // Retired with the upstream merge: per-sequence rewrite checkpoints and long anchors
     // supersede the host turn-checkpoint ring. The field is dead everywhere and goes away

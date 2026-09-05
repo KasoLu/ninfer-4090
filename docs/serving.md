@@ -95,11 +95,11 @@ state block (about 300 MiB with a held turn checkpoint on Qwen3.8-27B); a 6.9k-t
 session measures 416 MiB, saving in ~0.24 s and restoring in ~0.12 s on NVMe. The DFlash
 backend is not supported.
 
-When `--turn-checkpoints` is active, a snapshot also carries the slot's checkpoint ring at
-about 147 MiB per entry (format version 2; a snapshot with an empty ring stays version 1,
-which binaries without ring support keep reading). The restored ring lets a later
-mid-history edit reuse the session; see
-[turn-checkpoint-ring.md](turn-checkpoint-ring.md).
+Slot snapshots are written in format version 3 (continuation catalog): they
+carry the slot's rewrite checkpoints and long anchors, so a later mid-history
+edit reuses the session after a restart. The retired `--turn-checkpoints`
+ring is no longer persisted; snapshots of the old format (versions 1 and 2,
+which carried the ring) are rejected by this build.
 
 A successful save or restore binds the slot to its file. With `--auto-save-evicted`, an
 involuntary eviction (a fresh session claiming the slot, a restore over it, or a
@@ -708,15 +708,15 @@ The table lists executable defaults. The startup example selects a long-context 
 
 | Option | Meaning | Default |
 |---|---|---:|
-| `--host H` | listen address | `127.0.0.1` |
-| `--port N` | listen port | `8080` |
+| `--host H` | listen address | `0.0.0.0` |
+| `--port N` | listen port | `1234` |
 | `--api-key KEY` | required bearer or `x-api-key` value | unset |
 | `--model-id ID` | override the public OpenAI model alias | artifact `identity.model_id` |
 | `--max-context N` | logical context ceiling of each sequence | `8192` |
 | `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or maximize it from remaining GPU memory; omitted means `--max-context` | `8192` |
 | `--max-concurrency N` | maximum admitted requests; valid range `1..8` | `1` |
 | `--max-pending-requests N` | additional requests allowed to wait for admission | `16` |
-| `--pending-timeout-ms N` | maximum preparation-plus-admission wait | `30000` |
+| `--pending-timeout-ms N` | maximum preparation-plus-admission wait | `600000` |
 | `--prefill-chunk N` | text-prefill chunk | `1024` |
 | `--log-stats-interval-ms N` | aggregate throughput report interval; `0` disables it | `5000` |
 | `--device N` | CUDA device index | `0` |
@@ -727,7 +727,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--media-preprocess-threads N` | bounded media preprocessing workers; `0` selects at most 16 from host concurrency | `0` |
 | `--request-log-jsonl FILE` | append full-precision server/request records | disabled |
 | `--slot-save-path DIR` | enable `/slots/{id}?action=save\|restore\|erase` session persistence into DIR | disabled |
-| `--turn-checkpoints N` | retained turn checkpoints per slot for mid-history prompt reuse; see [turn-checkpoint-ring.md](turn-checkpoint-ring.md) | `0` |
+| `--turn-checkpoints N` | retired: accepted but ignored (startup warning); rewrite checkpoints and long anchors cover mid-history reuse | ignored |
 | `--auto-save-evicted` | spill an involuntarily evicted session back to its bound slot file; requires `--slot-save-path` | off |
 | `--response-store-max-records N` | maximum locally retained Responses objects | `1024` |
 | `--response-store-max-mib N` | total local Response envelope/Item/context budget | `256` |
@@ -741,8 +741,8 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--no-prefix-reuse` | disable compatible-prefix caching | prefix reuse on |
 | `--device-state-slots N` | extra Device checkpoint StateImages beyond the active-lane guarantee | `max-concurrency` |
-| `--host-state-slots N` | pinned Host StateImage capacity | `8` |
-| `--host-kv-mib N` | shared pinned Host Main/Backend KV byte capacity in MiB | `8192` |
+| `--host-state-slots N` | pinned Host StateImage capacity (pinned host RAM, opt-in) | `0` |
+| `--host-kv-mib N` | shared pinned Host Main/Backend KV byte capacity in MiB (pinned host RAM, opt-in) | `0` |
 | `--max-private-continuations N` | private continuation descriptor capacity | `2 * max-concurrency` |
 | `--max-shared-prefixes N` | shared stable-prefix descriptor capacity | `max-concurrency` |
 | `--max-long-anchors-per-continuation N` | private long-anchor limit per continuation | `2` |
@@ -774,7 +774,9 @@ request fields override process flags, and `--greedy` finally forces temperature
 For `C=--max-concurrency` and `H=--device-state-slots`, total Device StateImage capacity is `C+H`:
 `C` slots guarantee active requests and `H` is a global checkpoint pool. Host State and Host KV are
 independent startup-fixed pinned-memory capacities; Host KV is shared by Main and the selected
-Backend pool and is consumed in physical page extents. `--no-prefix-reuse` selects root-only Engine
+Backend pool and is consumed in physical page extents. Both host tiers default to `0` and are
+opt-in: they consume pinned system RAM (not VRAM), so large values on low-memory hosts (for
+example WSL2) exhaust system memory at startup. `--no-prefix-reuse` selects root-only Engine
 mode and cannot be combined with any of the seven explicit context-cache capacity flags, including
 zero-valued flags.
 
