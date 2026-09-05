@@ -14,6 +14,11 @@ RUN apt-get update \
         ninja-build \
         pkg-config \
     && rm -rf /var/lib/apt/lists/*
+# The build stage doubles as a development and run-time toolchain image on
+# GeForce hosts (docker run --gpus all): strip the CUDA forward-compatibility
+# libraries there as well, or CUDA initialization fails at startup on any
+# GeForce card.
+RUN rm -rf /usr/local/cuda-13.1/compat /usr/local/cuda-13/compat /usr/local/cuda/compat
 
 WORKDIR /src
 COPY . .

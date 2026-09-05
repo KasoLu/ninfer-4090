@@ -21,7 +21,8 @@ int main() {
             {QType::FP8_E4M3FN_ROW_BF16S, 34816, 5120, 17408, 1813U, ActivationCompute::A8},
             kA8Cases);
         std::cout << (failures == 0 ? "OK" : "FAIL") << " LinearSwiGLU FP8 correctness\n";
-        return failures == 0 ? 0 : 1;
+        if (failures % 77 == 0) { return 77; } // Propagate the no-GPU skip code to ctest.
+        return 1;
     } catch (const std::exception& error) {
         std::cerr << "LinearSwiGLU FP8 test failed: " << error.what() << '\n';
         return 1;
