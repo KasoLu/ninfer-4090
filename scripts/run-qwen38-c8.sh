@@ -3,14 +3,14 @@ set -euo pipefail
 
 root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 server="${NINFER_SERVER:-$root/ninfer-serve}"
-if [[ ! -x "$server" && -x "$root/../build-sm86/apps/ninfer-serve" ]]; then
-  server="$root/../build-sm86/apps/ninfer-serve"
+if [[ ! -x "$server" && -x "$root/../build/apps/ninfer-serve" ]]; then
+  server="$root/../build/apps/ninfer-serve"
 fi
 model="${1:-${NINFER_MODEL_DIR:-$root/models}/qwen3_8_27b.ninfer}"
 
 if [[ ! -x "$server" ]]; then
   printf 'Missing executable: %s\n' "$server" >&2
-  printf '%s\n' 'Set NINFER_SERVER or build build-sm86/apps/ninfer-serve.' >&2
+  printf '%s\n' 'Set NINFER_SERVER or build build/apps/ninfer-serve.' >&2
   exit 1
 fi
 if [[ ! -f "$model" ]]; then

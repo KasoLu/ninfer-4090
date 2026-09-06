@@ -226,7 +226,7 @@ Every ordinary sample is cold-cache: a 256 MiB L2 eviction write completes befor
 interval. Reported effective bandwidth uses the encoded weight planes once, one BF16 activation
 read, and one BF16 output write. Reported FLOPs are the mathematical `2*N*K*T`; neither metric
 copies route-private tile, replay, padding, split, schedule, host-launcher, or kernel-instance
-behavior. The fixed RTX 5090 memory reference is `1792 GB/s` DRAM bandwidth. Because `AllowA4` is
+behavior. The memory reference is looked up per active GPU from `gpu_specs.h` (the RTX 5090 entry is `1792 GB/s` DRAM bandwidth, the RTX 4090 entry `1008 GB/s`). Because `AllowA4` is
 a permission rather than an execution-profile label, the long-lived benchmark does not infer or
 report private activation compute or Tensor Core utilization. `READ_%` additionally compares the same one-read model
 bytes with the measured `1674.5 GB/s` pure-read ceiling from `tools/hbm_bandwidth_probe.cu`; it is
@@ -243,7 +243,7 @@ W8/D=2048 additionally covers DFlash through `T=128`.
 
 Each interval contains one public Op call and receives one 256 MiB L2 eviction before timing; the
 eviction itself is excluded. Effective bandwidth counts the selected encoded rows, their scales,
-the I32 ids, and BF16 output once, and `READ_%` uses the measured RTX 5090 sustained-read reference.
+the I32 ids, and BF16 output once, and `READ_%` uses the measured sustained-read reference of the active GPU (RTX 5090 entry: 1674.5 GB/s; RTX 4090 pending).
 There are no repeated-T=1 comparisons, private launchers, forced routes, candidate kernels, or
 copied controls in this benchmark.
 
@@ -542,7 +542,7 @@ cmake --build build --parallel --target ninfer_q4_linear_swiglu_bench
 `ninfer_fp8_linear_swiglu_bench` measures the public row-scaled FP8 `[34816,5120] ->
 [17408,T]` profile. `--policy a8` measures the production resolver, including caller-owned
 activation workspace and the fused SwiGLU output; `--policy a16` measures the public A16 form.
-The Tensor Core percentage uses the RTX 5090 dense FP8/FP32-accumulate reference of 419 TFLOP/s
+The Tensor Core percentage uses the active GPU's dense FP8/FP32-accumulate reference (RTX 5090 entry: 419 TFLOP/s;
 only for extents that the production resolver sends to A8.
 
 ```bash
@@ -573,8 +573,8 @@ cmake --build build --parallel --target ninfer_q5_linear_add_bench
 in-place BF16 residual epilogue. Production uses decode at `T=1`, exact-small-T at `T=2..4`,
 aggregate MMA through `T=48`, and the large-T MMA afterward.
 Every sample is cold-cache. Effective bandwidth counts the weight once, the activation once, and
-the residual read plus write; its `READ_%` and `TC_%` use the benchmark's explicit RTX 5090 BF16
-references.
+the residual read plus write; its `READ_%` and `TC_%` use the active-GPU specs from `gpu_specs.h`
+(RTX 5090 entry: 209.5 TFLOPs dense BF16; RTX 4090: 165.2).
 
 ```bash
 cmake --build build --parallel --target ninfer_bf16_linear_add_bench
@@ -616,7 +616,7 @@ including activation quantization, caller-owned workspace, contraction, residual
 in-place BF16 write. `--policy a8` follows the independent production resolver of the selected
 semantic Op: `[5120,6144]` uses A16 below `T=22`, while `[5120,17408]` uses A16 below `T=25`; larger
 extents use FP8/FP32-accumulate Tensor Core contraction. `TC_%` is reported only when that A8 route
-actually executes, against the RTX 5090 419 TFLOP/s reference.
+actually executes, against the active GPU's FP8/FP32-accumulate reference (RTX 5090 entry: 419 TFLOP/s; RTX 4090: 330.3).
 
 ```bash
 cmake --build build --parallel --target ninfer_fp8_linear_add_bench
