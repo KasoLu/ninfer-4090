@@ -14,9 +14,10 @@
 namespace ninfer::ops::detail {
 namespace {
 
-// RTX 5090 cold-cache winners for the exact [248320,5120] vocabulary problem. The 128-token
-// schedule is the large-T computation core. The 64- and 96-token schedules avoid executing a
-// mostly empty final token tile; dispatch emits at most one such tail launch.
+// Schedules inherited from RTX 5090 cold-cache measurements; unqualified on sm_89, pending an Ada
+// retune. For the exact [248320,5120] vocabulary problem, the 128-token schedule is the large-T
+// computation core. The 64- and 96-token schedules avoid executing a mostly empty final token
+// tile; dispatch emits at most one such tail launch.
 using Main128 = Fp8A16GemmSchedule<64, 128, 64, 64, 16, 2, 2>;
 using Tail64  = Fp8A16GemmSchedule<128, 64, 64, 64, 16, 2, 2>;
 using Tail96  = Fp8A16GemmSchedule<64, 96, 64, 64, 16, 2, 2>;

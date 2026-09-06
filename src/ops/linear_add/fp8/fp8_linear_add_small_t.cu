@@ -20,7 +20,8 @@ template <class Geometry, int ActiveTokens>
 struct Fp8LinearAddSmallTProductionSchedule;
 
 // LinearAdd's residual read and fused epilogue shift the register/occupancy crossovers relative to
-// contiguous Linear. These are the measured RTX 5090 ranges for [5120,6144].
+// contiguous Linear. Ranges inherited from RTX 5090 cold-cache measurements for [5120,6144];
+// unqualified on sm_89, pending an Ada retune.
 template <int ActiveTokens>
 struct Fp8LinearAddSmallTProductionSchedule<Fp8Residual6144Geometry, ActiveTokens> {
     static_assert(ActiveTokens >= kFp8FirstSmallT && ActiveTokens <= kFp8LastSmallT);

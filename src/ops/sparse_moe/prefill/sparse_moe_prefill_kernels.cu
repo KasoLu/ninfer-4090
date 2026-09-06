@@ -256,9 +256,7 @@ constexpr int kExpertBK                = 64;
 constexpr int kExpertStages            = 2;
 constexpr int kExpertWarps             = 8;
 constexpr int kExpertThreads           = 32 * kExpertWarps;
-constexpr int kRtx5090SmCount          = 170;
 constexpr int kPrefillBlocksPerSm      = 3;
-constexpr int kPrefillPersistentBlocks = kPrefillBlocksPerSm * kRtx5090SmCount;
 
 template <int ExpertWarps, int ExpertBN>
 __global__ __launch_bounds__(ExpertWarps * 32, 3) void sparse_moe_prefill_q4_gate_up_kernel(
@@ -1119,6 +1117,7 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
         static_cast<const std::uint8_t*>(weights.shared_gate_up.scales);
     const auto* shared_down_codes  = static_cast<const std::uint8_t*>(weights.shared_down.qdata);
     const auto* shared_down_scales = static_cast<const std::uint8_t*>(weights.shared_down.scales);
+    const int prefill_blocks = kPrefillBlocksPerSm * static_cast<int>(device_sm_count());
 
     auto* ids               = static_cast<int*>(workspace.token_ids.data);
     auto* alpha             = static_cast<float*>(workspace.token_alpha.data);
@@ -1189,12 +1188,12 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
         if (weights.routed_gate_up.qtype == QType::Q4G64_F16S) {
             if (wide_plan) {
                 sparse_moe_prefill_q4_gate_up_kernel<8, 64>
-                    <<<kPrefillPersistentBlocks, 8 * 32, 0, stream>>>(
+                    <<<prefill_blocks, 8 * 32, 0, stream>>>(
                         grouped_io, offsets, route_job_experts, route_job_columns, route_job_count,
                         routed_gate_codes, routed_gate_scales, routed_activation);
             } else {
                 sparse_moe_prefill_q4_gate_up_kernel<4, 32>
-                    <<<kPrefillPersistentBlocks, 4 * 32, 0, stream>>>(
+                    <<<prefill_blocks, 4 * 32, 0, stream>>>(
                         grouped_io, offsets, route_job_experts, route_job_columns, route_job_count,
                         routed_gate_codes, routed_gate_scales, routed_activation);
             }
@@ -1228,13 +1227,13 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
         case QType::Q5G64_F16S:
             if (wide_plan) {
                 sparse_moe_prefill_qx_down_kernel<Q5DownMma, 8, 64>
-                    <<<kPrefillPersistentBlocks, 8 * 32, 0, stream>>>(
+                    <<<prefill_blocks, 8 * 32, 0, stream>>>(
                         routed_activation, offsets, route_job_experts, route_job_columns,
                         route_job_count, routed_down_codes, routed_down_high, routed_down_scales,
                         grouped_io);
             } else {
                 sparse_moe_prefill_qx_down_kernel<Q5DownMma, 4, 32>
-                    <<<kPrefillPersistentBlocks, 4 * 32, 0, stream>>>(
+                    <<<prefill_blocks, 4 * 32, 0, stream>>>(
                         routed_activation, offsets, route_job_experts, route_job_columns,
                         route_job_count, routed_down_codes, routed_down_high, routed_down_scales,
                         grouped_io);
@@ -1243,13 +1242,13 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
         case QType::Q6G64_F16S:
             if (wide_plan) {
                 sparse_moe_prefill_qx_down_kernel<Q6DownMma, 8, 64>
-                    <<<kPrefillPersistentBlocks, 8 * 32, 0, stream>>>(
+                    <<<prefill_blocks, 8 * 32, 0, stream>>>(
                         routed_activation, offsets, route_job_experts, route_job_columns,
                         route_job_count, routed_down_codes, routed_down_high, routed_down_scales,
                         grouped_io);
             } else {
                 sparse_moe_prefill_qx_down_kernel<Q6DownMma, 4, 32>
-                    <<<kPrefillPersistentBlocks, 4 * 32, 0, stream>>>(
+                    <<<prefill_blocks, 4 * 32, 0, stream>>>(
                         routed_activation, offsets, route_job_experts, route_job_columns,
                         route_job_count, routed_down_codes, routed_down_high, routed_down_scales,
                         grouped_io);
