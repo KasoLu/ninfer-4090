@@ -29,8 +29,6 @@ constexpr std::int32_t kFirstRow    = 4096;
 constexpr std::int32_t kSecondRow   = 5120;
 constexpr std::int32_t kRows        = 1024;
 constexpr std::int32_t kHidden      = 2048;
-constexpr double kRtx5090ReadGBs    = 1674.5;
-constexpr double kRtx5090Bf16Tflops = 209.5;
 
 struct Options {
     std::vector<std::int32_t> tokens{1, 2, 4, 8, 16, 32, 48, 64, 96, 128};
@@ -194,7 +192,7 @@ int main(int argc, char** argv) {
         std::printf("# gpu=%s public=linear_pair shape=two_adjacent_W8[1024,2048] "
                     "execution=graph_replay cache=cold read_reference=%.1f_GB/s "
                     "bf16_tc_reference=%.1f_TFLOP/s\n",
-                    properties.name, kRtx5090ReadGBs, kRtx5090Bf16Tflops);
+                    properties.name, bench::active_gpu_specs().sustained_read_gbs, bench::active_gpu_specs().dense_bf16_tflops);
 
         double t1_median = std::numeric_limits<double>::quiet_NaN();
         for (const std::int32_t tokens : options.tokens) {
@@ -220,11 +218,11 @@ int main(int argc, char** argv) {
             std::printf("T=%-3d median=%8.3f us min=%8.3f us p95=%8.3f us "
                         "effective=%7.1f GB/s READ=%5.1f%% logical=%6.2f TFLOP/s ",
                         tokens, timing.median_us, timing.min_us, timing.p95_us, gbs,
-                        100.0 * gbs / kRtx5090ReadGBs, tflops);
+                        100.0 * gbs / bench::active_gpu_specs().sustained_read_gbs, tflops);
             if (tokens == 1) {
                 std::printf("TC=n/a ");
             } else {
-                std::printf("TC=%5.1f%% ", 100.0 * tflops / kRtx5090Bf16Tflops);
+                std::printf("TC=%5.1f%% ", 100.0 * tflops / bench::active_gpu_specs().dense_bf16_tflops);
             }
             if (std::isnan(extrapolation)) {
                 std::printf("T1_linear=n/a\n");

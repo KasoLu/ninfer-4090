@@ -36,7 +36,6 @@ constexpr std::int32_t kKvGroup       = 64;
 constexpr std::int32_t kFp8KvGroup    = 256;
 constexpr std::int32_t kRingCapacity  = 4096;
 constexpr std::size_t kFlushBytes     = std::size_t{256} << 20;
-constexpr double kRtx5090DramGBs      = 1792.0;
 
 enum class Mode : std::uint8_t { Full, Prefix, All };
 enum class FullGeometryChoice : std::uint8_t { Kv4, Kv2, All };
@@ -498,7 +497,7 @@ void report(const Result& result) {
                 mode_name(result.mode), result.geometry, dtype_name(result.kv_dtype), result.layout,
                 execution_name(result.execution), cache_name(result.cache), result.tokens,
                 result.committed, result.timing.median_us, result.timing.min_us,
-                result.timing.p95_us, gbps, gbps / kRtx5090DramGBs * 100.0, kRtx5090DramGBs);
+                result.timing.p95_us, gbps, gbps / bench::active_gpu_specs().dram_gbs * 100.0, bench::active_gpu_specs().dram_gbs);
 }
 
 void write_csv(const Options& options, const std::vector<Result>& results) {
