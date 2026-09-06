@@ -10,8 +10,9 @@
 // This fork targets the RTX 4090 (sm_89). The RTX 5090 entry is kept so the
 // same binaries can be re-pointed at either card for cross-GPU comparison.
 //
-// The 4090 sustained-read bandwidth is a placeholder (0.0) until
-// tools/hbm_bandwidth_probe measures it on a 4090 and backfills the value.
+// The 4090 sustained-read bandwidth (906.7 GB/s) was measured on a real
+// RTX 4090 on 2026-09-06 with tools/hbm_bandwidth_probe (median of the
+// uint4 read kernel, 56.9x-L2 working set, 90.3% of the 1008 GB/s bus).
 
 #include <cuda_runtime.h>
 
@@ -35,9 +36,9 @@ inline const GpuSpecs& gpu_specs(std::string_view device_name) {
     static const GpuSpecs kRtx5090{"RTX 5090", 1792.0, 1674.5, 209.5, 838.0, 419.0};
     // RTX 4090 (sm_89, Ada): DRAM 1008 GB/s, dense BF16 165.2 TFLOPs, dense FP8
     // 330.3 TFLOPs. Ada quotes a single dense FP8 tensor figure, so both
-    // accumulator variants share it. sustained_read_gbs stays 0.0 until the
-    // hbm_bandwidth_probe measurement on a 4090 is backfilled.
-    static const GpuSpecs kRtx4090{"RTX 4090", 1008.0, 0.0, 165.2, 330.3, 330.3};
+    // accumulator variants share it. sustained_read_gbs 906.7 GB/s is the
+    // on-card hbm_bandwidth_probe measurement (uint4 read, median, 2026-09-06).
+    static const GpuSpecs kRtx4090{"RTX 4090", 1008.0, 906.7, 165.2, 330.3, 330.3};
     if (device_name.find("5090") != std::string_view::npos) {
         return kRtx5090;
     }
