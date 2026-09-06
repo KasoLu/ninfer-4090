@@ -2,7 +2,6 @@
 
 #include "core/device.h"
 #include "ops/linear/w8/w8_small_t_mma.cuh"
-#include "ops/linear/w8/w8_rowsplit_gemm_medium_t_splitk.cuh"
 
 #include <array>
 #include <algorithm>
@@ -16,11 +15,7 @@ namespace {
 constexpr int kRows           = 2048;
 constexpr int kRowsPerCta     = 16;
 constexpr int kFirstExactCols = 2;
-#if defined(NINFER_SM86)
-constexpr int kLastExactCols = 32;
-#else
-constexpr int kLastExactCols = 48;
-#endif
+constexpr int kLastExactCols  = 32;
 using ProjectionLauncher      = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 
 template <int Hidden, int ActiveCols>
@@ -32,12 +27,7 @@ void launch_active_cols(const Tensor& x, const Weight& weight, Tensor& residual_
                              : ActiveCols <= 32 ? 32
                              : ActiveCols <= 40 ? 40
                                                 : 48;
-#if defined(NINFER_SM86)
     constexpr int KWarps = ActiveCols <= 32 ? 8 : 4;
-#else
-    constexpr int KWarps =
-        Hidden == 4096 ? (ActiveCols <= 12 ? 16 : 8) : (ActiveCols <= 32 ? 8 : 4);
-#endif
     constexpr int MinBlocks = Hidden == 4096 ? (KWarps == 16 ? 1 : 2) : (ActiveCols <= 32 ? 2 : 3);
     constexpr auto ScaleAccess =
         ActiveCols > 4 ? W8SmallTMmaScaleAccess::Shared : W8SmallTMmaScaleAccess::Direct;
@@ -68,28 +58,6 @@ constexpr auto kK4096ProjectionLaunchers = make_projection_launchers<4096>(
 constexpr auto kK6144ProjectionLaunchers = make_projection_launchers<6144>(
     std::make_index_sequence<kLastExactCols - kFirstExactCols + 1>{});
 
-template <int Hidden, int TileCols, int KSplits, int NGroups, int MinBlocks>
-void launch_medium(const Tensor& x, Tensor& residual_out, const Weight& weight,
-                   cudaStream_t stream) {
-    const W8ContiguousOutput output{static_cast<__nv_bfloat16*>(residual_out.data), kRows};
-    w8_rowsplit_medium_t_splitk_kernel<Hidden, TileCols, KSplits, NGroups, MinBlocks,
-                                       W8ContiguousOutput, true>
-        <<<kRows / kRowsPerCta, KSplits * NGroups * 32, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(x.data),
-            static_cast<const std::uint8_t*>(weight.qdata),
-            static_cast<const std::uint8_t*>(weight.scales), output, x.ne[1]);
-}
-
-template <int TileCols, int KSplits, int NGroups, int MinBlocks>
-void dispatch_medium_shape(const Tensor& x, const Weight& weight, Tensor& residual_out,
-                           cudaStream_t stream) {
-    if (weight.k == 4096) {
-        launch_medium<4096, TileCols, KSplits, NGroups, MinBlocks>(x, residual_out, weight, stream);
-    } else {
-        launch_medium<6144, TileCols, KSplits, NGroups, MinBlocks>(x, residual_out, weight, stream);
-    }
-}
-
 } // namespace
 
 void w8_linear_add_splitk_mma_launch(const Tensor& x, const Weight& weight, Tensor& residual_out,
@@ -97,7 +65,6 @@ void w8_linear_add_splitk_mma_launch(const Tensor& x, const Weight& weight, Tens
     if (x.ne[1] < kFirstExactCols || x.ne[1] > 48) {
         throw std::invalid_argument("W8 linear_add split-K MMA requires exact T=2..48");
     }
-#if defined(NINFER_SM86)
     if (x.ne[1] > kLastExactCols) {
         std::int32_t offset = 0;
         while (x.ne[1] - offset >= kLastExactCols) {
@@ -122,7 +89,6 @@ void w8_linear_add_splitk_mma_launch(const Tensor& x, const Weight& weight, Tens
         }
         return;
     }
-#endif
     if (weight.k == 6144) {
         kK6144ProjectionLaunchers[x.ne[1] - kFirstExactCols](x, weight, residual_out, stream);
     } else {
@@ -137,7 +103,6 @@ void w8_linear_add_medium_splitk_launch(const Tensor& x, const Weight& weight, T
     if ((weight.k != 4096 && weight.k != 6144) || t < 49 || t > 128) {
         throw std::invalid_argument("W8 linear_add medium split-K requires T=49..128");
     }
-#if defined(NINFER_SM86)
     std::int32_t offset = 0;
     while (offset < t) {
         const std::int32_t count = std::min<std::int32_t>(kLastExactCols, t - offset);
@@ -154,27 +119,6 @@ void w8_linear_add_medium_splitk_launch(const Tensor& x, const Weight& weight, T
         }
         offset += count;
     }
-#else
-    if (t <= 64) {
-        dispatch_medium_shape<64, 8, 4, 1>(x, weight, residual_out, stream);
-    } else if (t == 65) {
-        dispatch_medium_shape<80, 8, 2, 1>(x, weight, residual_out, stream);
-    } else if (t <= 72) {
-        dispatch_medium_shape<72, 8, 3, 1>(x, weight, residual_out, stream);
-    } else if (t <= 80) {
-        dispatch_medium_shape<80, 8, 2, 1>(x, weight, residual_out, stream);
-    } else if (t <= 96) {
-        dispatch_medium_shape<96, 4, 6, 1>(x, weight, residual_out, stream);
-    } else if (t <= 112) {
-        dispatch_medium_shape<112, 4, 7, 1>(x, weight, residual_out, stream);
-    } else if (t <= 120) {
-        dispatch_medium_shape<120, 4, 5, 1>(x, weight, residual_out, stream);
-    } else if (t <= 125) {
-        dispatch_medium_shape<128, 4, 4, 1>(x, weight, residual_out, stream);
-    } else {
-        dispatch_medium_shape<128, 4, 8, 1>(x, weight, residual_out, stream);
-    }
-#endif
     CUDA_CHECK(cudaGetLastError());
 }
 

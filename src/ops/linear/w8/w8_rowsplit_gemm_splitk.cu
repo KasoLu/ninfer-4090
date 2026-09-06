@@ -1,6 +1,5 @@
 #include "core/device.h"
 #include "ops/linear/w8/w8_small_t_mma.cuh"
-#include "ops/linear/w8/w8_rowsplit_gemm_medium_t_splitk.cuh"
 #include "ops/linear/w8/w8_launch.h"
 
 #include <array>
@@ -30,13 +29,8 @@ void launch_active_cols(const Tensor& x, const Weight& weight, Tensor& out, cuda
                               : ActiveCols <= 32 ? 32
                               : ActiveCols <= 40 ? 40
                                                  : 48;
-#if defined(NINFER_SM86)
     constexpr int KWarps    = 4;
     constexpr int MinBlocks = 2;
-#else
-    constexpr int KWarps    = ActiveCols <= 36 ? 16 : 8;
-    constexpr int MinBlocks = KWarps == 16 ? 1 : 2;
-#endif
     constexpr auto ScaleAccess =
         ActiveCols > 4 ? W8SmallTMmaScaleAccess::Shared : W8SmallTMmaScaleAccess::Direct;
     constexpr auto ActivationCache = ActiveCols <= 36 || ActiveCols == 48 ? Cache::cg : Cache::ca;
@@ -65,15 +59,6 @@ void require_problem(const Tensor& x, const Weight& w, const Tensor& out) {
         w.k != kHidden || w.padded_shape[1] != kHidden) {
         throw std::invalid_argument("W8 exact-T split-K requires [2048,16384]");
     }
-}
-
-template <int TileCols, int KSplits, int NGroups, int MinBlocks>
-void launch_medium(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
-    const W8ContiguousOutput output{static_cast<__nv_bfloat16*>(out.data), kRows};
-    w8_rowsplit_medium_t_splitk_kernel<kHidden, TileCols, KSplits, NGroups, MinBlocks>
-        <<<kRows / kRowsPerCta, KSplits * NGroups * 32, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
-            static_cast<const std::uint8_t*>(w.scales), output, x.ne[1]);
 }
 
 } // namespace
@@ -113,16 +98,6 @@ void launch_w8_exact_t_composite(const Tensor& x, const Weight& w, Tensor& out,
     }
 }
 
-template <int TileCols, int KSplits, int NGroups, int MinBlocks>
-void launch_medium_route(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
-    require_problem(x, w, out);
-    if (x.ne[1] > TileCols) {
-        throw std::invalid_argument("W8 medium-T split-K route does not cover this T");
-    }
-    launch_medium<TileCols, KSplits, NGroups, MinBlocks>(x, w, out, stream);
-    CUDA_CHECK(cudaGetLastError());
-}
-
 void launch_w8_dflash_medium(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
     require_problem(x, w, out);
     const int t = x.ne[1];
@@ -130,41 +105,13 @@ void launch_w8_dflash_medium(const Tensor& x, const Weight& w, Tensor& out, cuda
         throw std::invalid_argument("W8 DFlash medium route requires T=49..128");
     }
 
-#if defined(NINFER_SM86)
     launch_w8_exact_t_composite(x, w, out, stream);
-#else
-    if (t <= 64) {
-        launch_medium<64, 8, 4, 1>(x, w, out, stream);
-    } else if (t == 65) {
-        launch_medium<80, 8, 2, 1>(x, w, out, stream);
-    } else if (t <= 72) {
-        launch_medium<72, 8, 3, 1>(x, w, out, stream);
-    } else if (t <= 80) {
-        launch_medium<80, 8, 2, 1>(x, w, out, stream);
-    } else if (t <= 96) {
-        launch_medium<96, 4, 6, 1>(x, w, out, stream);
-    } else if (t <= 104) {
-        launch_medium<104, 4, 1, 1>(x, w, out, stream);
-    } else if (t <= 112) {
-        launch_medium<112, 4, 7, 1>(x, w, out, stream);
-    } else if (t <= 120) {
-        launch_medium<120, 4, 5, 1>(x, w, out, stream);
-    } else if (t <= 125) {
-        launch_medium<128, 4, 4, 1>(x, w, out, stream);
-    } else {
-        launch_medium<128, 4, 8, 1>(x, w, out, stream);
-    }
-#endif
     CUDA_CHECK(cudaGetLastError());
 }
 
 void launch_w8_medium_splitk_c144(const Tensor& x, const Weight& w, Tensor& out,
                                   cudaStream_t stream) {
-#if defined(NINFER_SM86)
     launch_w8_exact_t_composite(x, w, out, stream);
-#else
-    launch_medium_route<144, 2, 9, 2>(x, w, out, stream);
-#endif
 }
 
 } // namespace ninfer::ops::detail
