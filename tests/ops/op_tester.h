@@ -63,6 +63,16 @@ inline bool cuda_unavailable() {
     throw std::runtime_error(std::string("cudaGetDeviceCount: ") + cudaGetErrorString(e));
 }
 
+// NVFP4 W4A4 (A4) execution requires Blackwell FP4 tensor cores (sm_120a). On other hardware
+// every W4A4 entry point is a stub that throws, so A4 cases must be skipped, not invoked.
+inline bool nvfp4_a4_unavailable() {
+    int device = 0;
+    cuda_check(cudaGetDevice(&device), "cudaGetDevice");
+    int major = 0;
+    cuda_check(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device),
+               "compute capability query");
+    return major < 12;
+}
 // --- bf16 <-> f32 (round-to-nearest-even) -----------------------------------
 inline float bf16_to_f32(std::uint16_t h) {
     std::uint32_t u = std::uint32_t(h) << 16;
