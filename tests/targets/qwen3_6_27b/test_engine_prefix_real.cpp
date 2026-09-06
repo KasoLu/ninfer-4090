@@ -1636,9 +1636,37 @@ int exercise_concurrent_resource_settlement(const char* artifact,
         fixed_output(2));
     if (replay.generated_token_ids.size() != 2 || replay.reused_prompt_tokens == 0 ||
         replay.prefix_reuse_path == ninfer::PrefixReusePath::Root) {
+        const auto& replay_plan = replay.materialization;
+        const auto& pressure_plan = pressure.materialization;
         std::cerr << "late older finish exposed the newer session binding to pressure: path="
                   << static_cast<int>(replay.prefix_reuse_path)
-                  << " reused=" << replay.reused_prompt_tokens << '\n';
+                  << " reused=" << replay.reused_prompt_tokens
+                  << " | replay: stop="
+                  << ninfer::materialization_stop_reason_name(replay_plan.stop_reason)
+                  << " best_reuse=" << replay_plan.best_reuse_prompt_tokens
+                  << " targets=" << replay_plan.targets_evaluated
+                  << " | pressure: stop="
+                  << ninfer::materialization_stop_reason_name(pressure_plan.stop_reason)
+                  << " targets=" << pressure_plan.targets_evaluated
+                  << " degradation_units=" << pressure_plan.selected_degradation_units
+                  << " maximal_fallback=" << (pressure_plan.selected_maximal_fallback ? 1 : 0)
+                  << " predicted_total_ns=" << pressure_plan.predicted_total_ns
+                  << " | deltas evicted="
+                  << (after_pressure.pressure_private_owners_evicted -
+                      before_pressure.pressure_private_owners_evicted)
+                  << " degraded="
+                  << (after_pressure.pressure_private_owners_degraded -
+                      before_pressure.pressure_private_owners_degraded)
+                  << " checkpoints_dropped="
+                  << (after_pressure.pressure_checkpoints_dropped -
+                      before_pressure.pressure_checkpoints_dropped)
+                  << " budget_exhaustions="
+                  << (after_pressure.pressure_search_budget_exhaustions -
+                      before_pressure.pressure_search_budget_exhaustions)
+                  << " | after: state_slots=" << after_pressure.device_state_occupied_slots
+                  << " main_kv_pages=" << after_pressure.device_main_kv_occupied_pages
+                  << " backend_kv_pages=" << after_pressure.device_backend_kv_occupied_pages
+                  << '\n';
         return 1;
     }
 
