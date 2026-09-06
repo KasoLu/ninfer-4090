@@ -244,7 +244,7 @@ INT8 text-only ceiling is near 176K: 172032 starts, and 196608 is rejected at
 startup with a byte-exact deficit. The server validates memory before it listens,
 so an oversized context fails fast instead of at request time.
 
-For a native build, follow the [Linux build guide](docs/rtx-3090-linux.md) with
+For a native build, follow the [Linux build guide](docs/rtx-4090-linux.md) with
 `CMAKE_CUDA_ARCHITECTURES=89` (the default in this fork). The build requires CUDA 12.8 or newer,
 GCC 13, and CMake 3.28 or newer; the Docker image builds with CUDA 13.1.
 

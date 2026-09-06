@@ -15,7 +15,7 @@ NInfer-4090 是 **从零实现的 C++20/CUDA 单 GPU 推理引擎**，在一张 
 - 默认 KV 模式 `rk4v4-e8`（E8 Conway-Sloane 格 4-bit）在 24 GB 上放下模型完整原生 262,144 token 上下文（余量 1.37 GiB）；INT8 KV 上限约 172,032。
 - 对外接口：OpenAI Chat Completions / Responses（流式 + 本地续接状态）、Anthropic Messages（含 thinking 签名）、prompt-rendered function tools、JSONL 请求日志。
 - 产品边界：单进程、单 GPU、单模型；启动时固定 1–8 个活跃请求；有界 FIFO 准入、无抢占；无 continuous batching、无多卡、无权重 offload。
-- License：Apache 2.0；`VERSION` 为 `0.6.1-rtx3090`（`vcpkg.json` 的 `0.1.0` 是陈旧值）。
+- License：Apache 2.0；`VERSION` 为 `0.6.1-rtx4090`（`vcpkg.json` 同步为 `0.6.1`）。
 
 ### 支持的模型身份（registry 注册）
 
@@ -27,7 +27,7 @@ NInfer-4090 是 **从零实现的 C++20/CUDA 单 GPU 推理引擎**，在一张 
 
 27B 与 35B-A3B 是同一 identity-free `qwen3_6` 家族运行时的**对等编译期 Variant**：家族拥有共享的 `SequencePlan<Variant>`/`RequestPlan<Variant>`/`Program<Variant>` 算法、frontend/output 语义、Text/Vision/投机调度、状态事务、workspace 组合与 CUDA Graph 捕获/重放；各包各自拥有注册身份、binder、model view、维度/存储事实、三个执行叶家族（attn 投影、GDN 投影/控制、post-mixer）与 graph frontier 数据。Program 之间不共享可变状态，家族调度内无运行时目标分支。
 
-**sm_89 上 NVFP4 的限制**：`src/CMakeLists.txt` 在架构为 86/89 时从 `ninfer_ops` 剔除所有 `nvfp4/*_w4a4.cu`，注入 `ops/nvfp4_sm86_stubs.cpp`（所有 W4A4 入口 `[[noreturn]] reject_nvfp4_a4()`）并定义 `NINFER_SM86=1`；`nvfp4_tma` 库仅在 `120a` 构建。即 Blackwell-only 的 NVFP4 W4A4 张量核执行不可用，A4 激活测试在无 FP4 卡的硬件上跳过而非中止。
+**sm_89 上 NVFP4 的限制**：`src/CMakeLists.txt` 无条件从 `ninfer_ops` 剔除所有 `nvfp4/*_w4a4.cu`，注入 `ops/nvfp4_stubs_sm89.cpp`（所有 W4A4 入口 `[[noreturn]] reject_nvfp4_a4()`，报错 "NVFP4 A4 execution requires a Blackwell (sm_120a) GPU; this build targets sm_89"）。即 Blackwell-only 的 NVFP4 W4A4 张量核执行不可用，A4 激活测试在无 FP4 卡的硬件上跳过而非中止。
 
 ### 目录结构（含 CMake 目标映射）
 
@@ -51,7 +51,7 @@ src/ops   → ninfer_ops     语义封闭 Op 全集，CMake 源清单显式列�
                              linear {bf16,fp8,nvfp4,q4,q5,q6,w8}、linear_add、linear_swiglu、linear_pair/w8
                            sparse_moe {decode,prefill,small_t}
                            wrapper/*.cpp（各 Op 的公共入口）
-                           ops/nvfp4_sm86_stubs.cpp（仅 86/89 架构编译）
+                           ops/nvfp4_stubs_sm89.cpp（无条件编入 ninfer_ops）
 src/text  → ninfer_text    unicode.cpp + third_party/utf8proc
 src/media/decode → ninfer_media_decode   FFMPEG 解码（消费已拥有的字节）
 src/product/       media_acquire（CURL 获取，产品专用，不链接进 target）、prompt_input、load_progress
@@ -75,7 +75,7 @@ tools/                 维护者工作流：convert/<target>（BF16 检查点 �
                            serve_thinking_preservation.py）、test_kv（E8 codec 微基准）、perplexity、freq_corpus
 eval/                  独立 Python 评测协调器（backends base/mock/registry；eval/configs/*.yaml；
                            自带 venv：PYTHONPATH=eval eval/.venv/bin/python -m unittest discover -s eval/tests）
-docs/                  用户指南（cli.md、serving.md、performance.md、perplexity.md、rtx-3090-linux.md——本 fork 的
+docs/                  用户指南（cli.md、serving.md、performance.md、perplexity.md、rtx-4090-linux.md——本 fork 的
                            构建指南也是它，传 CMAKE_CUDA_ARCHITECTURES=89）、llamacpp-comparison.md、
                            udp-fork-comparison.md、turn-checkpoint-ring.md；
                            maintainer/ 为权威参考：engine-architecture.md（唯一顶层引擎架构文档）、
@@ -482,10 +482,7 @@ ninfer-serve models/qwen3_8_27b.ninfer \
     仅在客户端显式声明 `cache_boundary_after`（kind=PrivateLongAnchor）时创建，L=0 时 marker 一律
     忽略（`program_impl.h:7610`）。
   - CLI 路径不受影响：`apps/cli/main.cpp:311` 对 CLI 硬禁用 context cache。- **已知不一致 / 陈旧点**（动手前先留意）：
-  - `.clangd` 指向 `sm_120a` + `/usr/local/cuda-13.1`（上游 5090 配置残留，与本 fork 的 sm_89 不符）。
-  - `vcpkg.json` 版本串 `0.1.0` 与 `VERSION` `0.6.1-rtx3090` 不一致。
   - 根目录 `test-cpu-remote.log` 是临时测试日志；`misc/` 只有 `__pycache__`。
-  - `docs/rtx-3090-*.md` 文件名仍沿 3090 命名，但 4090 的 Linux 构建指南就是 `rtx-3090-linux.md`（传 `CMAKE_CUDA_ARCHITECTURES=89`）。
 
 ## 约定
 

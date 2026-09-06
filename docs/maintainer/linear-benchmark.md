@@ -331,9 +331,9 @@ traffic。它不计：
 这些问题需要 NCU 回答。benchmark 不再根据 launcher column tile 推导
 `weight_replay_lower_bound_bytes`。
 
-`1792 GB/s` 仍是固定硬件规格，用于原有 `DRAM_%` 和 fixed-spec roofline。附加的
+`1792 GB/s` 仍是固定硬件规格（RTX 5090 DRAM 参考），用于原有 `DRAM_%` 和 fixed-spec roofline；benchmark 现按活动 GPU 名从 `bench/ops/gpu_specs.h` 查取参考值（probe 已按 sm_89 构建，4090 持续读数值待实测回填）。附加的
 `READ_%` 使用 RTX 5090 上 `tools/hbm_bandwidth_probe.cu` 的 4 GiB `uint4` 纯读结果
-`1674.5 GB/s`，表示该机器已经实测可持续的只读上限。它只为读主导 Linear 提供实际
+`1674.5 GB/s`，表示该机器已经实测可持续的只读上限（RTX 5090 实测值，作为 5090 条目的参考保留）。它只为读主导 Linear 提供实际
 可达利用率，不替换 fixed-spec 指标，也不改变一遍 logical weight read 的
 `model_bytes` 口径。copy probe 同时读写，不是这类 GEMV 的适用上限。
 
@@ -385,6 +385,9 @@ dram_spec=1792 GB/s
 sustained_read=1674.5 GB/s
 cache=cold
 ```
+
+示例为 RTX 5090 运行输出；benchmark 现按活动 GPU 名从 `gpu_specs.h` 查取参考值，
+其他卡打印对应条目（5090 条目保留现值）。
 
 单行结果保留：
 

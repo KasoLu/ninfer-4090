@@ -50,7 +50,7 @@ RUN apt-get update \
 #   cudaErrorCompatNotSupportedOnDevice: forward compatibility was attempted
 #   on non supported HW
 # Removing them lets the container use the host driver through ordinary CUDA
-# minor-version compatibility, which is what an RTX 3090/3090 Ti needs.
+# minor-version compatibility, which is what any GeForce card (e.g., RTX 4090) needs.
 RUN rm -rf /usr/local/cuda-13.1/compat /usr/local/cuda-13/compat /usr/local/cuda/compat
 
 COPY --from=build /build/apps/ninfer /usr/local/bin/ninfer

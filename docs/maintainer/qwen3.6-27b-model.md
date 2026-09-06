@@ -159,7 +159,7 @@ Text-only positions use the same scalar position for temporal, height, and width
 Multimodal prefill supplies distinct three-axis positions. Only 64 of each 256-dimensional head are
 rotated, divided across the model's interleaved MRoPE sections `[11,11,10]`.
 
-For the registered RTX 5090 implementation, `attn_input_proj` consumes the physical
+For the registered implementation, `attn_input_proj` consumes the physical
 `query_key [7168,5120]` Q4 parent and `gate_value [7168,5120]` Q5 parent directly. At
 `T=1..16`, one Q4 projection writes Q/K through a split epilogue and one Q5 projection writes
 Gate/V through a split epilogue, so a full-attention layer issues exactly two input-projection

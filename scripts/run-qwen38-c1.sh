@@ -3,14 +3,14 @@ set -euo pipefail
 
 root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 server="${NINFER_SERVER:-$root/ninfer-serve}"
-if [[ ! -x "$server" && -x "$root/../build-sm86/apps/ninfer-serve" ]]; then
-  server="$root/../build-sm86/apps/ninfer-serve"
+if [[ ! -x "$server" && -x "$root/../build/apps/ninfer-serve" ]]; then
+  server="$root/../build/apps/ninfer-serve"
 fi
 model="${1:-${NINFER_MODEL_DIR:-$root/models}/qwen3_8_27b.ninfer}"
 
 if [[ ! -x "$server" ]]; then
   printf 'Missing executable: %s\n' "$server" >&2
-  printf '%s\n' 'Set NINFER_SERVER or build build-sm86/apps/ninfer-serve.' >&2
+  printf '%s\n' 'Set NINFER_SERVER or build build/apps/ninfer-serve.' >&2
   exit 1
 fi
 if [[ ! -f "$model" ]]; then
@@ -20,10 +20,10 @@ if [[ ! -f "$model" ]]; then
 fi
 
 printf '%s\n' 'Starting Qwen3.8-27B at http://127.0.0.1:8080/v1'
-printf '%s\n' 'Profile: one request, 64K context, MTP3, ReplaySSM'
+printf '%s\n' 'Profile: one request, 256K context, rk4v4-e8 KV, MTP3, ReplaySSM'
 exec "$server" "$model" \
   --host 127.0.0.1 --port 8080 \
-  --max-context 65536 --kv-capacity 65536 \
+  --max-context 262144 --kv-capacity 262144 \
   --max-concurrency 1 --max-pending-requests 16 \
-  --prefill-chunk 1024 --kv-dtype int8 \
+  --prefill-chunk 1024 --kv-dtype rk4v4-e8 \
   --spec mtp --draft-tokens 3 --lm-head-draft

@@ -3,14 +3,14 @@ set -euo pipefail
 
 root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 server="${NINFER_SERVER:-$root/ninfer-serve}"
-if [[ ! -x "$server" && -x "$root/../build-sm86/apps/ninfer-serve" ]]; then
-  server="$root/../build-sm86/apps/ninfer-serve"
+if [[ ! -x "$server" && -x "$root/../build/apps/ninfer-serve" ]]; then
+  server="$root/../build/apps/ninfer-serve"
 fi
 model="${1:-${NINFER_MODEL_DIR:-$root/models}/qwen3_8_27b.ninfer}"
 
 if [[ ! -x "$server" ]]; then
   printf 'Missing executable: %s\n' "$server" >&2
-  printf '%s\n' 'Set NINFER_SERVER or build build-sm86/apps/ninfer-serve.' >&2
+  printf '%s\n' 'Set NINFER_SERVER or build build/apps/ninfer-serve.' >&2
   exit 1
 fi
 if [[ ! -f "$model" ]]; then
@@ -20,7 +20,7 @@ if [[ ! -f "$model" ]]; then
 fi
 
 printf '%s\n' 'Starting Qwen3.8-27B Vision at http://127.0.0.1:8080/v1'
-printf '%s\n' 'Tested RTX 3090 profile: one request, 32K context, ReplaySSM and MTP3'
+printf '%s\n' 'Tested RTX 4090 profile: one request, 32K context, ReplaySSM and MTP3'
 exec "$server" "$model" \
   --host 127.0.0.1 --port 8080 \
   --max-context 32768 --kv-capacity 32768 \

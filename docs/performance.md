@@ -1,5 +1,12 @@
 # Single-GPU serving performance
 
+> All measurements in this document were taken on an NVIDIA GeForce RTX 5090
+> (sm_120a). This fork targets the RTX 4090 (sm_89); RTX 4090 results are
+> pending and will be recorded in a dedicated section once the remote 4090
+> benchmark campaign completes. Use the values below as hardware-specific
+> references, not as 4090 expectations.
+
+
 Tested Git revisions:
 
 - Qwen3.8-27B NVFP4 MTP0 context-length serving:
