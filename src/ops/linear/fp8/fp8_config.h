@@ -204,8 +204,9 @@ inline Fp8Problem resolve_fp8_problem(std::int32_t output_rows, std::int32_t inp
 template <class Geometry>
 struct Fp8LinearDecodeProductionSchedule;
 
-// RTX 5090 cold-cache winner for this exact problem. Each newly registered geometry supplies its
-// own specialization so admission never silently inherits another problem's measured schedule.
+// Schedule inherited from RTX 5090 cold-cache measurements; unqualified on sm_89, pending an Ada
+// retune. Each newly registered geometry supplies its own specialization so admission never
+// silently inherits another problem's measured schedule.
 template <>
 struct Fp8LinearDecodeProductionSchedule<Fp8AttnInputGeometry> {
     using Type = Fp8GemvSchedule<8, 2, 8, 4, Fp8CodeCache::Default, 2, 2>;
@@ -270,8 +271,9 @@ inline std::int32_t fp8_linear_small_t_max(Fp8Problem problem) {
     throw std::logic_error("FP8 vocabulary uses its A16 MMA route");
 }
 
-// RTX 5090 cold-cache winners for contiguous Linear output. Each geometry owns its measured
-// schedule ranges; fused semantic Ops reuse the mainloop but retain independent route frontiers.
+// Schedules inherited from RTX 5090 cold-cache measurements; unqualified on sm_89, pending an Ada
+// retune. Each geometry owns its measured schedule ranges; fused semantic Ops reuse the mainloop
+// but retain independent route frontiers.
 template <class Geometry, int ActiveTokens>
 struct Fp8LinearSmallTProductionSchedule {
     static_assert(ActiveTokens >= kFp8FirstSmallT);

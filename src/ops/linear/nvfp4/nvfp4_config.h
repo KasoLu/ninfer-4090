@@ -160,7 +160,8 @@ inline Nvfp4Problem resolve_nvfp4_problem(std::int32_t output_rows, std::int32_t
     throw std::invalid_argument("unsupported NVFP4 problem");
 }
 
-// RTX 5090 cold-cache winner among the measured decode schedules.
+// Schedule inherited from RTX 5090 cold-cache measurements; unqualified on sm_89, pending an Ada
+// retune among the measured decode schedules.
 template <class Geometry>
 struct Nvfp4LinearDecodeProductionSchedule {
     using Type =
@@ -170,9 +171,10 @@ struct Nvfp4LinearDecodeProductionSchedule {
 inline constexpr std::int32_t kNvfp4FirstSmallT = 2;
 inline constexpr std::int32_t kNvfp4LastSmallT  = 32;
 
-// RTX 5090 cold-cache winners for contiguous Linear output. T=2..4 amortizes activation loads
-// through shared staging; T=5..32 keeps one packed activation tile per warp. The warp-count changes
-// are measured occupancy/register crossovers, not semantic frontiers.
+// Schedules inherited from RTX 5090 cold-cache measurements; unqualified on sm_89, pending an Ada
+// retune. T=2..4 amortizes activation loads through shared staging; T=5..32 keeps one packed
+// activation tile per warp. The warp-count changes are measured occupancy/register crossovers, not
+// semantic frontiers.
 template <class Geometry, int ActiveTokens>
 struct Nvfp4LinearSmallTProductionSchedule {
     static_assert(ActiveTokens >= kNvfp4FirstSmallT);

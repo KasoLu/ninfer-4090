@@ -59,7 +59,7 @@ std::int32_t causal_small_t_split_count(std::int32_t window, std::int32_t tokens
         return div_up(window, kKeysPerSplit);
     }
     // Bc=64 is one CTA/SM on these model shapes. Keep the 8K grid at or below
-    // one 170-SM wave after accounting for the geometry's KV-head count.
+    // one device wave after accounting for the geometry's KV-head count.
     if (kv_dtype == DType::I8 && tokens == 6 && window > 5000 && window <= 8198) {
         const std::int32_t splits   = div_up(window, 192 / Geometry::SmallTSplitScale);
         constexpr std::int32_t kMin = 4 * Geometry::SmallTSplitScale;

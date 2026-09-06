@@ -125,6 +125,15 @@ std::size_t DeviceContext::total_vram() const noexcept { return props.totalGloba
 
 void DeviceContext::synchronize() const { CUDA_CHECK(cudaStreamSynchronize(stream)); }
 
+std::size_t device_sm_count(int device) {
+    static const std::size_t cached = [device] {
+        int count = 0;
+        CUDA_CHECK(cudaDeviceGetAttribute(&count, cudaDevAttrMultiProcessorCount, device));
+        return static_cast<std::size_t>(count);
+    }();
+    return cached;
+}
+
 CudaEventTimer::CudaEventTimer(const DeviceContext& ctx) : CudaEventTimer(ctx, ctx.stream) {}
 
 CudaEventTimer::CudaEventTimer(const DeviceContext& ctx, cudaStream_t stream) : stream_(stream) {

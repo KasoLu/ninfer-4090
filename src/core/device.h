@@ -10,6 +10,10 @@ void cuda_check(cudaError_t err, const char* expr, const char* file, int line);
 
 #define CUDA_CHECK(expr) ::ninfer::cuda_check((expr), #expr, __FILE__, __LINE__)
 
+// Number of SMs on the device, queried once per process. The product runs on
+// a single GPU, so callers pass no device argument.
+std::size_t device_sm_count(int device = 0);
+
 struct DeviceContext {
     int device                   = 0;
     cudaStream_t stream          = nullptr;

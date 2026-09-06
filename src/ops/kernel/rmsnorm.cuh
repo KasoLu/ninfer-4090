@@ -78,7 +78,8 @@ __launch_bounds__(Block) __global__
 }
 
 // Implements: include/ninfer/ops/rmsnorm.h
-// Match: aligned contiguous BF16, plain epilogue, D=128, sm_120a.
+// Match: aligned contiguous BF16, plain epilogue, D=128; qualified on sm_120a upstream,
+// unqualified on sm_89.
 // Algorithm assumptions: exactly two BF16x2 values per lane; one warp owns one logical row.
 template <RmsEpilogue Epilogue, int Block>
 __launch_bounds__(Block) __global__
@@ -173,7 +174,8 @@ __launch_bounds__(Block) __global__
 }
 
 // Implements: include/ninfer/ops/rmsnorm.h
-// Match: aligned contiguous BF16, plain epilogue, D=2048, sm_120a.
+// Match: aligned contiguous BF16, plain epilogue, D=2048; qualified on sm_120a upstream,
+// unqualified on sm_89.
 // Algorithm assumptions: exactly two BF16x2 values per thread; one 512-thread CTA owns one row.
 template <RmsEpilogue Epilogue>
 __launch_bounds__(512) __global__

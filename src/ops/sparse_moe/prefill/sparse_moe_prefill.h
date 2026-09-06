@@ -11,8 +11,9 @@
 
 namespace ninfer::ops::detail {
 
-// RTX 5090 codec frontiers balance trace-like and independent expert distributions. The public
-// workspace query starts at the earliest codec-specific prefill route.
+// Codec frontiers inherited from RTX 5090 measurements; unqualified on sm_89, pending an Ada
+// retune. They balance trace-like and independent expert distributions. The public workspace
+// query starts at the earliest codec-specific prefill route.
 inline constexpr std::int32_t kSparseMoePrefillWorkspaceMin = 20;
 inline constexpr std::int32_t kSparseMoePrefillQ4Q5Min      = 47;
 inline constexpr std::int32_t kSparseMoePrefillQ4Q6Min      = 47;
