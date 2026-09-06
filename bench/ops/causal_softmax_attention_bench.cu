@@ -35,11 +35,6 @@ constexpr std::int32_t kKvGroup          = 64;
 constexpr std::int32_t kFp8KvGroup       = 256;
 constexpr float kScale                   = 0.0625F;
 constexpr std::size_t kFlushBytes        = std::size_t{256} << 20;
-constexpr double kDenseF16Bf16TcTflops   = 209.5;
-constexpr double kDenseFp8TcTflops       = 419.0;
-constexpr double kMixedFp8F16TcTflops    = 279.333;
-constexpr double kRtx5090DramGBs         = 1792.0;
-constexpr double kColdPureReadCeilingGBs = 1674.5;
 
 enum class Entry : std::uint8_t { Append, Cached, Both };
 enum class GeometryChoice : std::uint8_t { H24Kv4, H16Kv2, All };
@@ -615,7 +610,10 @@ void report(const Result& result) {
     const double gbps    = result.logical_bytes / seconds / 1.0e9;
     const double tflops  = (result.qk_flops + result.pv_flops) / seconds / 1.0e12;
     const double tensor_core_roofline =
-        result.kv_dtype == DType::FP8_E4M3FN ? kMixedFp8F16TcTflops : kDenseF16Bf16TcTflops;
+        result.kv_dtype == DType::FP8_E4M3FN
+            ? 2.0 / (1.0 / bench::active_gpu_specs().fp8_fp32_acc_tflops +
+                     1.0 / bench::active_gpu_specs().dense_bf16_tflops)
+            : bench::active_gpu_specs().dense_bf16_tflops;
     std::printf("entry=%-6s geometry=%-14s kv=%-4s mapping=%-10s execution=%-5s cache=%-4s "
                 "B=%d W=%d contexts=%s valid=%s rows=%s "
                 "workspace=%9zu median=%10.3f us min=%10.3f us p95=%10.3f us "
@@ -625,11 +623,11 @@ void report(const Result& result) {
                 cache_name(result.cache), result.batch, result.tokens, result.row_contexts.c_str(),
                 result.valid_columns.c_str(), result.table_rows.c_str(), result.workspace_bytes,
                 result.timing.median_us, result.timing.min_us, result.timing.p95_us, gbps,
-                gbps / kRtx5090DramGBs * 100.0, kRtx5090DramGBs, tflops,
+                gbps / bench::active_gpu_specs().dram_gbs * 100.0, bench::active_gpu_specs().dram_gbs, tflops,
                 tflops / tensor_core_roofline * 100.0, tensor_core_roofline);
     if (result.kv_dtype == DType::FP8_E4M3FN) {
-        const double mixed_floor_us = (result.qk_flops / (kDenseFp8TcTflops * 1.0e12) +
-                                       result.pv_flops / (kDenseF16Bf16TcTflops * 1.0e12)) *
+        const double mixed_floor_us = (result.qk_flops / (bench::active_gpu_specs().fp8_fp32_acc_tflops * 1.0e12) +
+                                       result.pv_flops / (bench::active_gpu_specs().dense_bf16_tflops * 1.0e12)) *
                                       1.0e6;
         const double physical_gbps = result.physical_kv_read_bytes / seconds / 1.0e9;
         std::printf("  fp8 qk_flops=%.0f pv_flops=%.0f mixed_tc_floor=%8.3f us "
@@ -637,8 +635,8 @@ void report(const Result& result) {
                     "physical_kv_read=%8.1f GB/s (%5.1f%% of %.1f)\n",
                     result.qk_flops, result.pv_flops, mixed_floor_us,
                     mixed_floor_us / result.timing.median_us * 100.0, result.physical_kv_read_bytes,
-                    physical_gbps, physical_gbps / kColdPureReadCeilingGBs * 100.0,
-                    kColdPureReadCeilingGBs);
+                    physical_gbps, physical_gbps / bench::active_gpu_specs().sustained_read_gbs * 100.0,
+                    bench::active_gpu_specs().sustained_read_gbs);
     }
 }
 
@@ -662,8 +660,8 @@ void write_csv(const Options& options, const std::vector<Result>& results) {
                << ',';
         if (result.kv_dtype == DType::FP8_E4M3FN) {
             const double seconds        = result.timing.median_us * 1.0e-6;
-            const double mixed_floor_us = (result.qk_flops / (kDenseFp8TcTflops * 1.0e12) +
-                                           result.pv_flops / (kDenseF16Bf16TcTflops * 1.0e12)) *
+            const double mixed_floor_us = (result.qk_flops / (bench::active_gpu_specs().fp8_fp32_acc_tflops * 1.0e12) +
+                                           result.pv_flops / (bench::active_gpu_specs().dense_bf16_tflops * 1.0e12)) *
                                           1.0e6;
             output << mixed_floor_us << ',' << mixed_floor_us / result.timing.median_us * 100.0
                    << ',' << result.physical_kv_read_bytes << ','

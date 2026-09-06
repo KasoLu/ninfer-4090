@@ -24,7 +24,6 @@ namespace {
 
 constexpr std::int32_t kVocab             = 248320;
 constexpr std::size_t kL2FlushBytes       = 256ULL << 20;
-constexpr double kRtx5090SustainedReadGBs = 1674.5;
 
 enum class Profile {
     Q6D5120,
@@ -213,7 +212,7 @@ void run_profile(Profile profile, const std::vector<std::int32_t>* requested_tok
             measure_point(spec, table, ids, out, flush, t, stream, warmup, repeat);
         const double logical_bytes = logical_bytes_per_column(spec, layout) * t;
         const double effective_gbs = logical_bytes / (result.median_us * 1.0e-6) / 1.0e9;
-        const double read_pct      = effective_gbs / kRtx5090SustainedReadGBs * 100.0;
+        const double read_pct      = effective_gbs / bench::active_gpu_specs().sustained_read_gbs * 100.0;
         if (csv) {
             std::printf("%s,%d,%.3f,%.3f,%.3f,%.3f\n", spec.name, t, result.median_us,
                         result.p95_us, effective_gbs, read_pct);

@@ -100,8 +100,8 @@ std::string read_file(const std::filesystem::path& path) {
 }
 
 void test_exact_evaluation() {
-    expect(ninfer::runtime::context_cost_hardware_class("NVIDIA GeForce RTX 5090", 12, 0) ==
-               "nvidia-geforce-rtx-5090-sm120",
+    expect(ninfer::runtime::context_cost_hardware_class("NVIDIA GeForce RTX 4090", 8, 9) ==
+               "nvidia-geforce-rtx-4090-sm89",
            "hardware class duplicated or lost the NVIDIA vendor");
     expect(ninfer::runtime::context_cost_hardware_class("Example Accelerator", 9, 0) ==
                "nvidia-example-accelerator-sm90",
@@ -283,6 +283,7 @@ void test_resolution_and_atomic_upserts() {
     const std::filesystem::path path = directory / "presets.json";
     try {
         const ninfer::runtime::ContextCostIdentity compiled_identity{
+            // The 5090 is the only compiled-in preset machine (D7: no 4090 preset yet).
             .hardware_class = "nvidia-geforce-rtx-5090-sm120",
             .model_id       = "qwen3.6-27b",
             .weights_id     = "groupwise-int",

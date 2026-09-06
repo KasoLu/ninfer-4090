@@ -14,7 +14,7 @@ def test_schema_v13_report_is_flattened_for_matrix_summary(tmp_path) -> None:
                 "artifact_type": "ninfer_bench_report",
                 "tool": "ninfer_bench",
                 "artifact": {"path": "model.ninfer"},
-                "environment": {"gpu_name": "RTX 5090"},
+                "environment": {"gpu_name": "RTX 4090"},
                 "load": {
                     "target": "qwen3_6_27b",
                     "weights_id": "nvfp4",
@@ -92,7 +92,7 @@ def test_schema_v13_report_is_flattened_for_matrix_summary(tmp_path) -> None:
         "qwen3_6_27b",
         "nvfp4",
         "model.ninfer",
-        "RTX 5090",
+        "RTX 4090",
     )
     assert (row["decode_path"], row["decode_graph_primed"]) == (
         "cuda-graph",
