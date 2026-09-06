@@ -214,7 +214,11 @@ int run_nvfp4() {
     int failures = 0;
     failures += run_nvfp4_case(parent, 1, ops::LinearPolicy::A16Only);
     failures += run_nvfp4_case(parent, 4, ops::LinearPolicy::A16Only);
-    failures += run_nvfp4_case(parent, 1, ops::LinearPolicy::AllowA4);
+    if (nvfp4_a4_unavailable()) {
+        std::cout << "SKIP: NVFP4 A4 (W4A4) requires sm_120a FP4 tensor cores; A4 cases not run\n";
+    } else {
+        failures += run_nvfp4_case(parent, 1, ops::LinearPolicy::AllowA4);
+    }
     return failures;
 }
 
