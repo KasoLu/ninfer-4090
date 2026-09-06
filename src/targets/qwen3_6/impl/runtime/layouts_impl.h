@@ -719,17 +719,13 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                     const std::uint64_t final_visible = std::min<std::uint64_t>(
                         impl->capacity,
                         static_cast<std::uint64_t>(profile.max) + 2ULL * impl->draft_window);
-#ifdef NINFER_SM86
                     if (final_visible <= 4096) {
                         // The reduced-startup graph set still consumes 35.8 MiB at C1/K3 and
-                        // 43.1 MiB at C1/K4 on SM86. K2 retains the smaller qualified allowance;
+                        // 43.1 MiB at C1/K4 on the sm_86/sm_89 branch. K2 retains the smaller qualified allowance;
                         // reserve one 64 MiB class for K3 and deeper captures.
                         return (impl->draft_window >= 3 ? 64ULL : 16ULL) * kMiB;
                     }
                     return 86ULL * kMiB;
-#else
-                    return (final_visible <= 4096 ? 12ULL : 82ULL) * kMiB;
-#endif
                 },
                 "MTP graph allowance");
             impl->graph_allowance_bytes = checked_mul(per_batch_allowance, impl->max_concurrency,

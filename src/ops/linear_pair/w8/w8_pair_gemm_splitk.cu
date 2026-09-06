@@ -3,7 +3,6 @@
 
 #include "core/device.h"
 #include "ops/linear/w8/w8_small_t_mma.cuh"
-#include "ops/linear/w8/w8_rowsplit_gemm_medium_t_splitk.cuh"
 
 #include <cuda_bf16.h>
 
@@ -22,7 +21,6 @@ constexpr int kHidden      = 2048;
 constexpr int kRowsPerCta  = 8;
 constexpr int kFirstExactT = 2;
 constexpr int kLastExactT  = 32;
-using PairOutput           = W8SplitOutput2<kRows, kRows>;
 using PairLauncher         = void (*)(const Tensor&, const Weight&, const Weight&, Tensor&, Tensor&,
                               cudaStream_t);
 
@@ -90,23 +88,6 @@ constexpr auto make_launchers(std::index_sequence<Offsets...>) {
 constexpr auto kLaunchers =
     make_launchers(std::make_index_sequence<kLastExactT - kFirstExactT + 1>{});
 
-template <int TileCols, int KSplits, int NGroups, int MinBlocks>
-void launch_medium(const Tensor& x, const Weight& first_weight, const Weight& second_weight,
-                   Tensor& first_out, Tensor& second_out, cudaStream_t stream) {
-    const auto* first_codes  = static_cast<const std::uint8_t*>(first_weight.qdata);
-    const auto* first_scales = static_cast<const std::uint8_t*>(first_weight.scales);
-    if (static_cast<const std::uint8_t*>(second_weight.qdata) != first_codes + kRows * kHidden ||
-        static_cast<const std::uint8_t*>(second_weight.scales) !=
-            first_scales + kRows * (kHidden / 32) * 2) {
-        throw std::invalid_argument("W8 medium pair requires adjacent K/V row views");
-    }
-    const PairOutput output{static_cast<__nv_bfloat16*>(first_out.data),
-                            static_cast<__nv_bfloat16*>(second_out.data)};
-    w8_rowsplit_medium_t_splitk_kernel<kHidden, TileCols, KSplits, NGroups, MinBlocks>
-        <<<(2 * kRows) / 16, KSplits * NGroups * 32, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(x.data), first_codes, first_scales, output, x.ne[1]);
-}
-
 } // namespace
 
 void w8_pair_splitk_exact_t_launch(const Tensor& x, const Weight& first_weight,
@@ -129,14 +110,13 @@ void w8_pair_splitk_medium_launch(W8PairScheduleId schedule, const Tensor& x,
         first_out.ne[1] != x.ne[1] || second_out.ne[0] != kRows || second_out.ne[1] != x.ne[1]) {
         throw std::invalid_argument("W8 medium pair requires [1024,2048] and T>=33");
     }
-#if defined(NINFER_SM86)
     (void)schedule;
     std::int32_t offset = 0;
     while (offset < x.ne[1]) {
         const std::int32_t count = std::min<std::int32_t>(kLastExactT, x.ne[1] - offset);
         const Tensor x_slice = x.slice(1, offset, count);
-        Tensor first_slice = first_out.slice(1, offset, count);
-        Tensor second_slice = second_out.slice(1, offset, count);
+        Tensor first_slice   = first_out.slice(1, offset, count);
+        Tensor second_slice  = second_out.slice(1, offset, count);
         if (count == 1) {
             w8_pair_decode_r16_launch(x_slice, first_weight, second_weight, first_slice,
                                       second_slice, stream);
@@ -146,110 +126,6 @@ void w8_pair_splitk_medium_launch(W8PairScheduleId schedule, const Tensor& x,
         }
         offset += count;
     }
-    return;
-#else
-    switch (schedule) {
-    case W8PairScheduleId::DualSplitKMediumC48:
-        if (x.ne[1] <= 48) {
-            launch_medium<48, 4, 2, 3>(x, first_weight, second_weight, first_out, second_out,
-                                       stream);
-            CUDA_CHECK(cudaGetLastError());
-            return;
-        }
-        break;
-    case W8PairScheduleId::DualSplitKMediumC64:
-        if (x.ne[1] <= 64) {
-            launch_medium<64, 4, 2, 2>(x, first_weight, second_weight, first_out, second_out,
-                                       stream);
-            CUDA_CHECK(cudaGetLastError());
-            return;
-        }
-        break;
-    case W8PairScheduleId::DualSplitKMediumC80:
-        if (x.ne[1] <= 80) {
-            launch_medium<80, 4, 2, 1>(x, first_weight, second_weight, first_out, second_out,
-                                       stream);
-            CUDA_CHECK(cudaGetLastError());
-            return;
-        }
-        break;
-    case W8PairScheduleId::DualSplitKMediumC88:
-        if (x.ne[1] <= 88) {
-            launch_medium<88, 4, 1, 1>(x, first_weight, second_weight, first_out, second_out,
-                                       stream);
-            CUDA_CHECK(cudaGetLastError());
-            return;
-        }
-        break;
-    case W8PairScheduleId::DualSplitKMediumC96:
-        if (x.ne[1] <= 96) {
-            launch_medium<96, 4, 1, 1>(x, first_weight, second_weight, first_out, second_out,
-                                       stream);
-            CUDA_CHECK(cudaGetLastError());
-            return;
-        }
-        break;
-    case W8PairScheduleId::DualSplitKMediumC104:
-        if (x.ne[1] <= 104) {
-            launch_medium<104, 4, 1, 1>(x, first_weight, second_weight, first_out, second_out,
-                                        stream);
-            CUDA_CHECK(cudaGetLastError());
-            return;
-        }
-        break;
-    case W8PairScheduleId::DualSplitKMediumC112:
-        if (x.ne[1] <= 112) {
-            launch_medium<112, 4, 1, 1>(x, first_weight, second_weight, first_out, second_out,
-                                        stream);
-            CUDA_CHECK(cudaGetLastError());
-            return;
-        }
-        break;
-    case W8PairScheduleId::DualSplitKMediumC128:
-        if (x.ne[1] <= 128) {
-            launch_medium<128, 2, 4, 2>(x, first_weight, second_weight, first_out, second_out,
-                                        stream);
-            CUDA_CHECK(cudaGetLastError());
-            return;
-        }
-        break;
-    case W8PairScheduleId::DualSplitKMediumC160:
-        if (x.ne[1] <= 160) {
-            launch_medium<160, 2, 5, 2>(x, first_weight, second_weight, first_out, second_out,
-                                        stream);
-            CUDA_CHECK(cudaGetLastError());
-            return;
-        }
-        break;
-    case W8PairScheduleId::DualSplitKMediumC192:
-        if (x.ne[1] <= 192) {
-            launch_medium<192, 2, 6, 2>(x, first_weight, second_weight, first_out, second_out,
-                                        stream);
-            CUDA_CHECK(cudaGetLastError());
-            return;
-        }
-        break;
-    case W8PairScheduleId::DualSplitKMediumC224:
-        if (x.ne[1] <= 224) {
-            launch_medium<224, 2, 7, 2>(x, first_weight, second_weight, first_out, second_out,
-                                        stream);
-            CUDA_CHECK(cudaGetLastError());
-            return;
-        }
-        break;
-    case W8PairScheduleId::DualSplitKMediumC256:
-        if (x.ne[1] <= 256) {
-            launch_medium<256, 2, 8, 1>(x, first_weight, second_weight, first_out, second_out,
-                                        stream);
-            CUDA_CHECK(cudaGetLastError());
-            return;
-        }
-        break;
-    default:
-        break;
-    }
-    throw std::invalid_argument("W8 medium pair schedule does not cover this T");
-#endif
 }
 
 } // namespace ninfer::ops::detail

@@ -10,16 +10,10 @@ int main() {
 
     try {
         constexpr std::array<std::int32_t, 4> kA16Cases{1, 4, 8, 16};
-        [[maybe_unused]] constexpr std::array<std::int32_t, 6> kA4Cases{5, 48, 49, 128, 256, 1024};
         int failures = 0;
         failures += run_profile("LinearSwiGLU NVFP4_A16",
                                 {QType::NVFP4, 34816, 5120, 17408, 1801U, ActivationCompute::A16},
                                 kA16Cases);
-#ifndef NINFER_SM86
-        failures +=
-            run_profile("LinearSwiGLU NVFP4_A4",
-                        {QType::NVFP4, 34816, 5120, 17408, 1803U, ActivationCompute::A4}, kA4Cases);
-#endif
         std::cout << (failures == 0 ? "OK" : "FAIL") << " LinearSwiGLU NVFP4 correctness\n";
         if (failures % 77 == 0) { return 77; } // Propagate the no-GPU skip code to ctest.
         return 1;

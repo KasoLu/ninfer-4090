@@ -11,7 +11,7 @@ namespace ninfer::ops::detail {
 namespace {
 
 [[noreturn]] void reject_nvfp4_a4() {
-    throw std::runtime_error("NVFP4 A4 execution requires an sm_120a GPU");
+    throw std::runtime_error("NVFP4 A4 execution is unavailable on sm_89");
 }
 
 } // namespace
