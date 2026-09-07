@@ -58,6 +58,8 @@ struct ServeOptions {
     ContextCacheOptions context_cache;
     bool enable_vision              = false;
     std::uint32_t vision_max_tokens = 8192;
+    // Registered chat-template name; empty selects the artifact-embedded template.
+    std::string chat_template_name;
     bool use_cuda_graph             = true;
     bool allow_prefix_reuse = true;
     bool enable_thinking =

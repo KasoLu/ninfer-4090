@@ -746,6 +746,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--auto-long-anchors N` | propose a private long anchor at each of the last N message boundaries of every prompt; clamped to the anchor limit, `0` disables | anchor limit |
 | `--no-thinking` | disable thinking by default | thinking on |
 | `--preserve-thinking` | preserve closed-turn assistant reasoning by default | off |
+| `--chat-template v22_4` | select a registered chat template instead of the artifact-embedded one; the registered `v22_4` template is the C++ port of the v22.4 chat template (XML tool calls only) | artifact-embedded |
 | `--cors` | permissive browser CORS headers | off |
 | `--temperature F` | process-level temperature override | unset |
 | `--top-p F` | process-level top-p override | unset |

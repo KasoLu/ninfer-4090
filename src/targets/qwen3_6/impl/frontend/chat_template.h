@@ -130,14 +130,23 @@ struct RenderedChat {
     std::vector<std::optional<std::size_t>> cache_boundaries;
 };
 
+// The registered chat-template name that selects the v22.4 semantics directly instead of a
+// sha256 of a template source. `--chat-template v22_4` maps to this name.
+inline constexpr std::string_view kRegisteredChatTemplateV224 = "v22_4";
+
 enum class ChatTemplateSemantics : std::uint8_t {
     ThinkingToggle,
     ReasoningEffort,
+    V224,
 };
 
 class CompiledChatTemplate {
 public:
     [[nodiscard]] static CompiledChatTemplate resolve(std::string_view source);
+
+    // Selects a registered chat template by name without hashing a template source. Unknown
+    // names throw std::invalid_argument and enumerate the supported names.
+    [[nodiscard]] static CompiledChatTemplate resolve_registered(std::string_view name);
 
     [[nodiscard]] PromptCapabilities capabilities() const noexcept;
     [[nodiscard]] RenderedChat render(const std::vector<ChatMessage>& messages,
@@ -146,6 +155,9 @@ public:
 private:
     explicit CompiledChatTemplate(ChatTemplateSemantics semantics) noexcept
         : semantics_(semantics) {}
+
+    [[nodiscard]] RenderedChat render_v224(const std::vector<ChatMessage>& messages,
+                                           ChatRenderOptions options) const;
 
     ChatTemplateSemantics semantics_;
 };

@@ -89,14 +89,16 @@ std::string usage_text(const char* argv0) {
            "       [--presence-penalty F] [--frequency-penalty F] [--seed N] [--greedy]\n"
            "       [--stop-token-id N]... [--stop <text>]... [--reasoning-stop <text>]...\n"
            "       [--raw-output] [--print-token-ids] [--no-thinking] [--thinking-budget N]\n"
-           "       [--reasoning-effort low|medium|xhigh] [--vision] [--vision-max-tokens N]\n"
-           "       [--no-cuda-graph]\n"
+            "       [--reasoning-effort low|medium|xhigh] [--vision] [--vision-max-tokens N]\n"
+            "       [--chat-template v22_4] [--no-cuda-graph]\n"
            "\n"
            "Streams answer content to stdout and reasoning plus diagnostics to stderr.\n"
            "Structured message content accepts text, image/image_url, and video/video_url parts;\n"
            "media sources may be local paths, HTTP(S) URLs, or base64 data URIs.\n"
            "--vision enables image/video input and loads the fixed Vision GPU allocations.\n"
            "--vision-max-tokens sets the Vision scratchpad token capacity (default 8192).\n"
+           "--chat-template selects a registered chat template by name (default: the chat "
+           "template embedded in the artifact).\n"
            "--thinking-budget caps model-origin thinking tokens; inserted control tokens count "
            "toward --max-new.\n"
            "--kv-capacity auto leaves " +
@@ -161,6 +163,8 @@ Options parse_options(int argc, char** argv) {
         } else if (arg == "--vision-max-tokens" || arg == "--vision-limit") {
             options.vision_max_tokens = parse_u32(value(arg), "vision-max-tokens", false);
             options.enable_vision     = true;
+        } else if (arg == "--chat-template") {
+            options.chat_template_name = value(arg);
         } else if (arg == "--no-cuda-graph") {
             options.use_cuda_graph = false;
         } else if (arg == "--stop-token-id") {

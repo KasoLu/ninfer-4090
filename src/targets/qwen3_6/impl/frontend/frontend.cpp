@@ -224,7 +224,18 @@ void validate_tokenizer_config(const FrontendResources& resources) {
     }
 }
 
-fi::CompiledChatTemplate compile_chat_template(const FrontendResources& resources) {
+// Compiles the chat template that renders product prompts. An empty
+// chat_template_name selects the artifact-embedded frontend/chat_template.jinja
+// (identity-validated through the tokenizer_config.json equality check and the
+// template digest); a registered name (see kRegisteredChatTemplateV224) selects
+// its compiled semantics directly and is validated against the name registry
+// instead of a digest, so artifact tokenizer_config.json chat_template text
+// stays authoritative for its own identity only.
+fi::CompiledChatTemplate compile_chat_template(const FrontendResources& resources,
+                                               const std::string& chat_template_name) {
+    if (!chat_template_name.empty()) {
+        return fi::CompiledChatTemplate::resolve_registered(chat_template_name);
+    }
     validate_tokenizer_config(resources);
     return fi::CompiledChatTemplate::resolve(resources.chat_template_jinja);
 }
@@ -859,7 +870,7 @@ PreparedContextCache prepare_context_cache(
 class Frontend::Impl {
 public:
     Impl(const FrontendResources& resources, bool registered_checkpoint, FrontendOptions options)
-        : chat_template(compile_chat_template(resources)),
+        : chat_template(compile_chat_template(resources, options.chat_template_name)),
           tokenizer(std::make_shared<const fi::Tokenizer>(
               fi::TokenizerResources{.tokenizer_json         = resources.tokenizer_json,
                                      .tokenizer_config_json  = resources.tokenizer_config_json,

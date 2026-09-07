@@ -25,6 +25,9 @@ struct FrontendOptions {
     // full 262K context, so the cap stays configurable. Zero derives the cap from max_context;
     // production paths normalize an unset value to 8192 in startup_features.h.
     std::uint32_t vision_max_tokens = 0;
+    // Optional registered chat-template name (e.g. "v22_4"). Empty selects the chat
+    // template embedded in the artifact (frontend/chat_template.jinja).
+    std::string chat_template_name;
 };
 
 struct FrontendResources;

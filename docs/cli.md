@@ -43,6 +43,14 @@ template's default. An artifact whose template does not expose effort rejects th
 `--no-thinking` for direct-response prompt rendering; it cannot be combined with
 `--reasoning-effort`. `--greedy` selects exact argmax decoding independently.
 
+`--chat-template v22_4` replaces the artifact-embedded template with a registered chat template by
+name, without hashing a template source. The registered `v22_4` template is the repository's
+C++ port of the v22.4 chat template (see `scripts/chat_template_v22_4.jinja`): it enables thinking
+by default, keeps prior reasoning in rendered history, selects `medium` reasoning effort when none
+is requested, honors the `<|think_on|>/<|think_off|>/<|think_low|>/<|think_medium|>/<|think_xhigh|>`
+control tags in system, developer, and user content, and renders assistant tool calls in the XML
+`<tool_call>/<function>/<parameter>` form only. Unknown template names are rejected at startup.
+
 `--thinking-budget N` places a positive upper bound on accepted model-origin tokens while the
 new-turn Qwen thinking block remains open. If the model has not emitted `</think>` at that exact
 boundary, Engine appends [Qwen's canonical early-close guidance](https://github.com/QwenLM/Qwen3/blob/main/docs/source/getting_started/thinking_budget.md)
@@ -201,6 +209,7 @@ The table lists executable defaults. The examples above select FP8 KV and MTP3.
 | `--no-thinking` | disable thinking in prompt rendering | thinking on |
 | `--thinking-budget N` | positive model-origin thinking-token cap; omitted means unlimited | unset |
 | `--reasoning-effort low\|medium\|xhigh` | select an effort exposed by the loaded chat template | template default |
+| `--chat-template v22_4` | select a registered chat template instead of the artifact-embedded one (`v22_4` ports the v22.4 XML-tool chat template) | artifact-embedded |
 | `--greedy` | exact argmax decoding | off |
 | `--temperature F` | sampling temperature override | registered model/mode default |
 | `--top-p F` | nucleus-threshold override | registered model/mode default |

@@ -193,6 +193,10 @@ struct EngineOptions {
     std::uint32_t media_preprocess_threads = 0;
     bool enable_vision                     = false;
     std::uint32_t vision_max_tokens        = 8192;
+    // Optional registered chat-template name (e.g. "v22_4"). Empty selects the chat
+    // template embedded in the artifact (frontend/chat_template.jinja); a name is
+    // resolved through the template registry without validating the artifact digest.
+    std::string chat_template_name;
     bool use_cuda_graph                    = true;
     ContextCacheOptions context_cache;
     ContextCostOptions context_cost;

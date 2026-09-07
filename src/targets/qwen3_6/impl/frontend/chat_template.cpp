@@ -363,6 +363,225 @@ std::string_view resolve_reasoning_instructions(ChatTemplateSemantics semantics,
     throw std::invalid_argument("invalid reasoning effort");
 }
 
+// ---------------------------------------------------------------------------
+// Registered v22.4 chat template (scripts/chat_template_v22_4.jinja).
+//
+// The jinja file is compiled to ChatTemplateSemantics::V224; render_v224()
+// below reproduces its output byte for byte over the engine's closed message
+// model. The source template's json tool_call_format branch is deliberately not
+// ported: the engine's tool-call parser recognizes only the XML
+// <tool_call>/<function>/<parameter> form, so the xml branch is unconditional.
+// ---------------------------------------------------------------------------
+
+constexpr std::array<std::string_view, 10> kThinkControlTags{
+    "<|think_off|>",        "<|think_on|>",     "<|think_xhigh|>",  "<|think_high|>",
+    "<|think_ultracode|>",  "<|think_extreme|>", "<|think_max|>",   "<|think_medium|>",
+    "<|think_low|>",        "<|think_minimal|>",
+};
+
+void erase_all(std::string& text, std::string_view needle) {
+    for (std::size_t position = text.find(needle); position != std::string::npos;
+         position = text.find(needle, position)) {
+        text.erase(position, needle.size());
+    }
+}
+
+struct V224ThinkingState {
+    bool thinking = true;
+    ReasoningEffort effort = ReasoningEffort::Medium;
+};
+
+// One elif-chain transition per scanned text item, exactly like the jinja
+// source: only the first matching branch applies to that item.
+void scan_think_control_tag(std::string_view text, V224ThinkingState& state) {
+    const auto contains_any = [text](std::initializer_list<std::string_view> tags) {
+        for (const std::string_view tag : tags) {
+            if (text.find(tag) != std::string_view::npos) { return true; }
+        }
+        return false;
+    };
+    if (contains_any({"<|think_off|>"})) {
+        state.thinking = false;
+    } else if (contains_any({"<|think_on|>"})) {
+        state.thinking = true;
+    } else if (contains_any({"<|think_xhigh|>", "<|think_high|>", "<|think_ultracode|>",
+                             "<|think_extreme|>", "<|think_max|>"})) {
+        state.thinking = true;
+        state.effort   = ReasoningEffort::XHigh;
+    } else if (contains_any({"<|think_low|>", "<|think_minimal|>"})) {
+        state.thinking = true;
+        state.effort   = ReasoningEffort::Low;
+    } else if (contains_any({"<|think_medium|>"})) {
+        state.thinking = true;
+        state.effort   = ReasoningEffort::Medium;
+    }
+}
+
+void strip_think_control_tags(std::string& text) {
+    for (const std::string_view tag : kThinkControlTags) { erase_all(text, tag); }
+}
+
+// Tag removal happens before rendering so that literal-span bookkeeping stays
+// exact.
+ChatMessage without_think_control_tags(const ChatMessage& message) {
+    ChatMessage sanitized = message;
+    for (ChatPart& part : sanitized.parts) {
+        if (part.kind == ChatPartKind::Text) { strip_think_control_tags(part.text); }
+    }
+    return sanitized;
+}
+
+// Mirrors `content.split(separator)[0].rstrip('\n')` from the jinja source.
+RenderedFragment split_head_rstrip_newlines(const RenderedFragment& content,
+                                            std::string_view separator) {
+    const std::size_t first = content.text.find(separator);
+    std::size_t end         = first == std::string::npos ? content.text.size() : first;
+    while (end > 0 && content.text[end - 1] == '\n') { --end; }
+    return slice_fragment(content, 0, end);
+}
+
+// Mirrors `content.split(separator)[-1].lstrip('\n')` from the jinja source.
+RenderedFragment split_tail_lstrip_newlines(const RenderedFragment& content,
+                                            std::string_view separator) {
+    const std::size_t last  = content.text.rfind(separator);
+    std::size_t begin       = last == std::string::npos ? 0 : last + separator.size();
+    while (begin < content.text.size() && content.text[begin] == '\n') { ++begin; }
+    return slice_fragment(content, begin, content.text.size());
+}
+
+// Splits an assistant turn without an explicit reasoning channel exactly as the
+// v22.4 template does: reasoning is the last <think>-style block, content is
+// everything after the final closing tag. The candidate list and its ordering
+// mirror the jinja source.
+ThinkParts derive_think_parts_v224(const RenderedFragment& content) {
+    ThinkParts parts;
+    parts.content = content;
+    const std::string_view close =
+        starts_with(content.text, "</think>")
+            ? std::string_view("</think>")
+            : starts_with(content.text, "</thinking>")
+                  ? std::string_view("</thinking>")
+                  : content.text.find("\n</think>") != std::string::npos
+                        ? std::string_view("\n</think>")
+                        : content.text.find("\n</thinking>") != std::string::npos
+                              ? std::string_view("\n</thinking>")
+                              : content.text.find("\n</ think>") != std::string::npos
+                                    ? std::string_view("\n</ think>")
+                                    : content.text.find("\n</think >") != std::string::npos
+                                          ? std::string_view("\n</think >")
+                                          : starts_with(content.text, "<think>") &&
+                                                    content.text.find("</think>") !=
+                                                        std::string::npos
+                                                ? std::string_view("</think>")
+                                                : starts_with(content.text, "<thinking>") &&
+                                                          content.text.find("</thinking>") !=
+                                                              std::string::npos
+                                                      ? std::string_view("</thinking>")
+                                                      : std::string_view();
+    if (close.empty()) { return parts; }
+    const std::string_view open = close.find("thinking") != std::string_view::npos
+                                      ? std::string_view("<thinking>")
+                                      : std::string_view("<think>");
+    // reasoning = split(close)[0].rstrip('\n'); when an opening tag remains
+    // inside, take the tail after the last one and lstrip newlines. The final
+    // whitespace trim happens at the call site, exactly like the jinja
+    // `reasoning_content | trim`.
+    RenderedFragment reasoning = split_head_rstrip_newlines(content, close);
+    if (reasoning.text.find(open) != std::string::npos) {
+        reasoning = split_tail_lstrip_newlines(reasoning, open);
+    }
+    parts.reasoning = std::move(reasoning);
+    parts.content   = split_tail_lstrip_newlines(content, close);
+    return parts;
+}
+
+// The XML tool-format instructions embedded in the v22.4 tools preamble. The
+// text depends on whether thinking is enabled when the prompt is rendered.
+std::string v224_tool_format_instructions(bool thinking) {
+    std::string out =
+        "\n\nIf you choose to call a function ONLY reply in the following format with NO "
+        "suffix:\n\n";
+    if (thinking) { out += "<think>\nBrief explanation of tool call\n</think>\n"; }
+    out += "<tool_call>\n"
+           "<function=example_function_name>\n"
+           "<parameter=example_parameter_1>\n"
+           "value_1\n"
+           "</parameter>\n"
+           "<parameter=example_parameter_2>\n"
+           "This is the value for the second parameter\n"
+           "that can span\n"
+           "multiple lines\n"
+           "</parameter>\n"
+           "</function>\n"
+           "</tool_call>\n\n"
+           "<IMPORTANT>\n"
+           "Reminder:\n";
+    if (thinking) {
+        out += "- You can use the <think></think> block to plan your next tool call OR to "
+               "synthesize data and formulate your final response to the user.\n"
+               "- ALL explanation and reasoning MUST be placed strictly inside the "
+               "<think></think> block.\n";
+    }
+    out += "- Function calls MUST follow the specified format: an inner <function=...></function> "
+           "block must be nested within <tool_call></tool_call> XML tags.\n";
+    if (thinking) {
+        out += "- If you choose to call a tool, you MUST output the <tool_call> block IMMEDIATELY "
+               "after thinking, with NO conversational text before it.\n";
+    } else {
+        out += "- If you choose to call a tool, you MUST output the <tool_call> block IMMEDIATELY, "
+               "with NO conversational text before it.\n";
+    }
+    out += "- The <tool_call> and <function> tags MUST be at the very beginning of a new line, with "
+           "NO spaces or indentation before them.\n"
+           "- To call multiple functions, output a separate, completely closed "
+           "<tool_call></tool_call> block for EACH function. Do NOT nest <tool_call> blocks.\n"
+           "- If you have all necessary data, provide your final answer directly to the user "
+           "without any tool call.\n"
+           "</IMPORTANT>";
+    return out;
+}
+
+// Tool-failure classification of the v22.4 template over the trimmed content of
+// a tool message. The checks and their ordering mirror the jinja source.
+bool v224_is_tool_failure(const std::string& content) {
+    std::string lowered = content;
+    for (char& character : lowered) {
+        character = static_cast<char>(std::tolower(static_cast<unsigned char>(character)));
+    }
+    const std::string_view head(lowered.data(), std::min<std::size_t>(lowered.size(), 120));
+    const bool is_code_or_grep =
+        lowered.find("throw new ") != std::string::npos ||
+        lowered.find("throw error") != std::string::npos ||
+        lowered.find("console.error") != std::string::npos ||
+        lowered.find("logger.error") != std::string::npos ||
+        lowered.find("logging.error") != std::string::npos ||
+        head.find("import ") != std::string_view::npos ||
+        head.find("def ") != std::string_view::npos ||
+        head.find("function ") != std::string_view::npos;
+    const bool exit_code_zero = head.find("exit code: 0") != std::string_view::npos ||
+                                head.find("process exited with code 0") != std::string_view::npos;
+    const auto head_contains = [head](std::string_view needle) {
+        return head.find(needle) != std::string_view::npos;
+    };
+    const bool error_field_ok =
+        head_contains("\"error\": null") || head_contains("\"error\":null") ||
+        head_contains("\"error\": false") || head_contains("\"error\":false") ||
+        head_contains("\"error\": \"\"") || head_contains("\"error\":\"\"");
+    const bool strong_error =
+        (head_contains("\"error\":") && !error_field_ok) ||
+        head_contains("\"status\": \"error\"") || head_contains("\"status\":\"error\"") ||
+        head_contains("traceback (most recent call last):") ||
+        head_contains("command not found") || head_contains("invalid syntax") ||
+        head_contains("fatal:") ||
+        ((head_contains("exit code: ") || head_contains("process exited with code")) &&
+         !exit_code_zero) ||
+        head.starts_with("exception:") || head.starts_with("failed to ");
+    const bool weak_error = head_contains("error:") || head_contains("err!");
+    const bool weak_suppressed =
+        head_contains("$ ") || head_contains("took ") || content.size() >= 600;
+    return !is_code_or_grep && (strong_error || (weak_error && !weak_suppressed));
+}
+
 } // namespace
 
 bool ChatMessage::has_media() const noexcept {
@@ -423,6 +642,14 @@ CompiledChatTemplate CompiledChatTemplate::resolve(std::string_view source) {
                                 sha256_hex(digest) + ")");
 }
 
+CompiledChatTemplate CompiledChatTemplate::resolve_registered(std::string_view name) {
+    if (name == kRegisteredChatTemplateV224) {
+        return CompiledChatTemplate(ChatTemplateSemantics::V224);
+    }
+    throw std::invalid_argument("unknown registered chat template '" + std::string(name) +
+                                "' (supported: " + std::string(kRegisteredChatTemplateV224) + ")");
+}
+
 PromptCapabilities CompiledChatTemplate::capabilities() const noexcept {
     PromptCapabilities result;
     result.enable_thinking = true;
@@ -431,6 +658,11 @@ PromptCapabilities CompiledChatTemplate::capabilities() const noexcept {
         result.reasoning_effort.medium         = true;
         result.reasoning_effort.xhigh          = true;
         result.reasoning_effort.default_effort = ReasoningEffort::XHigh;
+    } else if (semantics_ == ChatTemplateSemantics::V224) {
+        result.reasoning_effort.low            = true;
+        result.reasoning_effort.medium         = true;
+        result.reasoning_effort.xhigh          = true;
+        result.reasoning_effort.default_effort = ReasoningEffort::Medium;
     }
     return result;
 }
@@ -438,6 +670,7 @@ PromptCapabilities CompiledChatTemplate::capabilities() const noexcept {
 RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messages,
                                           ChatRenderOptions options) const {
     if (messages.empty()) { throw std::invalid_argument("chat messages must not be empty"); }
+    if (semantics_ == ChatTemplateSemantics::V224) { return render_v224(messages, options); }
 
     const bool continue_final_assistant =
         options.continuation == PromptContinuationMode::ContinueFinalAssistant;
@@ -682,6 +915,349 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
             break;
         case PromptCacheMarkerLocation::LeadingInstructionBoundary:
             if (message_begin == 1 && instruction_begin &&
+                marker.leading_instruction_bytes <= leading_instruction_raw.text.size()) {
+                const std::size_t clamped = std::clamp<std::size_t>(
+                    marker.leading_instruction_bytes, leading_trim_begin, leading_trim_end);
+                cache_boundaries[index] = *instruction_begin + clamped - leading_trim_begin;
+            }
+            break;
+        case PromptCacheMarkerLocation::ToolBoundary:
+            if (marker.after_tool_count != 0 && marker.after_tool_count <= tool_boundaries.size()) {
+                cache_boundaries[index] = tool_boundaries[marker.after_tool_count - 1U];
+            }
+            break;
+        }
+    }
+    RenderedFragment final = std::move(rendered).release();
+    return RenderedChat{.text                         = std::move(final.text),
+                        .literal_spans                = std::move(final.literal_spans),
+                        .media_placeholders           = std::move(final.media_placeholders),
+                        .rewrite_checkpoint           = rewrite_checkpoint,
+                        .rewrite_execution_boundaries = std::move(rewrite_execution_boundaries),
+                        .message_boundaries           = std::move(message_boundaries),
+                        .cache_boundaries             = std::move(cache_boundaries)};
+}
+
+RenderedChat CompiledChatTemplate::render_v224(const std::vector<ChatMessage>& messages,
+                                               ChatRenderOptions options) const {
+    const bool continue_final_assistant =
+        options.continuation == PromptContinuationMode::ContinueFinalAssistant;
+    if (continue_final_assistant) {
+        const ChatMessage& final = messages.back();
+        if (final.role != ChatRole::Assistant || final.parts.empty() ||
+            !final.reasoning_content.empty() || !final.tool_calls.empty() ||
+            final.has_media()) {
+            throw std::invalid_argument(
+                "assistant continuation requires a final text-only assistant message");
+        }
+        if (options.enable_thinking) {
+            throw std::invalid_argument("assistant continuation cannot start in thinking mode");
+        }
+    }
+
+    // Initial thinking state: medium reasoning effort by default, thinking
+    // enabled unless the request disables it. System, developer and user
+    // content is then scanned for think-control tags before anything renders;
+    // the tags also disappear from the rendered content later.
+    V224ThinkingState state;
+    state.thinking = options.enable_thinking;
+    state.effort   = options.reasoning_effort.value_or(ReasoningEffort::Medium);
+    for (const ChatMessage& message : messages) {
+        if (!is_instruction_role(message.role) && message.role != ChatRole::User) { continue; }
+        for (const ChatPart& part : message.parts) {
+            if (part.kind == ChatPartKind::Text) { scan_think_control_tag(part.text, state); }
+        }
+    }
+    std::string_view reasoning_instructions;
+    if (state.thinking) {
+        switch (state.effort) {
+        case ReasoningEffort::Low:
+            reasoning_instructions = kLowReasoningInstructions;
+            break;
+        case ReasoningEffort::Medium:
+            break;
+        case ReasoningEffort::XHigh:
+            reasoning_instructions = kXHighReasoningInstructions;
+            break;
+        }
+    }
+
+    // Leading system/developer messages merge into one system turn. Their
+    // content is trimmed, stripped of think-control tags, and joined with
+    // blank lines; empty turns contribute nothing.
+    std::size_t head_count = 0;
+    while (head_count < messages.size() && is_instruction_role(messages[head_count].role)) {
+        ++head_count;
+    }
+    RenderBuilder merged_parts;
+    RenderedFragment leading_instruction_raw;
+    std::size_t leading_trim_begin = 0;
+    std::size_t leading_trim_end   = 0;
+    for (std::size_t i = 0; i < head_count; ++i) {
+        validate_instruction_message(messages[i]);
+        const RenderedFragment raw =
+            without_think_control_tags(messages[i]).rendered_content();
+        if (i == 0) {
+            leading_instruction_raw = raw;
+            std::tie(leading_trim_begin, leading_trim_end) =
+                trim_ascii_whitespace_bounds(raw.text);
+        }
+        const RenderedFragment trimmed = trim_ascii_whitespace(raw);
+        if (trimmed.text.empty()) { continue; }
+        if (merged_parts.size() != 0) { merged_parts.append_template("\n\n"); }
+        merged_parts.append(trimmed);
+    }
+    const RenderedFragment merged_system = std::move(merged_parts).release();
+
+    RenderBuilder rendered;
+    std::vector<std::size_t> tool_boundaries;
+    std::optional<std::size_t> instruction_begin;
+    const bool has_tools = !options.tool_jsons.empty();
+    if (has_tools) {
+        rendered.append_template("<|im_start|>system\n");
+        if (!reasoning_instructions.empty()) {
+            rendered.append_template(reasoning_instructions);
+            rendered.append_template("\n\n");
+        }
+        rendered.append_template(
+            "# Tools\n\nYou have access to the following functions:\n\n<tools>");
+        for (const std::string& tool : options.tool_jsons) {
+            rendered.append_template("\n");
+            rendered.append_literal(tojson_text(OrderedJson::parse(tool)));
+            tool_boundaries.push_back(rendered.size());
+        }
+        rendered.append_template("\n</tools>");
+        rendered.append_template(v224_tool_format_instructions(state.thinking));
+        if (!merged_system.text.empty()) {
+            rendered.append_template("\n\n");
+            instruction_begin = rendered.size();
+            rendered.append(merged_system);
+        }
+        rendered.append_template("<|im_end|>\n");
+    } else if (!merged_system.text.empty()) {
+        rendered.append_template("<|im_start|>system\n");
+        if (!reasoning_instructions.empty()) {
+            rendered.append_template(reasoning_instructions);
+            rendered.append_template("\n\n");
+        }
+        instruction_begin = rendered.size();
+        rendered.append(merged_system);
+        rendered.append_template("<|im_end|>\n");
+    } else if (!reasoning_instructions.empty()) {
+        rendered.append_template("<|im_start|>system\n");
+        rendered.append_template(reasoning_instructions);
+        rendered.append_template("<|im_end|>\n");
+    }
+
+    std::vector<std::optional<std::size_t>> message_boundaries(messages.size() + 1U);
+    std::vector<std::optional<std::size_t>> cache_boundaries(options.cache_markers.size());
+    if (head_count == 0) {
+        message_boundaries[0] = rendered.size();
+    } else {
+        // Leading instruction messages are folded into the system preamble.
+        message_boundaries[head_count] = rendered.size();
+    }
+
+    const long last_query_index  = last_real_user_query(messages);
+    const bool preserve_thinking = options.preserve_thinking.value_or(true);
+    std::optional<RewriteCheckpointByteSpec> rewrite_checkpoint;
+    std::vector<std::size_t> rewrite_execution_boundaries;
+    const auto add_rewrite_execution_boundary = [&] {
+        if (rewrite_execution_boundaries.empty() ||
+            rewrite_execution_boundaries.back() != rendered.size()) {
+            rewrite_execution_boundaries.push_back(rendered.size());
+        }
+    };
+    int consecutive_failures = 0;
+
+    int image_count         = 0;
+    int video_count         = 0;
+    std::size_t media_count = 0;
+    for (std::size_t i = head_count; i < messages.size(); ++i) {
+        const ChatMessage& message = messages[i];
+        if (is_instruction_role(message.role)) { validate_instruction_message(message); }
+        const bool sanitize_content =
+            is_instruction_role(message.role) || message.role == ChatRole::User;
+        std::optional<ChatMessage> sanitized;
+        if (sanitize_content) { sanitized.emplace(without_think_control_tags(message)); }
+        const ChatMessage& render_source = sanitize_content ? *sanitized : message;
+        std::vector<std::size_t> raw_part_boundaries;
+        const RenderedFragment raw_content = render_source.rendered_content(
+            options.add_vision_id, &image_count, &video_count, &media_count,
+            &raw_part_boundaries);
+        const auto [content_trim_begin, content_trim_end] =
+            trim_ascii_whitespace_bounds(raw_content.text);
+        const RenderedFragment content =
+            slice_fragment(raw_content, content_trim_begin, content_trim_end);
+        const auto resolve_part_boundaries = [&](std::size_t content_begin) {
+            for (std::size_t marker_index = 0; marker_index < options.cache_markers.size();
+                 ++marker_index) {
+                const PromptCacheMarker& marker = options.cache_markers[marker_index];
+                if (marker.location != PromptCacheMarkerLocation::MessagePartBoundary ||
+                    marker.after_message_count != i + 1U || marker.after_message_part_count == 0 ||
+                    marker.after_message_part_count > raw_part_boundaries.size()) {
+                    continue;
+                }
+                const std::size_t raw = raw_part_boundaries[marker.after_message_part_count - 1U];
+                const std::size_t clamped = std::clamp(raw, content_trim_begin, content_trim_end);
+                cache_boundaries[marker_index] = content_begin + clamped - content_trim_begin;
+            }
+        };
+        if (is_instruction_role(message.role)) {
+            rendered.append_template("<|im_start|>system\n");
+            resolve_part_boundaries(rendered.size());
+            rendered.append(content);
+            rendered.append_template("<|im_end|>\n");
+            message_boundaries[i + 1U] = rendered.size();
+            continue;
+        }
+        if (message.role == ChatRole::User) {
+            // A real user turn resets the consecutive tool-error counter.
+            consecutive_failures = 0;
+            rendered.append_template("<|im_start|>user\n");
+            resolve_part_boundaries(rendered.size());
+            rendered.append(content);
+            rendered.append_template("<|im_end|>\n");
+            message_boundaries[i + 1U] = rendered.size();
+            continue;
+        }
+        if (message.role == ChatRole::Tool) {
+            const bool opens_group = i == 0 || messages[i - 1].role != ChatRole::Tool;
+            const bool closes_group =
+                i + 1 == messages.size() || messages[i + 1].role != ChatRole::Tool;
+            consecutive_failures =
+                v224_is_tool_failure(content.text) ? consecutive_failures + 1 : 0;
+            if (opens_group) { rendered.append_template("<|im_start|>user"); }
+            rendered.append_template("\n<tool_response>\n");
+            resolve_part_boundaries(rendered.size());
+            rendered.append(content);
+            if (consecutive_failures >= 2) {
+                rendered.append_template(
+                    "\n\n\u26a0\ufe0f SYSTEM WARNING: " + std::to_string(consecutive_failures) +
+                    " consecutive tool errors detected. Your previous approach is incorrect. "
+                    "You MUST use a fundamentally different approach or corrected arguments.");
+            } else if (consecutive_failures == 1) {
+                rendered.append_template("\n\n\u26a0\ufe0f SYSTEM WARNING: The previous tool call "
+                                         "returned an error. Diagnose the failure and retry with "
+                                         "completely corrected arguments.");
+            }
+            rendered.append_template("\n</tool_response>");
+            if (closes_group) { rendered.append_template("<|im_end|>\n"); }
+            message_boundaries[i + 1U] = rendered.size();
+            continue;
+        }
+        if (message.role != ChatRole::Assistant) {
+            // The engine's closed role set cannot reach the jinja [role]: fallback
+            // branch; unknown roles are rejected like the other templates.
+            throw std::invalid_argument("unsupported chat role value");
+        }
+
+        // assistant
+        if (continue_final_assistant && i + 1U == messages.size()) {
+            const std::size_t generation_begin = rendered.size();
+            rewrite_checkpoint                 = RewriteCheckpointByteSpec{
+                                .kind = RewriteCheckpointKind::ResponseReplay, .offset = generation_begin};
+            rendered.append_template("<|im_start|>assistant\n");
+            add_rewrite_execution_boundary();
+            rendered.append(content);
+            message_boundaries[i + 1U] = rendered.size();
+            continue;
+        }
+        RenderedFragment reasoning;
+        RenderedFragment body = content;
+        if (!message.reasoning_content.empty()) {
+            // An explicit reasoning channel wins; a think-style lead wrapper in the
+            // content is dropped (jinja: content.split(lead)[-1].lstrip('\n')).
+            const std::string_view lead =
+                starts_with(content.text, "<think>") &&
+                        content.text.find("</think>") != std::string::npos
+                    ? std::string_view("</think>")
+                    : starts_with(content.text, "<thinking>") &&
+                              content.text.find("</thinking>") != std::string::npos
+                          ? std::string_view("</thinking>")
+                          : starts_with(content.text, "</think>")
+                                ? std::string_view("</think>")
+                                : starts_with(content.text, "</thinking>")
+                                      ? std::string_view("</thinking>")
+                                      : std::string_view();
+            if (!lead.empty()) { body = split_tail_lstrip_newlines(content, lead); }
+            reasoning = literal_fragment(message.reasoning_content);
+        } else {
+            ThinkParts derived = derive_think_parts_v224(content);
+            reasoning         = std::move(derived.reasoning);
+            body              = std::move(derived.content);
+        }
+        reasoning = trim_ascii_whitespace(reasoning);
+
+        const bool keep_thinking = preserve_thinking || (static_cast<long>(i) > last_query_index);
+        if (!preserve_thinking && !rewrite_checkpoint && static_cast<long>(i) > last_query_index) {
+            // Closing the current turn may rewrite everything beginning with this assistant
+            // segment. Keep the stable history before the opener recoverable; retaining the
+            // deterministic opener itself is not worth losing the whole prefix when a caller
+            // branches with a new user message instead.
+            rewrite_checkpoint = RewriteCheckpointByteSpec{
+                .kind = RewriteCheckpointKind::TurnClosure, .offset = rendered.size()};
+        }
+        rendered.append_template("<|im_start|>assistant\n");
+        add_rewrite_execution_boundary();
+        if (keep_thinking) {
+            rendered.append_template("<think>\n");
+            add_rewrite_execution_boundary();
+            rendered.append(reasoning);
+            rendered.append_template("\n</think>\n\n");
+            add_rewrite_execution_boundary();
+        }
+        rendered.append(body);
+        if (!message.tool_calls.empty()) {
+            const bool body_has_text = !trim_ascii_whitespace(body).text.empty();
+            for (std::size_t call_index = 0; call_index < message.tool_calls.size(); ++call_index) {
+                if (call_index == 0) {
+                    if (body_has_text) { rendered.append_template("\n\n"); }
+                } else {
+                    rendered.append_template("\n");
+                }
+                // v22.4 allows parameter-less calls; arguments_json holds the
+                // XML parser's JSON object or is empty.
+                rendered.append(render_tool_call(message.tool_calls[call_index], true));
+            }
+        }
+        rendered.append_template("<|im_end|>\n");
+        message_boundaries[i + 1U] = rendered.size();
+    }
+
+    if (!continue_final_assistant && options.add_generation_prompt) {
+        // The generation suffix is replaceable as a unit, exactly as in render().
+        const std::size_t generation_begin = rendered.size();
+        if (preserve_thinking) {
+            rewrite_checkpoint = RewriteCheckpointByteSpec{
+                .kind = RewriteCheckpointKind::ResponseReplay, .offset = generation_begin};
+        } else if (!rewrite_checkpoint) {
+            rewrite_checkpoint = RewriteCheckpointByteSpec{
+                .kind = RewriteCheckpointKind::TurnClosure, .offset = generation_begin};
+        }
+        rendered.append_template("<|im_start|>assistant\n");
+        add_rewrite_execution_boundary();
+        rendered.append_template("<think>\n");
+        add_rewrite_execution_boundary();
+        if (!state.thinking) {
+            rendered.append_template("\n</think>\n\n");
+            add_rewrite_execution_boundary();
+        }
+    }
+    for (std::size_t index = 0; index < options.cache_markers.size(); ++index) {
+        const PromptCacheMarker marker = options.cache_markers[index];
+        switch (marker.location) {
+        case PromptCacheMarkerLocation::MessageBoundary:
+            if (marker.after_message_count < message_boundaries.size()) {
+                cache_boundaries[index] = message_boundaries[marker.after_message_count];
+            }
+            break;
+        case PromptCacheMarkerLocation::MessagePartBoundary:
+            // Resolved while the containing message's content offset is known. Assistant
+            // reasoning/tool-call interiors deliberately remain advisory and unresolved.
+            break;
+        case PromptCacheMarkerLocation::LeadingInstructionBoundary:
+            if (head_count == 1 && instruction_begin &&
                 marker.leading_instruction_bytes <= leading_instruction_raw.text.size()) {
                 const std::size_t clamped = std::clamp<std::size_t>(
                     marker.leading_instruction_bytes, leading_trim_begin, leading_trim_end);

@@ -97,6 +97,7 @@ Package::Frontend Package::make_frontend(const LoadedModel& model, const EngineO
                                       .media_live_bytes         = options.media_live_bytes,
                                       .media_preprocess_threads = options.media_preprocess_threads,
                                       .vision_max_tokens        = model.impl_->data.runtime.features.vision_max_tokens,
+                                      .chat_template_name       = options.chat_template_name,
                                   });
 }
 
