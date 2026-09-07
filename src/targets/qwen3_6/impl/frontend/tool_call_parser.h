@@ -43,6 +43,11 @@ struct ToolCallOutputContract {
 struct ParsedToolCallOutput {
     bool is_tool_call_response = false;
     std::string content;
+    // On a successful response, bytes of the tool region that could not be attributed to a valid
+    // tool block (narrative between or after blocks, or a whole malformed block) are restored
+    // here instead of forcing a wholesale text fallback. Empty when every region byte belongs to
+    // a valid call or is formatting whitespace.
+    std::string residual;
     std::vector<GeneratedToolCall> tool_calls;
 };
 
@@ -54,7 +59,8 @@ parse_qwen_tool_call_output(const std::string& text, std::size_t max_tool_name_l
                             const ToolArgumentTypeContracts& contracts);
 
 // Incrementally publishes bytes that are provably outside a possible terminal Qwen tool-call
-// suffix. At terminal time, valid calls are retained structurally; malformed output is restored
+// suffix. At terminal time, valid calls are retained structurally; narrative that cannot be
+// attributed to a valid block is restored as content, and wholly malformed output is restored
 // verbatim.
 class ToolCallOutputDecoder {
 public:

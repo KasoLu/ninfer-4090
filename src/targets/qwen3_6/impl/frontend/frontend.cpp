@@ -39,6 +39,7 @@ using Clock  = std::chrono::steady_clock;
 namespace fi = frontend_internal;
 
 constexpr std::size_t kPatchFeatures        = 1536;
+constexpr std::string_view kThinkOpen       = "<think>";
 constexpr std::string_view kThinkClose      = "</think>";
 constexpr std::string_view kUtf8Replacement = "\xef\xbf\xbd";
 constexpr std::string_view kThinkingControl =
@@ -244,7 +245,8 @@ fi::CompiledChatTemplate compile_chat_template(const FrontendResources& resource
     validate_tokenizer_config(resources);
     if (!options.chat_template_path.empty()) {
         return fi::CompiledChatTemplate::compile_jinja(
-            read_chat_template_file(options.chat_template_path), options.chat_template_path.string());
+            read_chat_template_file(options.chat_template_path),
+            options.chat_template_path.string());
     }
     return fi::CompiledChatTemplate::resolve(resources.chat_template_jinja);
 }
@@ -512,8 +514,16 @@ struct DecoderState {
     std::string utf8_pending;
     std::string think_marker_pending;
     std::array<std::string, 2> stop_pending;
-    bool in_reasoning              = false;
-    bool strip_content_leading     = false;
+    bool in_reasoning          = false;
+    bool strip_content_leading = false;
+    // When thinking is enabled but the turn does not start in the reasoning channel (a custom
+    // template without a thinking prologue), the model may still open its own canonical <think>
+    // block at generation start. Leading bytes are held until that start is classified; the
+    // detection stops at the first classification, so later literal "<think>" text is never
+    // swallowed.
+    bool detect_open_think = false;
+    std::string open_think_pending;
+    std::size_t open_think_ws      = 0;
     bool terminal                  = false;
     std::uint64_t decoded_bytes    = 0;
     std::uint32_t reasoning_tokens = 0;
@@ -626,11 +636,65 @@ void feed_content(DecoderState& state, std::string text, const StopPolicy& polic
                  best_match);
 }
 
+// feed_decoded_text routes into the undecided-start classifier below; the recursion between the
+// two functions needs this forward declaration.
+void feed_decoded_text(DecoderState& state, std::string_view text, const StopPolicy& policy,
+                       PublishedOutput& emitted, std::uint32_t committed_tokens,
+                       StopMatch* best_match);
+
+// Classifies the start of a turn that may still open its own reasoning block. While detection is
+// active no bytes are published: a canonical open marker after optional whitespace switches the
+// session into the reasoning channel (dropping the marker and the held whitespace), and any other
+// start is ordinary content. The classification is final for the turn.
+void feed_undecided_content_start(DecoderState& state, std::string_view text,
+                                  const StopPolicy& policy, PublishedOutput& emitted,
+                                  std::uint32_t committed_tokens, StopMatch* best_match) {
+    state.open_think_pending.append(text);
+    while (state.open_think_ws < state.open_think_pending.size() &&
+           std::isspace(
+               static_cast<unsigned char>(state.open_think_pending[state.open_think_ws])) != 0) {
+        ++state.open_think_ws;
+    }
+    const std::string_view candidate =
+        std::string_view(state.open_think_pending).substr(state.open_think_ws);
+    if (candidate.empty()) { return; } // all whitespace so far: keep holding
+    if (candidate.starts_with(kThinkOpen) &&
+        (candidate.size() == kThinkOpen.size() ||
+         !std::isalpha(static_cast<unsigned char>(candidate[kThinkOpen.size()])))) {
+        // Model-opened thinking block: the held whitespace and the marker are framing only. The
+        // marker must not continue into further letters: the decoder only closes the canonical
+        // </think>, so other marker families (<thinking>, <|think|> and friends) are never
+        // classified here and stay ordinary content.
+        state.open_think_pending.erase(0, state.open_think_ws + kThinkOpen.size());
+        state.open_think_ws         = 0;
+        state.detect_open_think     = false;
+        state.in_reasoning          = true;
+        state.strip_content_leading = false;
+        std::string remainder       = std::move(state.open_think_pending);
+        state.open_think_pending.clear();
+        if (!remainder.empty()) {
+            feed_decoded_text(state, remainder, policy, emitted, committed_tokens, best_match);
+        }
+        return;
+    }
+    if (kThinkOpen.starts_with(candidate)) { return; } // proper prefix: hold for more bytes
+    std::string held = std::move(state.open_think_pending);
+    state.open_think_pending.clear();
+    state.open_think_ws     = 0;
+    state.detect_open_think = false;
+    feed_content(state, std::move(held), policy, emitted, committed_tokens, best_match);
+}
+
 void feed_decoded_text(DecoderState& state, std::string_view text, const StopPolicy& policy,
                        PublishedOutput& emitted, std::uint32_t committed_tokens,
                        StopMatch* best_match) {
     if (!state.in_reasoning) {
-        feed_content(state, std::string(text), policy, emitted, committed_tokens, best_match);
+        if (state.detect_open_think) {
+            feed_undecided_content_start(state, text, policy, emitted, committed_tokens,
+                                         best_match);
+        } else {
+            feed_content(state, std::string(text), policy, emitted, committed_tokens, best_match);
+        }
         return;
     }
 
@@ -680,6 +744,14 @@ void terminalize(DecoderState& state, const StopPolicy& policy, PublishedOutput&
         state.think_marker_pending.clear();
         close_channel(state, OutputChannel::Reasoning, emitted);
     } else {
+        if (!state.open_think_pending.empty()) {
+            // An unclassified generation start at terminal time is ordinary content.
+            std::string held = std::move(state.open_think_pending);
+            state.open_think_pending.clear();
+            state.open_think_ws     = 0;
+            state.detect_open_think = false;
+            feed_content(state, std::move(held), policy, emitted, committed_tokens, nullptr);
+        }
         close_channel(state, OutputChannel::Content, emitted);
     }
     state.stop_pending = {};
@@ -957,7 +1029,7 @@ public:
 class OutputSession::Impl {
 public:
     Impl(std::shared_ptr<const fi::Tokenizer> tokenizer_, StopPolicy policy_, OutputOptions output,
-         bool starts_in_reasoning, ThinkingControlOptions thinking,
+         bool starts_in_reasoning, bool model_may_open_think, ThinkingControlOptions thinking,
          std::shared_ptr<const std::vector<TokenId>> thinking_control_tokens_,
          std::shared_ptr<const fi::ToolCallOutputContract> tool_call_output_)
         : tokenizer(std::move(tokenizer_)), policy(std::move(policy_)),
@@ -970,7 +1042,12 @@ public:
             throw std::invalid_argument("thinking budget must be positive");
         }
         state.in_reasoning = split_reasoning;
-        semantic.budget    = thinking.budget;
+        // A turn that starts in the content channel may still be a thinking turn in disguise when
+        // the rendered prompt did not open a thinking phase (custom template without a thinking
+        // prologue): recognize a model-opened canonical <think> block at the generation start.
+        // Sessions that already start in reasoning, and raw presentation, never classify.
+        state.detect_open_think = model_may_open_think && !split_reasoning;
+        semantic.budget         = thinking.budget;
         // The presentation decoder already tracks normal reasoning output. Keep the independent
         // semantic tracker dormant unless a cap needs it, so the default unlimited path does not
         // decode every model token twice.
@@ -1439,7 +1516,7 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
     } else {
         const fi::RenderedChat rendered =
             impl_->chat_template.render(messages, render_options(options, rendered_markers));
-        reasoning_prologue = fi::prompt_starts_in_reasoning(rendered.text);
+        reasoning_prologue          = fi::prompt_starts_in_reasoning(rendered.text);
         const auto tokenize_started = Clock::now();
         fi::EncodedChat encoded     = fi::encode_rendered_chat(
             *impl_->tokenizer, rendered, static_cast<std::size_t>(impl_->max_context) + 1U);
@@ -1467,9 +1544,14 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
     // rendered prompt (last reasoning marker open), so a custom template without a thinking
     // prologue cannot classify the whole generation as reasoning. The media path does not retain
     // rendered text and keeps the option-based derivation.
-    result.starts_in_reasoning =
-        options.continuation == PromptContinuationMode::NewAssistantTurn &&
-        (has_media ? options.enable_thinking : reasoning_prologue);
+    result.starts_in_reasoning = options.continuation == PromptContinuationMode::NewAssistantTurn &&
+                                 (has_media ? options.enable_thinking : reasoning_prologue);
+    // Self-opened thinking recognition: even when the rendered prompt does not open a thinking
+    // phase (custom templates without a thinking prologue), an enable_thinking turn may still
+    // begin with the model's own canonical <think> block. The output session classifies the
+    // generation start before publishing anything (see OutputSession::Impl).
+    result.model_may_open_think =
+        options.continuation == PromptContinuationMode::NewAssistantTurn && options.enable_thinking;
     result.prepare.seconds = std::chrono::duration<double>(Clock::now() - start).count();
     return PreparedPrompt(std::move(prepared));
 }
@@ -1563,8 +1645,9 @@ OutputSession Frontend::make_output_session(const PreparedPrompt& prompt,
     StopPolicy policy = merge_stop_policy(*impl_->tokenizer, caller_stop);
     if (output.raw) { policy.publish_stop_token = true; }
     return OutputSession(std::make_unique<OutputSession::Impl>(
-        impl_->tokenizer, std::move(policy), output, prompt.data_->starts_in_reasoning, thinking,
-        impl_->thinking_control_tokens, prompt.data_->tool_call_output));
+        impl_->tokenizer, std::move(policy), output, prompt.data_->starts_in_reasoning,
+        prompt.data_->model_may_open_think, thinking, impl_->thinking_control_tokens,
+        prompt.data_->tool_call_output));
 }
 
 const StopPolicy& Frontend::default_stop_policy() const noexcept { return impl_->defaults; }

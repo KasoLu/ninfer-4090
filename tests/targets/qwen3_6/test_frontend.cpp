@@ -2336,6 +2336,81 @@ int test_custom_template_reasoning_channel() {
                  "in reasoning");
 }
 
+int test_self_opened_think_classification() {
+    // A custom template without the default thinking prologue must not surface a model-opened
+    // <think> block as tagged content: the session classifies the generation start into the
+    // reasoning channel before publishing anything. With enable_thinking off, the decoder never
+    // intercepts a literal <think> block.
+    const std::string source = "{%- for message in messages -%}"
+                               "{{- message.role ~ ':' ~ message.content -}}"
+                               "{%- endfor -%}"
+                               "{{- 'assistant:' -}}";
+    FrontendOptions options;
+    options.vision_enabled = false;
+    options.max_context    = std::numeric_limits<std::uint32_t>::max();
+    const std::filesystem::path template_file =
+        std::filesystem::temp_directory_path() / "ninfer_self_opened_think_test.jinja";
+    {
+        std::ofstream out(template_file, std::ios::binary);
+        out << source;
+    }
+    options.chat_template_path   = template_file;
+    FrontendResources owned      = resources(source);
+    owned.tokenizer_json         = read_file(official_file("tokenizer.json").c_str());
+    owned.tokenizer_config_json  = read_file(official_file("tokenizer_config.json").c_str());
+    owned.generation_config_json = read_file(official_file("generation_config.json").c_str());
+    const Frontend frontend      = FrontendFactory::create_component(owned, options);
+
+    const auto prepare = [&](bool enable_thinking) {
+        ninfer::ChatMessage message;
+        message.role = ninfer::ChatRole::User;
+        message.parts.push_back(
+            ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "x", .media = {}});
+        ninfer::PromptInput input;
+        input.messages.push_back(std::move(message));
+        input.options.continuation    = ninfer::PromptContinuationMode::NewAssistantTurn;
+        input.options.enable_thinking = enable_thinking;
+        return frontend.prepare(std::move(input));
+    };
+
+    auto prompt                 = prepare(true);
+    const auto& data            = FrontendFactory::inspect(prompt);
+    int failures                = check(!data.starts_in_reasoning && data.model_may_open_think,
+                                        "no-prologue thinking turn did not arm self-opened think classification");
+    auto session                = frontend.make_output_session(prompt, {});
+    const std::string generated = "<think>thought</think>\n\nanswer";
+    const std::vector<ninfer::TokenId> tokens = official_tokenizer().encode(generated);
+    const auto decision = session.preview_model(tokens, static_cast<std::uint32_t>(tokens.size()),
+                                                ninfer::FinishReason::OutputLimit);
+    failures += check(decision.accepted_tokens == tokens.size() &&
+                          decision.finish_reason == ninfer::FinishReason::OutputLimit,
+                      "self-opened think output did not reach the terminal transaction");
+    const auto output = session.commit_preview();
+    failures += check(channel_text(output, ninfer::OutputChannel::Reasoning) == "thought",
+                      "self-opened <think> block did not enter the reasoning channel");
+    failures += check(channel_text(output, ninfer::OutputChannel::Content) == "answer",
+                      "self-opened thinking leaked into content or content was lost");
+    failures += check(session.reasoning_tokens() > 0,
+                      "self-opened thinking tokens were not counted as reasoning");
+
+    auto disabled_prompt      = prepare(false);
+    const auto& disabled_data = FrontendFactory::inspect(disabled_prompt);
+    failures += check(!disabled_data.starts_in_reasoning && !disabled_data.model_may_open_think,
+                      "disabled thinking armed self-opened think classification");
+    auto disabled_session     = frontend.make_output_session(disabled_prompt, {});
+    const std::string literal = "<think>tagged</think>";
+    const std::vector<ninfer::TokenId> literal_tokens = official_tokenizer().encode(literal);
+    (void)disabled_session.preview_model(literal_tokens,
+                                         static_cast<std::uint32_t>(literal_tokens.size()),
+                                         ninfer::FinishReason::OutputLimit);
+    const auto disabled_output = disabled_session.commit_preview();
+    failures += check(channel_text(disabled_output, ninfer::OutputChannel::Reasoning).empty() &&
+                          channel_text(disabled_output, ninfer::OutputChannel::Content) == literal,
+                      "disabled thinking intercepted a literal <think> block");
+    (void)std::filesystem::remove(template_file);
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -2359,6 +2434,7 @@ int main() {
     failures += test_assistant_continuation();
     failures += test_reasoning_effort_chat_template();
     failures += test_custom_template_reasoning_channel();
+    failures += test_self_opened_think_classification();
     failures += test_rewrite_checkpoint_trace();
     failures += test_adjacent_tool_message_boundary();
     failures += test_official_resource_guards();

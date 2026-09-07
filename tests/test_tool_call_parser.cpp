@@ -92,7 +92,7 @@ int test_malformed_falls_back_to_text() {
     return failures;
 }
 
-int test_suffix_after_tool_falls_back_to_text() {
+int test_trailing_narration_keeps_tool_call() {
     const std::string text = "<tool_call>\n"
                              "<function=get_weather>\n"
                              "<parameter=city>\nParis\n</parameter>\n"
@@ -102,8 +102,59 @@ int test_suffix_after_tool_falls_back_to_text() {
     const fi::ParsedToolCallOutput parsed =
         fi::parse_qwen_tool_call_output(text, 64, kNoTypeContracts);
     int failures = 0;
-    failures += check(!parsed.is_tool_call_response, "non-whitespace suffix falls back to text");
-    failures += check(parsed.content == text, "suffix fallback preserves text");
+    failures += check(parsed.is_tool_call_response, "non-whitespace suffix retained tool response");
+    failures += check(parsed.tool_calls.size() == 1 && parsed.tool_calls[0].name == "get_weather",
+                      "trailing narration dropped the structured tool call");
+    // The residual keeps the raw region bytes, including the newline framing right after the
+    // close tag: at terminal time it is appended verbatim after the streaming content delta.
+    failures += check(parsed.residual == "\nextra answer",
+                      "trailing narration restored as residual content");
+    failures += check(parsed.content.empty(), "no content preceded the tool region");
+    return failures;
+}
+
+int test_inter_block_narration_keeps_calls() {
+    const std::string text = "<tool_call>\n"
+                             "<function=get_weather>\n"
+                             "<parameter=city>\nParis\n</parameter>\n"
+                             "</function>\n"
+                             "</tool_call>\n"
+                             "and then\n"
+                             "<tool_call>\n"
+                             "<function=get_news>\n"
+                             "<parameter=count>\n2\n</parameter>\n"
+                             "</function>\n"
+                             "</tool_call>";
+    const fi::ParsedToolCallOutput parsed =
+        fi::parse_qwen_tool_call_output(text, 64, kNoTypeContracts);
+    int failures = 0;
+    failures += check(parsed.is_tool_call_response, "inter-block narrative retained tool response");
+    failures += check(parsed.tool_calls.size() == 2, "both tool calls retained");
+    failures +=
+        check(parsed.residual == "\nand then\n", "inter-block narrative restored as content");
+    return failures;
+}
+
+int test_failed_block_salvage_keeps_later_calls() {
+    const auto contracts   = contracts_for("second", Json{{"value", Json{{"type", "string"}}}});
+    const std::string text = "<tool_call>\n"
+                             "<function=first>\n"
+                             "<parameter=value>\n1\n</parameter>\n"
+                             "</function>\n"
+                             "</tool_call>\n"
+                             "<tool_call>\n"
+                             "<function=second>\n"
+                             "<parameter=value>\nok\n</parameter>\n"
+                             "</function>\n"
+                             "</tool_call>";
+    const fi::ParsedToolCallOutput parsed = fi::parse_qwen_tool_call_output(text, 64, contracts);
+    int failures                          = 0;
+    failures += check(parsed.is_tool_call_response,
+                      "malformed leading block forced a wholesale text fallback");
+    failures += check(parsed.tool_calls.size() == 1 && parsed.tool_calls[0].name == "second",
+                      "later valid block was lost with the malformed one");
+    failures += check(parsed.residual.find("<function=first>") != std::string::npos,
+                      "malformed block bytes not restored as residual content");
     return failures;
 }
 
@@ -313,6 +364,23 @@ int test_incremental_filter_valid_tool() {
     return failures;
 }
 
+int test_incremental_trailing_narration_restored_at_terminal() {
+    fi::ToolCallOutputDecoder filter(std::make_shared<fi::ToolCallOutputContract>(), 64);
+    std::string visible;
+    visible += filter.feed("Calling weather.  \n<tool_");
+    visible += filter.feed("call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n"
+                           "</function>\n</tool_call>\nAll set.");
+    auto terminal = filter.finish();
+    visible += terminal.content;
+    int failures = 0;
+    failures += check(visible == "Calling weather.\nAll set.",
+                      "trailing narration was not restored around a valid tool call");
+    failures +=
+        check(terminal.tool_calls.size() == 1 && terminal.tool_calls.front().name == "get_weather",
+              "trailing narration suppressed the retained tool call");
+    return failures;
+}
+
 int test_incremental_filter_fallback() {
     const std::string original = "prefix  \n<tool_call>\n<function=broken>";
     fi::ToolCallOutputDecoder malformed(std::make_shared<fi::ToolCallOutputContract>(), 64);
@@ -349,7 +417,9 @@ int main() {
     failures += test_single_call();
     failures += test_multiple_calls_and_json_values();
     failures += test_malformed_falls_back_to_text();
-    failures += test_suffix_after_tool_falls_back_to_text();
+    failures += test_trailing_narration_keeps_tool_call();
+    failures += test_inter_block_narration_keeps_calls();
+    failures += test_failed_block_salvage_keeps_later_calls();
     failures += test_configured_name_limit();
     failures += test_declared_strings_are_not_json_sniffed();
     failures += test_declared_non_string_values_are_json_decoded();
@@ -357,6 +427,7 @@ int main() {
     failures += test_unknown_schema_keeps_legacy_inference();
     failures += test_parser_enforces_active_tool_set();
     failures += test_incremental_filter_valid_tool();
+    failures += test_incremental_trailing_narration_restored_at_terminal();
     failures += test_incremental_filter_fallback();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;

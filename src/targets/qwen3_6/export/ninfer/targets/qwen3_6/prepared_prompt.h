@@ -149,6 +149,10 @@ struct PreparedPromptData {
     PreparedContextCache context_cache;
     std::shared_ptr<const frontend_internal::ToolCallOutputContract> tool_call_output;
     bool starts_in_reasoning = false;
+    // When set, an output session created for this prompt may recognize a model-opened canonical
+    // <think> block at the very start of generation even though the rendered prompt does not open
+    // a thinking phase (custom templates without a thinking prologue).
+    bool model_may_open_think = false;
     PrepareStats prepare;
 
     [[nodiscard]] std::span<const std::int32_t> position_axis(int axis) const;

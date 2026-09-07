@@ -266,25 +266,41 @@ ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
     ParsedToolCallOutput out;
     out.content = rtrim_ascii(std::string_view(text).substr(0, first));
 
+    // Salvage loop: every well-formed block is retained structurally; bytes that cannot be
+    // attributed to a valid block (narrative between or after blocks, or a whole malformed
+    // block) are restored as residual content instead of discarding the good calls.
+    const auto not_space = [](unsigned char byte) { return std::isspace(byte) == 0; };
+    std::string residual;
     std::size_t pos = first;
-    while (pos < text.size()) {
-        skip_ws(text, pos);
-        if (pos >= text.size()) { break; }
-        if (!starts_with_at(text, pos, kToolOpen)) { return fallback(text); }
-        const std::size_t inner_begin = pos + kToolOpen.size();
-        const std::size_t close       = text.find(kToolClose, inner_begin);
-        if (close == std::string::npos) { return fallback(text); }
-        GeneratedToolCall call;
-        if (!parse_one_tool_call(std::string_view(text).substr(inner_begin, close - inner_begin),
-                                 max_tool_name_length, contracts, call)) {
-            return fallback(text);
+    for (;;) {
+        const std::size_t open = text.find(kToolOpen, pos);
+        if (open == std::string::npos) {
+            const std::string_view trailing = std::string_view(text).substr(pos);
+            if (std::none_of(trailing.begin(), trailing.end(), not_space)) { break; }
+            residual.append(trailing);
+            break;
         }
-        out.tool_calls.push_back(std::move(call));
+        const std::string_view between = std::string_view(text).substr(pos, open - pos);
+        if (std::any_of(between.begin(), between.end(), not_space)) { residual.append(between); }
+        const std::size_t inner_begin = open + kToolOpen.size();
+        const std::size_t close       = text.find(kToolClose, inner_begin);
+        if (close == std::string::npos) {
+            residual.append(text.substr(open));
+            break;
+        }
+        GeneratedToolCall call;
+        if (parse_one_tool_call(std::string_view(text).substr(inner_begin, close - inner_begin),
+                                max_tool_name_length, contracts, call)) {
+            out.tool_calls.push_back(std::move(call));
+        } else {
+            residual.append(text.substr(open, close + kToolClose.size() - open));
+        }
         pos = close + kToolClose.size();
     }
 
     if (out.tool_calls.empty()) { return fallback(text); }
     out.is_tool_call_response = true;
+    out.residual              = std::move(residual);
     return out;
 }
 
@@ -349,7 +365,10 @@ ToolCallOutputDecoder::Terminal ToolCallOutputDecoder::finish() {
         trailing_whitespace_.clear();
         tool_region_.clear();
         marker_prefix_bytes_ = 0;
-        return Terminal{.content = {}, .tool_calls = std::move(parsed.tool_calls)};
+        // Narrative that could not be attributed to a valid block is restored as content; the
+        // retained calls are published structurally.
+        return Terminal{.content    = std::move(parsed.residual),
+                        .tool_calls = std::move(parsed.tool_calls)};
     }
 
     constexpr std::string_view kToolOpen = "<tool_call>";
