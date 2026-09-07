@@ -139,6 +139,15 @@ const fi::Tokenizer& official_tokenizer() {
     return tokenizer;
 }
 
+std::string official_template_source() {
+    static const std::string source = [&] {
+        const nlohmann::json config =
+            nlohmann::json::parse(read_file(official_file("tokenizer_config.json").c_str()));
+        return config.at("chat_template").get_ref<const std::string&>();
+    }();
+    return source;
+}
+
 nlohmann::json added(int id, std::string content, bool special = false) {
     return nlohmann::json{{"id", id},
                           {"content", std::move(content)},
@@ -1251,6 +1260,7 @@ int test_literal_control_tokens_with_media() {
         read_file(official_file("tokenizer_config.json").c_str());
     official.generation_config_json =
         read_file(official_file("generation_config.json").c_str());
+    official.chat_template_jinja = official_template_source();
     const Frontend frontend = FrontendFactory::create_component(official);
 
     auto text_part = [](std::string text) {
@@ -1407,6 +1417,7 @@ int test_automatic_private_anchor_opportunities() {
         read_file(official_file("tokenizer_config.json").c_str());
     official.generation_config_json =
         read_file(official_file("generation_config.json").c_str());
+    official.chat_template_jinja = official_template_source();
     const Frontend frontend = FrontendFactory::create_component(official, false);
 
     const auto text_message = [](ninfer::ChatRole role, const char* text) {
@@ -1511,6 +1522,7 @@ int test_explicit_leading_instruction_cache_boundary() {
         read_file(official_file("tokenizer_config.json").c_str());
     official.generation_config_json =
         read_file(official_file("generation_config.json").c_str());
+    official.chat_template_jinja = official_template_source();
     const Frontend frontend           = FrontendFactory::create_component(official, false);
     constexpr std::string_view stable = "stable cache section.";
     ninfer::ChatMessage system;
@@ -1760,6 +1772,7 @@ int test_structured_tool_output() {
         read_file(official_file("tokenizer_config.json").c_str());
     owned.generation_config_json =
         read_file(official_file("generation_config.json").c_str());
+    owned.chat_template_jinja = official_template_source();
     const Frontend frontend = FrontendFactory::create_component(owned);
 
     ninfer::ChatMessage message;
@@ -2301,12 +2314,16 @@ int test_media_preparation_cancellation() {
 int test_custom_template_reasoning_channel() {
     // P1 fix (upstream PR #42 review): a custom Jinja template that does not emit the
     // default thinking prologue must not classify the turn as starting in reasoning,
-    // even when enable_thinking is on.
+    // even when enable_thinking is on. The rendered turn envelope stays within the
+    // fixture tokenizer domain (added tokens only), because prepare() encodes the full
+    // rendered prompt.
     const std::string source =
         "{%- for message in messages -%}"
-        "{{- message.role ~ ': ' ~ message.content -}}"
+        "{{- '<|im_start|>' + message.role + '\\n' + message.content + '<|im_end|>\\n' -}}"
         "{%- endfor -%}"
-        "{{- 'assistant:' -}}";
+        "{%- if add_generation_prompt -%}"
+        "{{- '<|im_start|>assistant\\n' -}}"
+        "{%- endif -%}";
     FrontendOptions options;
     options.vision_enabled = false;
     options.max_context    = std::numeric_limits<std::uint32_t>::max();
@@ -2340,11 +2357,15 @@ int test_self_opened_think_classification() {
     // A custom template without the default thinking prologue must not surface a model-opened
     // <think> block as tagged content: the session classifies the generation start into the
     // reasoning channel before publishing anything. With enable_thinking off, the decoder never
-    // intercepts a literal <think> block.
+    // intercepts a literal <think> block. The rendered turn envelope is the official-marker form
+    // (no thinking prologue), so tokenization is well-defined under either tokenizer.
     const std::string source = "{%- for message in messages -%}"
-                               "{{- message.role ~ ':' ~ message.content -}}"
+                               "{{- '<|im_start|>' + message.role + '\\n' + message.content + "
+                               "'<|im_end|>\\n' -}}"
                                "{%- endfor -%}"
-                               "{{- 'assistant:' -}}";
+                               "{%- if add_generation_prompt -%}"
+                               "{{- '<|im_start|>assistant\\n' -}}"
+                               "{%- endif -%}";
     FrontendOptions options;
     options.vision_enabled = false;
     options.max_context    = std::numeric_limits<std::uint32_t>::max();
@@ -2355,11 +2376,7 @@ int test_self_opened_think_classification() {
         out << source;
     }
     options.chat_template_path   = template_file;
-    FrontendResources owned      = resources(source);
-    owned.tokenizer_json         = read_file(official_file("tokenizer.json").c_str());
-    owned.tokenizer_config_json  = read_file(official_file("tokenizer_config.json").c_str());
-    owned.generation_config_json = read_file(official_file("generation_config.json").c_str());
-    const Frontend frontend      = FrontendFactory::create_component(owned, options);
+    const Frontend frontend      = FrontendFactory::create_component(resources(source), options);
 
     const auto prepare = [&](bool enable_thinking) {
         ninfer::ChatMessage message;
@@ -2378,8 +2395,9 @@ int test_self_opened_think_classification() {
     int failures                = check(!data.starts_in_reasoning && data.model_may_open_think,
                                         "no-prologue thinking turn did not arm self-opened think classification");
     auto session                = frontend.make_output_session(prompt, {});
-    const std::string generated = "<think>thought</think>\n\nanswer";
-    const std::vector<ninfer::TokenId> tokens = official_tokenizer().encode(generated);
+    // Fixture-domain composite tokens decode to "<think>thought</think>\n\nanswer":
+    // token 248068 is the <think> added token, 3 = "thought</thi", 4 = "nk>\n\nanswer".
+    const std::vector<ninfer::TokenId> tokens{248068, 3, 4};
     const auto decision = session.preview_model(tokens, static_cast<std::uint32_t>(tokens.size()),
                                                 ninfer::FinishReason::OutputLimit);
     failures += check(decision.accepted_tokens == tokens.size() &&
@@ -2397,15 +2415,16 @@ int test_self_opened_think_classification() {
     const auto& disabled_data = FrontendFactory::inspect(disabled_prompt);
     failures += check(!disabled_data.starts_in_reasoning && !disabled_data.model_may_open_think,
                       "disabled thinking armed self-opened think classification");
-    auto disabled_session     = frontend.make_output_session(disabled_prompt, {});
-    const std::string literal = "<think>tagged</think>";
-    const std::vector<ninfer::TokenId> literal_tokens = official_tokenizer().encode(literal);
+    auto disabled_session = frontend.make_output_session(disabled_prompt, {});
+    // Composite tokens decode to "<think>helloST</think>" (token 1 = "helloST").
+    const std::vector<ninfer::TokenId> literal_tokens{248068, 1, 248069};
     (void)disabled_session.preview_model(literal_tokens,
                                          static_cast<std::uint32_t>(literal_tokens.size()),
                                          ninfer::FinishReason::OutputLimit);
     const auto disabled_output = disabled_session.commit_preview();
     failures += check(channel_text(disabled_output, ninfer::OutputChannel::Reasoning).empty() &&
-                          channel_text(disabled_output, ninfer::OutputChannel::Content) == literal,
+                          channel_text(disabled_output, ninfer::OutputChannel::Content) ==
+                              "<think>helloST</think>",
                       "disabled thinking intercepted a literal <think> block");
     (void)std::filesystem::remove(template_file);
     return failures;
