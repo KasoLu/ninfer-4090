@@ -333,6 +333,122 @@ int test_unknown_schema_keeps_legacy_inference() {
     return failures;
 }
 
+// Regression for the 2026-09-07 user report: a well-formed <tool_call> for tool `edit` was
+// degraded to plain text. The model emitted a long `edits` JSON value with TWO defects: some
+// string literals contain RAW line-feed bytes (real newlines) while sibling strings use \n
+// escapes, and the final insert_after element drops one closing brace before the array bracket.
+// A strict Json::parse rejects both, so the whole call fell back. Byte transcription: real
+// newlines where the report shows a break, two-char \n escapes elsewhere.
+int test_reported_example_raw_newlines_in_json_strings() {
+    const auto contracts = contracts_for(
+        "edit", Json{{"edits", Json{{"type", "array"}}}, {"path", Json{{"type", "string"}}}});
+    const std::string reported =
+        "<tool_call>\n"
+        "<function=edit>\n"
+        "<parameter=edits>\n"
+        "[{\"new_text\": \"├── src/\\n    ├── main.js        # entry point, "
+        "requestAnimationFrame loop\\n    ├── scene.js       # animation state, shared per-frame\n"
+        "layout, draw order\\n    ├── background.js  # sky, sun, clouds, hills, trees, bushes, road "
+        "(parallax)\\n    ├── bicycle.js     # wheels with rotating\n"
+        "spokes, frame, chain, crank, pedals\\n    ├── pelican.js     # body, wing, S-neck, beak + "
+        "pouch, IK pedaling legs\\n    └── controls.js    # buttons,\n"
+        "keyboard shortcuts, click-to-flap, HUD sync\\n└── test/\\n    └── logic.test.mjs # headless "
+        "state-machine test (npm test)\", \"replace\": {\"new_text\": \"└──\n"
+        "src/\\n    ├── main.js        # entry point, requestAnimationFrame loop\\n    ├── scene.js   "
+        "    # animation state, shared per-frame layout, draw order\\n"
+        "├── background.js  # sky, sun, clouds, hills, trees, bushes, road (parallax)\\n    ├── "
+        "bicycle.js     # wheels with rotating spokes, frame, chain, crank,\n"
+        "pedals\\n    ├── pelican.js     # body, wing, S-neck, beak + pouch, IK pedaling legs\\n    "
+        "└── controls.js    # buttons, keyboard shortcuts, click-to-flap,\n"
+        "HUD sync\\n└── test/\\n    └── logic.test.mjs # headless state-machine test (npm test)\", "
+        "\"old_text\": \"└── src/\\n    ├── main.js        # entry point,\n"
+        "requestAnimationFrame loop\\n    ├── scene.js       # animation state, shared per-frame "
+        "layout, draw order\\n    ├── background.js  # sky, sun, clouds,\n"
+        "hills, trees, bushes, road (parallax)\\n    ├── bicycle.js     # wheels with rotating "
+        "spokes, frame, chain, crank, pedals\\n    ├── pelican.js     # body,\n"
+        "wing, S-neck, beak + pouch, IK pedaling legs\\n    └── controls.js    # buttons, keyboard "
+        "shortcuts, click-to-flap, HUD sync\"}}, {\"insert_after\":\n"
+        "{\"anchor\": \"22:8be\", \"new_text\": \"- No Node? Any static server works too: `npx serve "
+        ".` or `python -m http.server`.\\n\\n### Tests\\n\\nA dependency-free\n"
+        "logic test drives the scene headlessly (wheel rotation, crank\\nratio, IK leg reach, "
+        "pause/reset, speed clamping):\\n\\n```bash\\nnpm test\\n```\\n\"}]\n"
+        "</parameter>\n"
+        "<parameter=path>\n"
+        "C:\\Workspace\\study\\pi-bike\\README.md\n"
+        "</parameter>\n"
+        "</function>\n"
+        "</tool_call>";
+
+    const fi::ParsedToolCallOutput parsed = fi::parse_qwen_tool_call_output(reported, 64, contracts);
+    int failures                          = 0;
+    failures += check(parsed.is_tool_call_response,
+                      "reported raw-newline edits value still fell back to text");
+    failures += check(parsed.tool_calls.size() == 1 && parsed.tool_calls.front().name == "edit",
+                      "reported example lost the structured edit call");
+    const Json args = Json::parse(parsed.tool_calls.front().arguments_json);
+    failures += check(args.at("edits").is_array() && args.at("edits").size() == 2,
+                      "repaired edits payload did not keep both edit entries");
+    failures += check(args.at("edits").at(0).contains("replace") &&
+                          args.at("edits").at(0).at("replace").contains("old_text") &&
+                          args.at("edits").at(0).at("replace").at("old_text").get<std::string>()
+                              .starts_with("└── src/"),
+                      "repaired replace edit lost its old_text");
+    failures += check(args.at("edits").at(1).at("insert_after").at("anchor") == "22:8be",
+                      "repaired insert_after edit lost its anchor");
+    failures += check(args.at("path") == "C:\\Workspace\\study\\pi-bike\\README.md",
+                      "string-typed path parameter was altered by the repair");
+    return failures;
+}
+
+// Isolated stage-1 defect: raw line-feed inside a JSON string, complete brace structure.
+int test_raw_newline_inside_json_string_only() {
+    const auto contracts =
+        contracts_for("edit", Json{{"edits", Json{{"type", "array"}}}, {"path", Json{{"type", "string"}}}});
+    const std::string call = "<tool_call>\n<function=edit>\n<parameter=edits>\n"
+                             "[{\"replace\": {\"new_text\": \"line1\n"
+                             "line2\", \"old_text\": \"o\"}}]\n"
+                             "</parameter>\n</function>\n</tool_call>";
+    const fi::ParsedToolCallOutput parsed = fi::parse_qwen_tool_call_output(call, 64, contracts);
+    int failures                          = 0;
+    failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1,
+                      "raw-newline-only value fell back to text");
+    if (parsed.tool_calls.size() == 1) {
+        const Json args    = Json::parse(parsed.tool_calls.front().arguments_json);
+        const std::string text =
+            args.at("edits").at(0).at("replace").at("new_text").get<std::string>();
+        failures += check(text == "line1\nline2", "raw newline was not recovered as \\n");
+    }
+    return failures;
+}
+
+// Isolated stage-2 defect: one object closer dropped before the array bracket, clean strings.
+int test_missing_object_close_before_bracket_only() {
+    const auto contracts = contracts_for("edit", Json{{"edits", Json{{"type", "array"}}}});
+    const std::string call =
+        "<tool_call>\n<function=edit>\n<parameter=edits>\n"
+        "[{\"replace\": {\"new_text\": \"n\", \"old_text\": \"o\"}}]\n"
+        "</parameter>\n</function>\n</tool_call>";
+    // Same call with the element object's closing brace omitted before the bracket.
+    const std::string broken_call =
+        "<tool_call>\n<function=edit>\n<parameter=edits>\n"
+        "[{\"replace\": {\"new_text\": \"n\", \"old_text\": \"o\"}]\n"
+        "</parameter>\n</function>\n</tool_call>";
+    int failures = 0;
+    const fi::ParsedToolCallOutput good = fi::parse_qwen_tool_call_output(call, 64, contracts);
+    failures += check(good.is_tool_call_response && good.tool_calls.size() == 1,
+                      "control call did not parse");
+    const fi::ParsedToolCallOutput repaired =
+        fi::parse_qwen_tool_call_output(broken_call, 64, contracts);
+    failures += check(repaired.is_tool_call_response && repaired.tool_calls.size() == 1,
+                      "missing object closer before bracket was not repaired");
+    if (repaired.tool_calls.size() == 1) {
+        const Json args = Json::parse(repaired.tool_calls.front().arguments_json);
+        failures += check(args.at("edits").at(0).at("replace").at("old_text") == "o",
+                          "repaired missing-closer call lost the edit payload");
+    }
+    return failures;
+}
+
 int test_parser_enforces_active_tool_set() {
     const auto contracts = contracts_for("declared", Json{{"value", Json{{"type", "string"}}}});
     const auto parsed    = fi::parse_qwen_tool_call_output(
@@ -426,6 +542,9 @@ int main() {
     failures += test_declared_type_mismatches_are_forwarded_without_coercion();
     failures += test_unknown_schema_keeps_legacy_inference();
     failures += test_parser_enforces_active_tool_set();
+    failures += test_reported_example_raw_newlines_in_json_strings();
+    failures += test_raw_newline_inside_json_string_only();
+    failures += test_missing_object_close_before_bracket_only();
     failures += test_incremental_filter_valid_tool();
     failures += test_incremental_trailing_narration_restored_at_terminal();
     failures += test_incremental_filter_fallback();

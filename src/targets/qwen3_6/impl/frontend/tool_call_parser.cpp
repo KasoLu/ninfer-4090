@@ -162,6 +162,129 @@ std::string_view remove_parameter_framing_newlines(std::string_view text) {
     return text.substr(begin, end - begin);
 }
 
+// Model-generated JSON frequently contains bare line-break bytes inside string literals (a common
+// slip on long values: some lines are escaped as \n, others are emitted as raw newlines). A strict
+// Json::parse rejects raw control bytes inside strings, which used to drop the whole tool call.
+// This rewrites ONLY raw control bytes inside string literals to their standard escapes; structure
+// outside strings and every other byte are preserved verbatim.
+std::string escape_raw_controls_in_strings(std::string_view text) {
+    std::string out;
+    out.reserve(text.size());
+    bool in_string = false;
+    std::size_t i  = 0;
+    while (i < text.size()) {
+        const char c = text[i];
+        if (!in_string) {
+            out.push_back(c);
+            if (c == '"') { in_string = true; }
+            ++i;
+            continue;
+        }
+        if (c == '\\') {
+            out.push_back(c);
+            // An escaped byte (\", \\, ...) is copied verbatim - but only when the escaped byte is
+            // not itself a raw control character (a backslash does not license a bare newline).
+            if (i + 1 < text.size() &&
+                static_cast<unsigned char>(text[i + 1]) >= 0x20) {
+                out.push_back(text[i + 1]);
+                i += 2;
+                continue;
+            }
+            ++i;
+            continue;
+        }
+        if (c == '"') {
+            out.push_back(c);
+            in_string = false;
+            ++i;
+            continue;
+        }
+        const unsigned char byte = static_cast<unsigned char>(c);
+        if (byte < 0x20) { // raw control byte inside a string literal
+            switch (c) {
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            case '\b': out += "\\b"; break;
+            case '\f': out += "\\f"; break;
+            default: {
+                static constexpr char kHex[] = "0123456789abcdef";
+                out += "\\u00";
+                out.push_back(kHex[(byte >> 4) & 0xF]);
+                out.push_back(kHex[byte & 0xF]);
+                break;
+            }
+            }
+            ++i;
+            continue;
+        }
+        out.push_back(c);
+        ++i;
+    }
+    return out;
+}
+
+// Second common slip: the model drops the closing brace(s) of the innermost object(s) when the
+// value ends inside an array - e.g. {"insert_after": {...}} closed as "}]" instead of "}}]".
+// Inserts the missing '}' closers before a ']' whenever the innermost open container is an object.
+// Bounded: only synthesizes object closers ahead of a bracket; anything else that still fails to
+// parse is left to the caller's drop path.
+std::string close_unclosed_objects_before_brackets(std::string_view text) {
+    std::string out;
+    out.reserve(text.size() + 4);
+    std::vector<char> containers;
+    bool in_string = false;
+    std::size_t i  = 0;
+    while (i < text.size()) {
+        const char c = text[i];
+        if (in_string) {
+            out.push_back(c);
+            if (c == '\\') {
+                if (i + 1 < text.size()) { out.push_back(text[i + 1]); }
+                i += 2;
+                continue;
+            }
+            if (c == '"') { in_string = false; }
+            ++i;
+            continue;
+        }
+        if (c == '"') {
+            in_string = true;
+            out.push_back(c);
+            ++i;
+            continue;
+        }
+        if (c == '{' || c == '[') {
+            containers.push_back(c);
+            out.push_back(c);
+            ++i;
+            continue;
+        }
+        if (c == '}' || c == ']') {
+            while (!containers.empty() && containers.back() == '{' && c == ']') {
+                out.push_back('}'); // the model closed the array but skipped the object closer(s)
+                containers.pop_back();
+            }
+            if (!containers.empty() &&
+                (containers.back() == '{' ? c == '}' : c == ']')) {
+                containers.pop_back();
+                out.push_back(c);
+                ++i;
+                continue;
+            }
+            if (containers.empty() && c == '}') { // stray close outside any container
+                out.push_back(c);
+                ++i;
+                continue;
+            }
+            return out; // mismatched closer that is not repairable: keep what we have
+        }
+        out.push_back(c);
+        ++i;
+    }
+    return out;
+}
+
 bool parse_parameter(std::string_view inner, std::size_t& pos, Json& args,
                      std::string_view tool_name, const ToolArgumentTypeContracts& contracts) {
     constexpr std::string_view kParamOpen  = "<parameter=";
@@ -182,12 +305,23 @@ bool parse_parameter(std::string_view inner, std::size_t& pos, Json& args,
         Json parsed                    = Json::parse(legacy_value, nullptr, false);
         args[key] = parsed.is_discarded() ? Json(legacy_value) : std::move(parsed);
     } else {
-        const std::string value(remove_parameter_framing_newlines(encoded_value));
+        std::string value(remove_parameter_framing_newlines(encoded_value));
         if (contract->encoding == ToolArgumentTypeContracts::Encoding::String) {
-            args[key] = value;
+            args[key] = std::move(value);
         } else {
             Json parsed = Json::parse(value, nullptr, false);
-            if (parsed.is_discarded()) { return false; }
+            if (parsed.is_discarded()) {
+                // Retry with bounded repairs for the two slips observed in model output: raw
+                // control bytes inside string literals, and object closers dropped ahead of a
+                // closing bracket. Keeps the declared JSON contract while tolerating both.
+                value  = escape_raw_controls_in_strings(value);
+                parsed = Json::parse(value, nullptr, false);
+                if (parsed.is_discarded()) {
+                    value  = close_unclosed_objects_before_brackets(value);
+                    parsed = Json::parse(value, nullptr, false);
+                }
+                if (parsed.is_discarded()) { return false; }
+            }
             args[key] = std::move(parsed);
         }
     }
