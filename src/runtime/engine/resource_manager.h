@@ -309,7 +309,7 @@ public:
         }
 
         const typename Planner::Clock::time_point planning_started = Planner::Clock::now();
-        rebuild_prefix_index();
+        rebuild_prefix_index("inspect");
         if (const char* trace = std::getenv("NINFER_ADMISSION_TRACE");
             trace != nullptr && trace[0] != '\0') {
             std::fprintf(stderr,
@@ -616,7 +616,7 @@ public:
             program.skip_capture(std::move(offer));
             return ActiveCaptureReserveResult::Skipped;
         }
-        rebuild_prefix_index();
+        rebuild_prefix_index("reserve");
 
         CaptureAssessment private_baseline =
             program.inspect_capture(offer, nullptr, nullptr, std::nullopt, false);
@@ -674,8 +674,9 @@ public:
                 return ActiveCaptureReserveResult::Skipped;
             }
             transaction_.template emplace<ActiveCaptureRecord>(ActiveCaptureRecord{
-                .lane              = lane,
-                .publishes_private = true,
+                .lane                 = lane,
+                .publishes_private    = true,
+                .publishes_checkpoint = private_baseline.publishes_checkpoint,
             });
             const ContextTransactionReserveStatus reserved = program.reserve_active_capture(
                 std::move(offer), exact_shared, nullptr, private_replacement, false, cancellation);
@@ -951,8 +952,9 @@ public:
                 return ActiveCaptureReserveResult::Skipped;
             }
             transaction_.template emplace<ActiveCaptureRecord>(ActiveCaptureRecord{
-                .lane              = lane,
-                .publishes_private = true,
+                .lane                 = lane,
+                .publishes_private    = true,
+                .publishes_checkpoint = private_baseline.publishes_checkpoint,
             });
             const ContextTransactionReserveStatus reserved = program.reserve_active_capture(
                 std::move(offer), nullptr, nullptr, private_replacement, false, cancellation);
@@ -974,6 +976,7 @@ public:
             .lane                 = lane,
             .publishes_private    = selected->scenario.assessment.publishes_private,
             .publishes_shared     = true,
+            .publishes_checkpoint = selected->scenario.assessment.publishes_checkpoint,
             .publication_slot     = selected->scenario.publication_slot,
             .replacement_id       = selected->scenario.replacement_id,
             .replacement_revision = selected->scenario.replacement_revision,
@@ -1141,6 +1144,35 @@ public:
         publication.retention = active.retention;
         migrate_observations(publication, result.summary, active.retention);
         advance_revision(publication.revision);
+        if (const char* trace = std::getenv("NINFER_ADMISSION_TRACE");
+            trace != nullptr && trace[0] != '\0') {
+            std::fprintf(stderr,
+                         "[admission-trace] finish: lane=%u disposition=%d",
+                         static_cast<unsigned>(lane.value),
+                         static_cast<int>(result.disposition));
+            if (result.summary.endpoint) {
+                if constexpr (requires { result.summary.endpoint->shortlist_key.frontier; }) {
+                    std::fprintf(stderr, " ep_front=%llu",
+                                 static_cast<unsigned long long>(
+                                     result.summary.endpoint->shortlist_key.frontier));
+                }
+            }
+            if (result.summary.endpoint) {
+                if constexpr (requires { result.summary.endpoint->shortlist_key.identity_tag;
+                                         result.summary.endpoint->shortlist_key.digests; }) {
+                    std::fprintf(stderr,
+                                 " ep_tag=%llu d0=%016llx d1=%016llx",
+                                 static_cast<unsigned long long>(
+                                     result.summary.endpoint->shortlist_key.identity_tag),
+                                 static_cast<unsigned long long>(
+                                     result.summary.endpoint->shortlist_key.digests[0]),
+                                 static_cast<unsigned long long>(
+                                     result.summary.endpoint->shortlist_key.digests[1]));
+                }
+            }
+            std::fprintf(stderr, "\n");
+            std::fflush(stderr);
+        }
         if (publication.session && active.update_session_index) {
             if (!publish_session(*publication.session, active.publication_slot, publication.id,
                                  publication.revision, active.publication_order)) {
@@ -1484,6 +1516,7 @@ private:
         LaneId lane;
         bool publishes_private                  = false;
         bool publishes_shared                   = false;
+        bool publishes_checkpoint      = true;
         std::uint32_t publication_slot          = kInvalidCatalogSlot;
         std::uint64_t replacement_id            = 0;
         std::uint64_t replacement_revision      = 0;
@@ -1861,7 +1894,7 @@ private:
         advance_revision(entry.revision);
     }
 
-    void rebuild_prefix_index() {
+    void rebuild_prefix_index(const char* trigger) {
         for (PrefixIndexEntry& entry : prefix_index_) { entry = {}; }
         std::size_t cursor = 0;
         const auto append  = [&](bool shared, std::uint32_t slot, std::uint64_t owner_id,
@@ -1896,6 +1929,33 @@ private:
             const SharedCatalogEntry& entry = shared_catalog_[slot];
             if (entry.state == SharedCatalogState::Catalogued && entry.handle) {
                 append(true, slot, entry.id, entry.revision, entry.summary.checkpoint);
+            }
+        }
+        if (trigger != nullptr) {
+            if (const char* trace = std::getenv("NINFER_ADMISSION_TRACE");
+                trace != nullptr && trace[0] != '\0') {
+                std::fprintf(stderr,
+                             "[admission-trace] index-rebuild: trigger=%s entries=%llu",
+                             trigger, static_cast<unsigned long long>(cursor));
+                for (const PrefixIndexEntry& item : prefix_index_) {
+                    if (!item.occupied) { continue; }
+                    std::fprintf(stderr,
+                                 " | sh=%d slot=%llu kind=%llu front=%llu ord=%llu",
+                                 static_cast<int>(item.shared ? 1 : 0),
+                                 static_cast<unsigned long long>(item.slot),
+                                 static_cast<unsigned long long>(item.checkpoint.kind),
+                                 static_cast<unsigned long long>(item.checkpoint.frontier),
+                                 static_cast<unsigned long long>(item.checkpoint.ordinal));
+                    if constexpr (requires { item.key.identity_tag; item.key.digests; }) {
+                        std::fprintf(stderr,
+                                     " tag=%llu d0=%016llx d1=%016llx",
+                                     static_cast<unsigned long long>(item.key.identity_tag),
+                                     static_cast<unsigned long long>(item.key.digests[0]),
+                                     static_cast<unsigned long long>(item.key.digests[1]));
+                    }
+                }
+                std::fprintf(stderr, "\n");
+                std::fflush(stderr);
             }
         }
     }
@@ -2719,7 +2779,7 @@ private:
         // Increment revision and advance resource revision.
         ++entry.revision;
         advance_revision(entry.revision);
-        rebuild_prefix_index();
+        rebuild_prefix_index("anchor-drop");
         return entry.summary;
     }
 
@@ -3428,7 +3488,8 @@ private:
         } else {
             const ActiveEntry& active = active_[record->lane.value];
             if (record->publishes_private) {
-                if (!valid_continuation_summary(result.active_summary)) {
+                if (record->publishes_checkpoint &&
+                    !valid_continuation_summary(result.active_summary)) {
                     throw std::logic_error("active capture returned an invalid private summary");
                 }
                 const CatalogEntry& publication = catalog_.at(active.publication_slot);
@@ -3472,11 +3533,23 @@ private:
             return {.status = ContextTransactionStatus::Aborted};
         }
         ActiveEntry& active = active_[record->lane.value];
-        if (record->publishes_private) {
+        if (record->publishes_private && valid_continuation_summary(result.active_summary)) {
             CatalogEntry& publication = catalog_[active.publication_slot];
             assign_continuation_summary(publication.summary, result.active_summary);
             migrate_observations(publication, result.active_summary, active.retention);
             advance_revision(publication.revision);
+        }
+        if (const char* trace = std::getenv("NINFER_ADMISSION_TRACE");
+            trace != nullptr && trace[0] != '\0') {
+            std::fprintf(stderr,
+                         "[admission-trace] settle: lane=%u pp=%d pc=%d sum=%d shared=%d status=%lld\n",
+                         static_cast<unsigned>(record->lane.value),
+                         static_cast<int>(record->publishes_private ? 1 : 0),
+                         static_cast<int>(record->publishes_checkpoint ? 1 : 0),
+                         static_cast<int>(valid_continuation_summary(result.active_summary) ? 1 : 0),
+                         static_cast<int>(record->publishes_shared ? 1 : 0),
+                         static_cast<long long>(result.status));
+            std::fflush(stderr);
         }
         if (record->publishes_shared) {
             SharedCatalogEntry& publication = shared_catalog_[record->publication_slot];

@@ -739,6 +739,10 @@ struct CaptureAssessment {
     std::uint32_t frontier                = 0;
     bool publishes_private                = false;
     bool publishes_shared                 = false;
+    // PREFIX-PLAN v2 D6: a plain prompt-boundary capture publishes a state image only (no
+    // endpoint/rewrite/anchor enters the sequence at publish time); its endpoint
+    // materializes at finish().  false => the publish returns no checkpoint summary.
+    bool publishes_checkpoint             = true;
     bool needs_transfer                   = false;
     bool physically_feasible              = false;
     bool recycles_private_state           = false;

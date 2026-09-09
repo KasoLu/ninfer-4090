@@ -7608,8 +7608,18 @@ ProgramImplCore::inspect_capture(const CaptureOffer& offer, const SharedPrefixHa
     if (!group.shared && !group.rewrite && !group.long_anchor &&
         group.frontier == prefill.prompt_tokens) {
         const SequenceState& boundary_sequence = active_sequence(lane);
-        assessment.publishes_private   = true;
-        assessment.physically_feasible = boundary_sequence.reserved_state.has_value();
+        assessment.publishes_private    = true;
+        assessment.publishes_checkpoint = false;
+        assessment.physically_feasible  = boundary_sequence.reserved_state.has_value();
+        if (const char* ct = std::getenv("NINFER_ADMISSION_TRACE");
+            ct != nullptr && ct[0] != '\0') {
+            std::fprintf(stderr,
+                         "[admission-trace] inspect: plain-boundary lane=%u frontier=%u reserved=%d\n",
+                         static_cast<unsigned>(lane),
+                         static_cast<unsigned>(group.frontier),
+                         boundary_sequence.reserved_state.has_value() ? 1 : 0);
+            std::fflush(stderr);
+        }
         return assessment;
     }
     if (!publish_private && !publish_shared) {
@@ -8049,10 +8059,11 @@ runtime::ContextTransactionReserveStatus ProgramImplCore::reserve_active_capture
     if (const char* trace = std::getenv("NINFER_ADMISSION_TRACE");
         trace != nullptr && trace[0] != '\0') {
         std::fprintf(stderr,
-                     "[admission-trace] program: lane=%u RESERVE frontier=%u pp=%d pf=%d placement=%d reserved=%d rw=%d la=%d sh=%d\n",
+                     "[admission-trace] program: lane=%u RESERVE frontier=%u pp=%d pf=%d pc=%d placement=%d reserved=%d rw=%d la=%d sh=%d\n",
                      static_cast<unsigned>(lane),
                      static_cast<unsigned>(transaction.group.frontier),
-                     static_cast<int>(transaction.publish_private),
+                     static_cast<int>(assessment.publishes_private),
+                     static_cast<int>(assessment.publishes_checkpoint),
                      static_cast<int>(assessment.physically_feasible),
                      static_cast<int>(static_cast<int>(transaction.state_placement)),
                      static_cast<int>(sequence.reserved_state ? 1 : 0),
@@ -8062,6 +8073,7 @@ runtime::ContextTransactionReserveStatus ProgramImplCore::reserve_active_capture
         std::fflush(stderr);
     }
     transaction.publish_private     = assessment.publishes_private;
+    transaction.publishes_checkpoint = assessment.publishes_checkpoint;
     transaction.publish_shared      = assessment.publishes_shared;
     transaction.private_replacement = private_replacement;
     transaction.resource_delta      = detail::PhysicalDelta{
@@ -8613,8 +8625,16 @@ ActiveCaptureResult ProgramImplCore::publish_active_capture(ActiveCaptureTransac
     out.status                         = runtime::ContextTransactionStatus::Published;
     out.capacity_preparation_committed = transaction.replacement_removed;
     if (transaction.publish_private) {
-        populate_continuation_summary(sequence, transaction.active_summary);
-        out.active_summary = std::move(transaction.active_summary);
+        // PREFIX-PLAN v2 D6: a plain prompt-boundary capture is state-only - it publishes no
+        // endpoint/rewrite/anchor at this point (the endpoint materializes at finish()), so
+        // only populate when a checkpoint set actually exists on the sequence.
+        const bool sequence_has_checkpoints =
+            sequence.endpoint_valid || sequence.rewrite_checkpoint.valid ||
+            !sequence.long_anchors.empty();
+        if (transaction.publishes_checkpoint || sequence_has_checkpoints) {
+            populate_continuation_summary(sequence, transaction.active_summary);
+            out.active_summary = std::move(transaction.active_summary);
+        }
     }
     out.victims               = std::move(transaction.pressure_results);
     out.shared_victims        = std::move(transaction.shared_pressure_results);
@@ -8661,9 +8681,10 @@ ActiveCaptureResult ProgramImplCore::publish_active_capture(ActiveCaptureTransac
     if (const char* trace = std::getenv("NINFER_ADMISSION_TRACE");
         trace != nullptr && trace[0] != '\0') {
         std::fprintf(stderr,
-                     "[admission-trace] publish: lane=%u frontier=%u endpoint_frontier=%u prompt=%u\n",
+                     "[admission-trace] publish: lane=%u frontier=%u pc=%d endpoint_frontier=%u prompt=%u\n",
                      static_cast<unsigned>(transaction.lane),
                      static_cast<unsigned>(transaction.group.frontier),
+                     static_cast<int>(transaction.publishes_checkpoint),
                      static_cast<unsigned>(sequence.endpoint_frontier),
                      static_cast<unsigned>(prefill.prompt_tokens));
         std::fflush(stderr);
@@ -9549,10 +9570,13 @@ FinishResult ProgramImplCore::finish(SequenceHandle sequence) noexcept {
         out.summary.long_anchors.reserve(state.long_anchors.size());
     } catch (...) { return out; }
     try {
+        bool fork_aborted = false;
+        const bool reserved_slot_pending = state.reserved_state.has_value();
         if (state.state.fork_pending) {
             const StateImageHandle source      = state.state.read;
             const StateImageHandle destination = state.state.write;
             state_store->abort_fork(source, destination);
+            fork_aborted = true;
             if (!state_store->release(destination)) { return out; }
             state.state = ActiveStateBinding{.read = source, .write = source};
         }
@@ -9580,6 +9604,26 @@ FinishResult ProgramImplCore::finish(SequenceHandle sequence) noexcept {
         }
         populate_continuation_summary(state, out.summary);
         out.summary.active_references = 0;
+        if (const char* trace = std::getenv("NINFER_ADMISSION_TRACE");
+            trace != nullptr && trace[0] != '\0') {
+            std::fprintf(stderr,
+                         "[admission-trace] finish: lane=%u fork=%d resleft=%d exec=%u ep_frontier=%u ep_tag=%llu d0=%016llx d1=%016llx\n",
+                         static_cast<unsigned>(lane),
+                         static_cast<int>(fork_aborted ? 1 : 0),
+                         static_cast<int>(reserved_slot_pending ? 1 : 0),
+                         static_cast<unsigned>(state.execution_frontier),
+                         static_cast<unsigned>(state.endpoint_frontier),
+                         out.summary.endpoint
+                             ? static_cast<unsigned long long>(out.summary.endpoint->shortlist_key.identity_tag)
+                             : 0ULL,
+                         out.summary.endpoint
+                             ? static_cast<unsigned long long>(out.summary.endpoint->shortlist_key.digests[0])
+                             : 0ULL,
+                         out.summary.endpoint
+                             ? static_cast<unsigned long long>(out.summary.endpoint->shortlist_key.digests[1])
+                             : 0ULL);
+            std::fflush(stderr);
+        }
     } catch (...) { return out; }
     release_active_shared_references(state);
     release_sequence_growth_entitlement(state);
@@ -12050,8 +12094,9 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
         if (const char* trace = std::getenv("NINFER_ADMISSION_TRACE");
             trace != nullptr && trace[0] != '\0') {
             std::fprintf(stderr,
-                         "[admission-trace] prefill-end: prompt=%u pfc=%d next=%u/%u next_frontier=%u\n",
+                         "[admission-trace] prefill-end: prompt=%u base=%u pfc=%d next=%u/%u next_frontier=%u\n",
                          static_cast<unsigned>(prompt_tokens),
+                         static_cast<unsigned>(staged.base),
                          static_cast<int>(prompt_frontier_capture ? 1 : 0),
                          static_cast<unsigned>(staged.next_capture),
                          static_cast<unsigned>(staged.capture_groups.size()),

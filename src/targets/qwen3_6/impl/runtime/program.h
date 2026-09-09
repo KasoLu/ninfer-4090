@@ -933,6 +933,7 @@ private:
         CaptureGroup group;
         bool publish_private = false;
         bool publish_shared  = false;
+        bool publishes_checkpoint = true;
         bool replaces_shared = false;
         std::optional<runtime::CheckpointRef> private_replacement;
         std::optional<std::uint32_t> shared_index;

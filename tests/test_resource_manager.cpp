@@ -478,6 +478,7 @@ struct FakeCaptureAssessment {
     std::vector<CheckpointRef> private_replacement_candidates;
     bool publishes_private   = false;
     bool publishes_shared    = false;
+    bool publishes_checkpoint = true;
     bool needs_transfer      = false;
     bool physically_feasible = true;
 };
