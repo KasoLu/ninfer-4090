@@ -7175,7 +7175,12 @@ StartResult ProgramImplCore::start_request(MaterializationTransaction& transacti
         detail::PhysicalResources actual         = resident_resources(sequence);
         actual.device.active_lanes               = 1;
         const detail::PhysicalResources expected = active;
-        if (actual != expected) {
+        // PREFIX-PLAN P0: actual mapped pages may be less than the planned entitlement when
+        // prefix reuse shares pages with the source; exceeding the entitlement is a planning bug.
+        if (actual.device.state_slots != expected.device.state_slots ||
+            actual.device.main_kv_pages > expected.device.main_kv_pages ||
+            actual.device.backend_kv_pages > expected.device.backend_kv_pages ||
+            actual.host != expected.host) {
             throw std::logic_error("materialized sequence does not match its active entitlement");
         }
         if (details.reuse != ReusePath::Root) {
