@@ -1814,6 +1814,11 @@ private:
         if (!erase_pending(request)) {
             throw std::logic_error("admitted request disappeared from the FIFO queue");
         }
+        // PREFIX-PLAN P1 (M3): an admitted request leaves the pending queue, so release its
+        // queued hard-protection record here; a leftover record would let the request keep
+        // self-protecting its own retained entry after terminal (I5: release on window exit).
+        // Active-request protection is enforced separately via active edges.
+        resources_.clear_pending_demand(request->id);
         release_planning_state(request);
         if (materializing_ || slots_[lane] != nullptr) {
             throw std::logic_error("reserved materialization destination is not empty");

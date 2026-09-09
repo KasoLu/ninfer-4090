@@ -3463,6 +3463,24 @@ void test_pending_demand_protection() {
 }
 
 
+// PREFIX-PLAN P1 (M3 regression): a queued request's hard-protection record is released
+// by targeted window exit, so a terminal request cannot self-protect its own retained
+// prefix entry (the engine releases the record when the request leaves the pending queue).
+void test_pending_demand_window_exit_releases_protection() {
+    FakeManager manager = make_manager(1, 2);
+    const auto domain = FakeManager::reuse_domain(std::nullopt, 44);
+    const FakeShortlistKey key{.digest = 11, .frontier = 12};
+    const FakeManager::PrefixDemandRecord provisional;
+    require(manager.protection_mask_for(key, provisional) == 0U,
+            "no hard protection before any pending demand is registered");
+    manager.note_pending_demand(55, {&key, 1}, domain);
+    require(manager.protection_mask_for(key, provisional) != 0U,
+            "queued pending demand did not register hard protection");
+    manager.clear_pending_demand(55);
+    require(manager.protection_mask_for(key, provisional) == 0U,
+            "targeted window exit did not release the hard protection");
+}
+
 int main() {
     run_test("private checkpoint identity loss",
              test_private_portfolio_loss_keeps_checkpoint_identity_fixed);
@@ -3536,6 +3554,8 @@ int main() {
     run_test("root gating blocks feasible reuse candidate", test_root_gating_blocks_feasible_reuse);
     run_test("root gating allows structurally dead reuse", test_root_gating_allows_structural_dead);
     run_test("pending demand registers protection", test_pending_demand_protection);
+    run_test("pending demand window exit releases protection",
+             test_pending_demand_window_exit_releases_protection);
 
     if (failures != 0) { return 1; }
     std::cout << "ok\n";
