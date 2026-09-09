@@ -4686,7 +4686,12 @@ void ProgramImplCore::prepare_consumed_source(MaterializationTransaction& transa
         }
     };
 
-    if (source.endpoint_valid && source.execution_frontier > details.reuse_base) {
+    // PREFIX-PLAN v2 D7c: a consumed PrivateEndpoint lane takes over the primary (endpoint)
+    // StateImage itself, so execution_frontier > reuse_base is only a stale KV/hidden tail
+    // (trimmed below) and must not drop the carrier; dropping it leaves the source without
+    // any resident state and prepare_materialization throws.
+    if (source.endpoint_valid && source.execution_frontier > details.reuse_base &&
+        details.reuse != ReusePath::PrivateEndpoint) {
         const StateImageHandle endpoint = source.state.read;
         source.endpoint_valid           = false;
         source.endpoint_frontier          = 0;
@@ -4798,6 +4803,20 @@ void ProgramImplCore::prepare_consumed_source(MaterializationTransaction& transa
     if (host_kv_extents) { (void)host_kv_extents->release_unreferenced(); }
     refresh_state_views(source);
 
+    if (const char* trace = std::getenv("NINFER_ADMISSION_TRACE");
+        trace != nullptr && trace[0] != '\0') {
+        std::fprintf(stderr,
+                     "[admission-trace] consume-source: reuse=%u exec=%u reuse_base=%u "
+                     "endpoint_valid=%d ep_frontier=%u state_read_valid=%d mtp_kv_valid=%u\n",
+                     static_cast<unsigned>(details.reuse),
+                     static_cast<unsigned>(source.execution_frontier),
+                     static_cast<unsigned>(details.reuse_base),
+                     source.endpoint_valid ? 1 : 0,
+                     static_cast<unsigned>(source.endpoint_frontier),
+                     source.state.read.valid() ? 1 : 0,
+                     static_cast<unsigned>(source.mtp_kv_valid));
+        std::fflush(stderr);
+    }
     const detail::PhysicalResources after   = resident_resources(source);
     const detail::PhysicalResources removed = checked_resource_difference(before, after);
     (void)checked_resource_difference(details.demand.final_removed, removed);
@@ -4839,9 +4858,25 @@ void ProgramImplCore::prepare_materialization(MaterializationTransaction& transa
     SharedPrefixState* shared_state = transaction.has_shared_source
                                           ? &shared_prefix_states[transaction.shared_source_index]
                                           : nullptr;
-    if (source_state != nullptr && resident_resources(*source_state).device.state_slots == 0 &&
-        resident_resources(*source_state).host.state_slots == 0) {
-        throw std::logic_error("materialization source has no resident state");
+    if (source_state != nullptr) {
+        const detail::PhysicalResources source_resident = resident_resources(*source_state);
+        if (const char* trace = std::getenv("NINFER_ADMISSION_TRACE");
+            trace != nullptr && trace[0] != '\0') {
+            std::fprintf(stderr,
+                         "[admission-trace] materialize: lane=%u reuse=%u reuse_base=%u "
+                         "src_dev_slots=%u src_host_slots=%u src_main_kv=%u src_backend_kv=%u\n",
+                         lane,
+                         static_cast<unsigned>(details.reuse),
+                         static_cast<unsigned>(details.reuse_base),
+                         source_resident.device.state_slots,
+                         source_resident.host.state_slots,
+                         source_resident.device.main_kv_pages,
+                         source_resident.device.backend_kv_pages);
+            std::fflush(stderr);
+        }
+        if (source_resident.device.state_slots == 0 && source_resident.host.state_slots == 0) {
+            throw std::logic_error("materialization source has no resident state");
+        }
     }
 
     std::uint32_t state_count = demand.reservation_added.device.state_slots;
@@ -8624,10 +8659,16 @@ ActiveCaptureResult ProgramImplCore::publish_active_capture(ActiveCaptureTransac
     ActiveCaptureResult out;
     out.status                         = runtime::ContextTransactionStatus::Published;
     out.capacity_preparation_committed = transaction.replacement_removed;
+    // PREFIX-PLAN v2 D3: advance endpoint_frontier for the plain prompt-boundary group before
+    // populate so a sequence that already carries a checkpoint (a consumed endpoint lane from a
+    // previous round) publishes the new prompt boundary instead of the stale one.
+    if (transaction.group.frontier == prefill.prompt_tokens) {
+        sequence.endpoint_frontier = prefill.prompt_tokens;
+    }
     if (transaction.publish_private) {
-        // PREFIX-PLAN v2 D6: a plain prompt-boundary capture is state-only - it publishes no
-        // endpoint/rewrite/anchor at this point (the endpoint materializes at finish()), so
-        // only populate when a checkpoint set actually exists on the sequence.
+        // PREFIX-PLAN v2 D6: a plain prompt-boundary capture publishes no new checkpoint of its
+        // own (the endpoint materializes at finish()), so only populate when a checkpoint set
+        // already exists on the sequence.
         const bool sequence_has_checkpoints =
             sequence.endpoint_valid || sequence.rewrite_checkpoint.valid ||
             !sequence.long_anchors.empty();
@@ -8675,9 +8716,6 @@ ActiveCaptureResult ProgramImplCore::publish_active_capture(ActiveCaptureTransac
     const bool post_begin_prompt_frontier_capture =
         prefill.cursor == prefill.prompt_tokens && request.lifecycle != Lifecycle::Prefilling;
     ++prefill.next_capture;
-    if (transaction.group.frontier == prefill.prompt_tokens) {
-        sequence.endpoint_frontier = prefill.prompt_tokens;
-    }
     if (const char* trace = std::getenv("NINFER_ADMISSION_TRACE");
         trace != nullptr && trace[0] != '\0') {
         std::fprintf(stderr,
@@ -10219,6 +10257,19 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
                     throw std::logic_error("dropped rewrite StateImage could not be released");
                 }
             }
+            if (const char* trace = std::getenv("NINFER_ADMISSION_TRACE");
+                trace != nullptr && trace[0] != '\0') {
+                std::fprintf(stderr,
+                             "[admission-trace] start-seq: lane=%u reuse=endpoint base=%u "
+                             "refs=%u fork_required=%d ep_valid=%d ep_frontier=%u\n",
+                             lane,
+                             static_cast<unsigned>(base),
+                             state_store->checkpoint_references(sequence.state.read),
+                             request_plan.state_fork_required ? 1 : 0,
+                             sequence.endpoint_valid ? 1 : 0,
+                             static_cast<unsigned>(sequence.endpoint_frontier));
+                std::fflush(stderr);
+            }
             activate_consumed_state(sequence.state.read);
             if (!sequence.kv) {
                 throw std::logic_error("resident prefix has no KV allocation bundle");
@@ -10863,9 +10914,23 @@ void ProgramImplCore::settle_state_fork(SequenceState& sequence) {
     sequence.state.read         = destination;
     sequence.state.write        = destination;
     sequence.state.fork_pending = false;
-    if (!sequence.state_source_retained && state_store->checkpoint_references(source) == 0 &&
-        !state_store->release(source)) {
+    const std::uint32_t source_refs = state_store->checkpoint_references(source);
+    const bool source_released      = !sequence.state_source_retained && source_refs == 0;
+    if (source_released && !state_store->release(source)) {
         throw std::logic_error("unreferenced StateImage fork source could not be released");
+    }
+    if (const char* trace = std::getenv("NINFER_ADMISSION_TRACE");
+        trace != nullptr && trace[0] != '\0') {
+        std::fprintf(stderr,
+                     "[admission-trace] fork-settle: src_refs=%u src_retained=%d src_released=%d "
+                     "exec=%u ep_valid=%d ep_frontier=%u\n",
+                     source_refs,
+                     sequence.state_source_retained ? 1 : 0,
+                     source_released ? 1 : 0,
+                     static_cast<unsigned>(sequence.execution_frontier),
+                     sequence.endpoint_valid ? 1 : 0,
+                     static_cast<unsigned>(sequence.endpoint_frontier));
+        std::fflush(stderr);
     }
     sequence.state_source_retained = false;
     refresh_state_views(sequence);
