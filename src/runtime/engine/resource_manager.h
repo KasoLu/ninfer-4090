@@ -126,6 +126,7 @@ public:
         std::vector<PrefixShortlistKey> exact_resident_keys;
         std::optional<PrefixShortlistKey> selected_source_key;
         std::uint64_t owner = 0;
+        bool pending_origin = false;
     };
 
     enum class CatalogState : std::uint8_t {
@@ -1522,6 +1523,26 @@ private:
         return mask;
     }
 
+    // PREFIX-PLAN P1 (I5): hard-protection mask. Only PENDING (queued, note_pending_demand)
+    // records plus the current request's provisional demand participate. Committed records
+    // (owner == 0, pushed on the publish path) keep their soft credit semantics but must not
+    // hard-protect: an owner is protected only while matching an active/pending request and
+    // releases immediately on terminal (PREFIX-PLAN.md 7-I5).
+    [[nodiscard]] std::uint32_t
+    protection_mask_for(const PrefixShortlistKey& key,
+                        const PrefixDemandRecord& provisional) const noexcept {
+        std::uint32_t mask      = 0;
+        std::uint32_t bit       = 0;
+        const std::size_t begin = demand_window_.size() == kDemandWindowCapacity ? 1U : 0U;
+        for (std::size_t index = begin; index < demand_window_.size(); ++index, ++bit) {
+            if (demand_window_[index].pending_origin && demand_matches(demand_window_[index], key)) {
+                mask |= 1U << bit;
+            }
+        }
+        if (bit < kDemandWindowCapacity && demand_matches(provisional, key)) { mask |= 1U << bit; }
+        return mask;
+    }
+
     [[nodiscard]] std::size_t matching_reuse_domains(const PrefixShortlistKey& key) const noexcept {
         std::array<ReuseDomainId, kDemandWindowCapacity> domains{};
         std::size_t count = 0;
@@ -1991,6 +2012,7 @@ private:
         std::vector<PlanningOwnerRecord> owner_records;
         std::vector<MaterializationOwnerPolicy> owner_policies;
         std::vector<MaterializationCheckpointPolicy> checkpoint_policies;
+        std::vector<PlanningOwnerId> protected_owner_ids;
         candidate_inputs.reserve(candidates.size());
 
         for (std::size_t index = 0; index < candidates.size(); ++index) {
@@ -2062,6 +2084,8 @@ private:
                         .baseline_recovery_ns = price_checkpoint_recovery_work(
                             cost_model_,
                             program.checkpoint_recovery_work(*entry.handle, checkpoint.ref)),
+                            .protection_mask =
+                                protection_mask_for(checkpoint.shortlist_key, provisional_demand),
                     });
                 };
                 if (entry.summary.endpoint) { append_checkpoint(*entry.summary.endpoint); }
@@ -2120,16 +2144,17 @@ private:
                     .baseline_recovery_ns = price_checkpoint_recovery_work(
                         cost_model_, program.checkpoint_recovery_work(
                                          *entry.handle, entry.summary.checkpoint.ref)),
+                    .protection_mask =
+                        protection_mask_for(entry.summary.checkpoint.shortlist_key, provisional_demand),
                 });
             }
 
             // PREFIX-PLAN P1: derive the hard-protection set P from the demand window and the
             // current request's provisional demand. An owner is protected if any of its
-            // checkpoints is matched by at least one demand record.
-            std::vector<PlanningOwnerId> protected_owner_ids;
+            // checkpoints is matched by a pending (queued) or provisional demand record.
             protected_owner_ids.reserve(owner_policies.size());
             for (const auto& cp : checkpoint_policies) {
-                if (cp.demand_mask == 0) { continue; }
+                if (cp.protection_mask == 0) { continue; }
                 bool already = false;
                 for (const auto& po : protected_owner_ids) {
                     if (po == cp.owner) { already = true; break; }
@@ -2528,8 +2553,24 @@ private:
         record.exact_resident_keys.clear();
         record.selected_source_key = std::nullopt;
         record.owner = owner;
+        record.pending_origin = true;
         demand_window_.push_back(std::move(record));
         saturating_increment(demand_epoch_);
+    }
+
+    // PREFIX-PLAN P1 (M3): targeted window exit. Drops this request pending (uncommitted)
+    // demand records when it leaves the queue (admitted / cancelled / expired / errored), per
+    // PREFIX-PLAN.md 3.4 lifecycle. Committed records always carry owner == 0 (the inspect
+    // path never sets it) so they are never touched; request ids start at 1 (engine_core.h).
+    void clear_pending_demand(std::uint64_t owner) noexcept {
+        if (owner == 0) { return; }
+        for (auto it = demand_window_.begin(); it != demand_window_.end();) {
+            if (it->owner == owner && !it->selected_source_key && it->exact_resident_keys.empty()) {
+                it = demand_window_.erase(it);
+            } else {
+                ++it;
+            }
+        }
     }
 
 

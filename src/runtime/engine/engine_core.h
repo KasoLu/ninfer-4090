@@ -1597,6 +1597,7 @@ private:
 
     void on_waiting_removed(const std::shared_ptr<Request>& request) noexcept {
         scheduler_.on_waiting_removed(request->id);
+        resources_.clear_pending_demand(request->id);
     }
 
     void ensure_base_plan(const std::shared_ptr<Request>& request) {
