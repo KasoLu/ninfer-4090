@@ -401,6 +401,12 @@ public:
                         }
                         std::fflush(stderr);
                     }
+                    if (!index.shared) {
+                        const CatalogEntry& key_probe = catalog_[index.slot];
+                        if (key_probe.handle) {
+                            program.debug_trace_prefix_divergence(*key_probe.handle, base);
+                        }
+                    }
                     continue;
                 }
 

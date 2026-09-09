@@ -420,6 +420,14 @@ template <>
 void Program<Variant>::mark_capacity_stalled(SequenceHandle<Variant> sequence) {
     impl_->mark_capacity_stalled(sequence);
 }
+template <>
+void Program<Variant>::debug_trace_prefix_divergence(const ContinuationHandle<Variant>& stored,
+                                                     const RequestBasePlan<Variant>& base) const {
+    if (impl_ != nullptr) {
+        impl_->debug_trace_prefix_divergence(stored, base);
+    }
+}
+
 
 
 

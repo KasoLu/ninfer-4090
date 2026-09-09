@@ -910,6 +910,10 @@ public:
     [[nodiscard]] SequenceGrowth probe_decode_capacity(SequenceHandle<Variant> sequence,
                                                        std::uint32_t remaining) const;
     void mark_capacity_stalled(SequenceHandle<Variant> sequence);
+    // PREFIX-PLAN debug (NINFER_ADMISSION_TRACE): report the first prefix-digest divergence
+    // between a stored continuation's shortlist chain and an incoming base plan's chain.
+    void debug_trace_prefix_divergence(const ContinuationHandle<Variant>& stored,
+                                       const RequestBasePlan<Variant>& base) const;
     [[nodiscard]] PrefillProgress<Variant>
     advance_prefill(SequenceHandle<Variant> sequence,
                     runtime::ExecutionTiming* failed_timing = nullptr);

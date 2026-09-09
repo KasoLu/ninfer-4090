@@ -6449,6 +6449,89 @@ bool ProgramImplCore::valid_shared_prefix(const SharedPrefixHandle& handle) cons
            shared_prefix_slots[index].role == SharedPrefixSlotRole::Catalogued;
 }
 
+void ProgramImplCore::debug_trace_prefix_divergence(const ContinuationHandle& stored,
+                                                    const RequestBasePlan& base) const {
+    if (const char* trace = std::getenv("NINFER_ADMISSION_TRACE");
+        trace == nullptr || trace[0] == '\0') {
+        return;
+    }
+    if (base.impl_ == nullptr) {
+        std::fprintf(stderr, "[admission-trace] divergence: base plan is empty\n");
+        std::fflush(stderr);
+        return;
+    }
+    if (!valid_continuation(stored)) {
+        std::fprintf(stderr, "[admission-trace] divergence: stored continuation is stale\n");
+        std::fflush(stderr);
+        return;
+    }
+    const SequenceState& state = continuation_states[ContractAccess::index(stored)];
+    const qwen3_6::detail::PrefixShortlistDigests& incoming = base.impl_->prefix_digests;
+    const std::size_t overlap =
+        state.prefix_digests.size() < incoming.size() ? state.prefix_digests.size()
+                                                       : incoming.size();
+    std::fprintf(stderr,
+                 "[admission-trace] divergence: stored_size=%llu incoming_size=%llu "
+                 "stored_frontier=%llu ledger_frontier=%llu ledger_tokens=%llu rope_delta=%d "
+                 "in_tag=%llu endpoint_valid=%d anchors=%llu",
+                 static_cast<unsigned long long>(state.prefix_digests.size()),
+                 static_cast<unsigned long long>(incoming.size()),
+                 static_cast<unsigned long long>(state.execution_frontier),
+                 static_cast<unsigned long long>(state.ledger_frontier),
+                 static_cast<unsigned long long>(state.ledger.size()),
+                 static_cast<int>(state.rope_delta),
+                 static_cast<unsigned long long>(base.impl_->prefix_identity_tag),
+                 state.endpoint_valid ? 1 : 0,
+                 static_cast<unsigned long long>(state.long_anchors.size()));
+    for (const LongAnchorCheckpoint& anchor : state.long_anchors) {
+        std::fprintf(stderr, " anchor[front=%llu ord=%llu]",
+                     static_cast<unsigned long long>(anchor.frontier),
+                     static_cast<unsigned long long>(anchor.ordinal));
+    }
+    std::fprintf(stderr, "\n");
+    std::fflush(stderr);
+    std::size_t first = 0;
+    for (std::size_t frontier = 1; frontier <= overlap; ++frontier) {
+        if (state.prefix_digests.at(frontier) != incoming.at(frontier)) {
+            first = frontier;
+            break;
+        }
+    }
+    if (first == 0) {
+        std::fprintf(stderr,
+                     "[admission-trace] divergence: chains identical through %llu (stored "
+                     "frontier exceeds incoming table)\n",
+                     static_cast<unsigned long long>(overlap));
+    } else {
+        const std::array<std::uint64_t, 2> stored_digest = state.prefix_digests.at(first);
+        const std::array<std::uint64_t, 2> incoming_digest = incoming.at(first);
+        std::fprintf(stderr,
+                     "[admission-trace] divergence: first=%llu stored={%llx %llx} "
+                     "incoming={%llx %llx}",
+                     static_cast<unsigned long long>(first),
+                     static_cast<unsigned long long>(stored_digest[0]),
+                     static_cast<unsigned long long>(stored_digest[1]),
+                     static_cast<unsigned long long>(incoming_digest[0]),
+                     static_cast<unsigned long long>(incoming_digest[1]));
+        if (first < state.ledger.size() && first < state.prefix_identity.size()) {
+            const ResidentPrefixIdentity& identity = state.prefix_identity;
+            const std::size_t begin = first >= 4 ? first - 4 : 0;
+            for (std::size_t token = begin; token <= first; ++token) {
+                std::fprintf(stderr,
+                             " | st@%llu tok=%llu tt=%llu p0=%d p1=%d p2=%d",
+                             static_cast<unsigned long long>(token),
+                             static_cast<unsigned long long>(state.ledger[token]),
+                             static_cast<unsigned long long>(identity.token_types()[token]),
+                             static_cast<int>(identity.position_axis(0)[token]),
+                             static_cast<int>(identity.position_axis(1)[token]),
+                             static_cast<int>(identity.position_axis(2)[token]));
+            }
+            std::fprintf(stderr, "\n");
+        }
+    }
+    std::fflush(stderr);
+}
+
 bool ProgramImplCore::valid_capture_offer(const CaptureOffer& offer) const noexcept {
     if (ContractAccess::owner(offer) != this) { return false; }
     const std::uint32_t lane = ContractAccess::lane(offer).value;

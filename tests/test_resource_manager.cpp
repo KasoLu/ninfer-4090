@@ -630,6 +630,13 @@ public:
         return base.isolated_feasible;
     }
 
+    // NINFER_ADMISSION_TRACE probe: no-op for the test fake.
+    void debug_trace_prefix_divergence(const FakeContinuationHandle& stored,
+                                       const FakeRequestBasePlan& base) const {
+        (void)stored;
+        (void)base;
+    }
+
     [[nodiscard]] std::optional<FakeAdmissionCandidate>
     inspect_admission(const FakePreparedPrompt& prompt, const FakeRequestBasePlan& base, LaneId,
                       const FakeContinuationHandle* source,

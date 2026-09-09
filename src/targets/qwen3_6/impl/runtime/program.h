@@ -1272,6 +1272,9 @@ public:
     [[nodiscard]] SequenceGrowth probe_decode_capacity(SequenceHandle sequence,
                                                        std::uint32_t remaining) const;
     void mark_capacity_stalled(SequenceHandle sequence);
+    // PREFIX-PLAN debug (NINFER_ADMISSION_TRACE): first prefix-digest divergence report.
+    void debug_trace_prefix_divergence(const ContinuationHandle& stored,
+                                       const RequestBasePlan& base) const;
     [[nodiscard]] std::uint32_t checkpoint_references(StateImageHandle handle) const noexcept;
     [[nodiscard]] bool try_release_superseded_anchor(std::uint32_t lane);
 };
