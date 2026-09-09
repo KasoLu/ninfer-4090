@@ -487,3 +487,35 @@ P0-a ✅ P0-b ✅ P0-c ✅ P0-d ✅ P0-e(§3.5 重准入，随 d) ✅ P0-f(E4，
 - 降级路径：运行时 offer 被跳过（program transaction 占用）→ endpoint_frontier 恒 0 → D4 三元回落 execution_frontier（legacy endpoint），不 crash
 - battery 影响面（==2U gate）：仅 host_restore / shared_replacement 两引擎新增 plain 组（池=2、host>0 → 内部 HostSnapshot 路径安全）；endpoint 前移至 prompt 边界可能偏移 reuse 量断言 → 4090 ctest 验证
 - 后续：commit+push → 4090 merge --ff-only + ninja → 用户停常驻 GPU 容器后：4090 ctest battery + serve 重跑（NINFER_ADMISSION_TRACE=1，2-3 轮；判据：prompt 边界 key-miss 消失、prefix_cache_hit_tokens ≈ 上轮 prompt_tokens、captures≥1、无 private_owners_evicted）；仍 miss 则上 §4.4-2（inspect_capture 预留槽计费）
+
+## 15.5 v2 修复失效定案 + D6（2026-09-10）
+
+### 失效证据（4090 新二进制 9b727428 复跑，10 轮全 key-miss）
+- 存储 endpoint frontier = execution_frontier − 1（req2 轮：17433+1436=18869，存 18868；ledger=18869 为 token 计数，frontier 为 0 基位置）→ 即 **legacy execution-frontier endpoint**：`endpoint_frontier` 恒 0，D3 从未触发。
+- 私有索引每轮仅 1 条 SessionEndpoint；无 rewrite/anchor 条目 → 所有 capture 均未发布。
+- 结论：D2 组可能已进 plan（gate 按 layouts 池=2 应命中），但断点在 offer→reserve 链路上。
+
+### 断点定位（逐环代码核实）
+1. offer 发射：`wrap_prefill` (:7227-7247) 仅在 `!step.complete` 分支发 offer；prompt 边界组的 offer 由 **commit() 的 prompt-frontier carrier 机制** 发射（program_impl.h:9264-9283）：prefill 末步 `advance_prefill` 末尾 (:11901-11910) 对**所有 backend（含 MTP）** 设 `request.pending = PendingCandidate{.kind = PendingKind::Begin}` 且当下一组在 prompt 边界时保留 prefill 为 carrier → commit() 一致性检查通过后发射 offer。此环无问题。
+2. skip_capture (:7909-7920) 消费组（++next_capture）→ 内部 rewrite 组被 skip 后 commit 时 next_capture 指向 plain 组，一致性检查通过 → offer 会发射。
+3. **真正的断点**：`inspect_capture` (:7564-7584) 对 plain 组（无 rewrite/long_anchor/shared 标志）返回 `publishes_private=false, publishes_shared=false` 的 “empty capture” 早退（代码注释原文 “empty capture has a private replacement”）。引擎侧 `reserve_active_capture`（resource_manager.h:909-913）：`if (!private_baseline.publishes_private || !physically_feasible) → skip_capture`；程序侧 `reserve_active_capture_impl` (:7958-7961) 同样 `!publishes_private && !publishes_shared → skip+Aborted`。**plain 组的 offer 在 reserve 之前被结构性丢弃**——capture 机制根本没有 “无索引发布、仅迁移状态到预留槽” 的语义 → prepare/D3 永远不执行 → endpoint_frontier 恒 0 → legacy endpoint → 100% key-miss。本地 ctest/电池全绿只因 skip 是静默的，无断言覆盖 plain 组发布。
+
+### D6 修复（已应用，program_impl.h inspect_capture，:7578 前插入 13 行）
+```cpp
+if (!group.shared && !group.rewrite && !group.long_anchor &&
+    group.frontier == prefill.prompt_tokens) {
+    const SequenceState& boundary_sequence = active_sequence(lane);
+    assessment.publishes_private   = true;
+    assessment.physically_feasible = boundary_sequence.reserved_state.has_value();
+    return assessment;
+}
+```
+- 语义：prompt 边界的 plain 组 = 状态边界捕获——私有“发布”（仅用于 reserve 通道）但不装索引条目（publish_active_capture 的 publish_private 门仍是 rewrite||long_anchor，plain 不装）；零需求（`CaptureAssessment` 构造器恒分配 `implementation`，零 demand 默认；`state_placement` 默认 `DeviceFork` → prepare 落到 `sequence.reserved_state` 分支 program_impl.h:8256-8259，P2 预留槽已计入 device_occupied，无额外池压力）；可行当且仅当预留槽存在（P2-A：capacity>=2 时 root 恒拿 2 槽 → reserved_state 置位；capacity==1 → 不可行 → 静默 skip → legacy endpoint，优雅降级）。
+- 引擎私有基线通道（resource_manager.h:909-924）随后 `program.reserve_active_capture` → prepare（预留槽 fork）→ publish（D3 置 endpoint_frontier=prompt_tokens；post_begin prefill.reset()）→ finish() fork abort（state.read=冻结的 prompt 边界镜像）→ populate_continuation_summary（D4）发布 SessionEndpoint@prompt_tokens。
+- 若 commit 时仍有其他 capture 事务未决（如 host>0 引擎的 rewrite 事务）→ 引擎 :608-611 `program_transaction → skip_capture` 静默跳过 → 该轮回落 legacy（不崩溃、无 throw）。
+- DFlash 已由 D2 gate 排除（dflash_context_frontier 精确检查阻止早 base 复用）。
+
+### 执行
+- 本地 docker ninja+ctest 全绿后：commit+push → 4090 `git fetch && git merge --ff-only origin/prefix-v2` + ninja → 用户停驻留 GPU 容器后复跑 serve（NINFER_ADMISSION_TRACE=1）2-3 轮。
+- 判据：存储 endpoint frontier 落在 prompt 边界（≈上轮 prompt_tokens，而非 execution_frontier−1）；prefix_cache_hit_tokens>0 ≈ 上轮 prompt_tokens；captures 通道有 reserve/publish 事件；无 eviction；ttft 大幅下降。
+- 若仍 miss → 剩余嫌疑只剩引擎侧 program_transaction 跳过时序（rewrite 事务未决），届时在 reserve/skip/publish 三处补 [admission-trace] 打印再判。

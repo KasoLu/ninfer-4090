@@ -7575,6 +7575,19 @@ ProgramImplCore::inspect_capture(const CaptureOffer& offer, const SharedPrefixHa
     assessment.frontier          = group.frontier;
     assessment.publishes_private = publish_private;
     assessment.publishes_shared  = publish_shared;
+
+    // PREFIX-PLAN v2: a plain capture group pinned to the prompt frontier is a state-boundary
+    // capture: it publishes no index entry and adds no pool pressure because its fork
+    // destination is the sequence's own pre-reserved capture slot (P2 Mechanism A), already
+    // counted in Device State occupancy.  The frozen source image becomes the stored endpoint
+    // at the prompt boundary, where prompt tokens replay identically on both sides.
+    if (!group.shared && !group.rewrite && !group.long_anchor &&
+        group.frontier == prefill.prompt_tokens) {
+        const SequenceState& boundary_sequence = active_sequence(lane);
+        assessment.publishes_private   = true;
+        assessment.physically_feasible = boundary_sequence.reserved_state.has_value();
+        return assessment;
+    }
     if (!publish_private && !publish_shared) {
         if (private_replacement) {
             throw std::invalid_argument("empty capture has a private replacement");
