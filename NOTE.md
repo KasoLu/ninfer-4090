@@ -519,3 +519,44 @@ if (!group.shared && !group.rewrite && !group.long_anchor &&
 - 本地 docker ninja+ctest 全绿后：commit+push → 4090 `git fetch && git merge --ff-only origin/prefix-v2` + ninja → 用户停驻留 GPU 容器后复跑 serve（NINFER_ADMISSION_TRACE=1）2-3 轮。
 - 判据：存储 endpoint frontier 落在 prompt 边界（≈上轮 prompt_tokens，而非 execution_frontier−1）；prefix_cache_hit_tokens>0 ≈ 上轮 prompt_tokens；captures 通道有 reserve/publish 事件；无 eviction；ttft 大幅下降。
 - 若仍 miss → 剩余嫌疑只剩引擎侧 program_transaction 跳过时序（rewrite 事务未决），届时在 reserve/skip/publish 三处补 [admission-trace] 打印再判。
+
+## 15.6 v4 日志定案：inspect_lane 转移过滤器丢弃 plain 边界组（D7）
+
+### v4 运行（instrumented binary 6e7b508c）
+- 仅 `NINFER_ADMISSION_TRACE=1` 生效（全程无 TRIPWIRE 行，含 session=1 → `NINFER_PREFILL_TRIPWIRE` 本次未设置）。
+- round1 req1：prompt=28273（60 messages, tools=13, preserve_thinking, MTP）。plan：`boundary gate=1 groups=4 plain_boundary=1` → **S1 排除**：D2 plain 边界组（frontier=28273=prompt_tokens）确实在 base 计划中；base 组 = {27113 anchor, 28240 anchor, 28268 rewrite ResponseReplay@gen_begin(=28273−5), 28273 plain 边界}。
+- prefill 实际只收到 4 组 {27113, 28240, 28266(shared, 由 select_shared_captures 合并), 28268}——**28273 边界组缺席**。
+- 4 组 offer 全部 `verdict pp=… pf=0 → SKIP (no selection, infeasible)`（2 槽池 root 占满，内部组本就 infeasible，skip 不占槽，行为正确）。
+- `prefill-end: prompt=28273 pfc=0 next=4/4` → 列表里没有边界组 → prefill reset → `carrier: no-prefill (reset)` → **28273 从未有 offer** → D3 从未触发 → `summary: endpoint_frontier=0 exec=28747 stored=28747`（legacy execution-frontier endpoint）。
+- round2：`key-miss slot=0 front=28747`（tag 两侧同 327937），divergence `stored_size=28748 incoming_size=28788 first=28548 | st@28544 tok=553 st@28545 tok=198 st@28546 tok=248069 st@28547 tok=271 st@28548 tok=97625`——生成段首控制簇，与 v1-v3 同一失配模式。
+
+### 根本原因（代码级，不再猜测）
+`ProgramImplCore::inspect_lane`（src/targets/qwen3_6/impl/runtime/request_plan_impl.h:502 起）在 :728-739 做 base→admission-candidate 的 capture 组转移，原 :737：
+
+```cpp
+if (!group.rewrite && !group.shared && !group.long_anchor) { continue; }
+```
+
+该过滤器无条件丢弃所有无标志（plain）组。v2 之前的世界里 plain 组不存在（add_capture 的组都带 rewrite/shared/long_anchor 之一），过滤器是安全的死代码假设；D2 首次引入 plain 组（prompt 边界 endpoint 组），随即被此过滤器在 inspect_lane 阶段静默删除，永远到不了 `Prefill.capture_groups`（program_impl.h:4536 的 `std::move(request_plan.capture_groups)` 直接透传）。于是：offer 永不发射 → D6/D3 永不执行 → endpoint_frontier 恒 0 → 每轮 legacy execution-frontier endpoint → 存储 key 落在生成段尾 → 客户端再序列化的响应在生成段首控制簇即分叉 → 100% key-miss。本地/4090 测试全绿是因为没有任何断言覆盖 "plain 边界组存活过 inspect_lane"。
+
+### D7 修复（已应用）
+request_plan_impl.h 转移过滤器（原 :737）改为：
+
+```cpp
+const bool prompt_boundary = (group.frontier == base.summary.prompt_tokens);
+if (!group.rewrite && !group.shared && !group.long_anchor && !prompt_boundary) {
+    continue;
+}
+```
+
+即仅放行 frontier==prompt_tokens 的 plain 组（= D2 边界组；其他 plain 组在现体系下不存在）。`base` = `const RequestBasePlanImpl&`（:512），`base.summary.prompt_tokens` 在作用域内。
+
+### 预期链路（D7 后）
+round N：prefill 末 cursor==prompt_tokens 时 next_capture 指向边界组 → `prompt_frontier_capture=1` → prefill 保留 → commit carrier 发射 28273 offer → 引擎 verdict（D6：pp=1, pf=reserved_state.has_value()=1）→ reserve → prepare 落 P2-B `sequence.reserved_state` → publish（D3：`endpoint_frontier = prefill.prompt_tokens`）→ 生成（fork dest 积累生成尾）→ finish：abort_fork 丢弃 dest（生成尾态），source（=prompt 边界镜像）freeze 为 CheckpointImmutable，tail_hidden 视图落回 prompt 边界 hidden 槽 → D4 summary endpoint@prompt_tokens（work=make_prefill_work(0, frontier, …)）。
+round N+1：存储 key@prompt_tokens 与 incoming prompt 段逐 token 相同 → PrivateEndpoint ConsumeToActive（D5 planner 校验接受 source->endpoint_frontier）→ 镜像迁移、trim 到 base → 只重 prefill base..new_prompt（其自身边界捕获续链）。
+
+### 验证判据（下一轮 serve，只需 NINFER_ADMISSION_TRACE=1，不再需要 TRIPWIRE）
+1. trace 出现 `publish: lane=0 frontier=<prompt_tokens> endpoint_frontier=<prompt_tokens> prompt=<prompt_tokens>` 与 `summary: endpoint_frontier=<prompt_tokens> exec=<更大值> stored=<prompt_tokens>`；
+2. 后续轮 `prefix_cache_hit_tokens > 0`（≈ 上轮 prompt_tokens），`prefix_reuse_path` 出现 PrivateEndpoint 系（不再恒 root），key-miss 行消失或仅剩尾差；
+3. ttft 从 ~15-19s 降到 ~1-3s；无 eviction/异常。
+4090 同步：`git merge --ff-only origin/prefix-v2` + ninja（devel:0905）。

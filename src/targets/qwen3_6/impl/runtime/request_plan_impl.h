@@ -734,7 +734,12 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
              !desired || group.frontier != desired->frontier || *group.rewrite != desired->kind)) {
             group.rewrite.reset();
         }
-        if (!group.rewrite && !group.shared && !group.long_anchor) { continue; }
+        // PREFIX-PLAN v2: retain the plain prompt-boundary endpoint group (frontier ==
+        // prompt_tokens) created by plan_request; every other flagless group is inert.
+        const bool prompt_boundary = (group.frontier == base.summary.prompt_tokens);
+        if (!group.rewrite && !group.shared && !group.long_anchor && !prompt_boundary) {
+            continue;
+        }
         plan->capture_groups.push_back(std::move(group));
     }
     plan->shared_candidates.reserve(base.shared_candidates.size());
