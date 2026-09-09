@@ -7813,7 +7813,7 @@ runtime::ContextTransactionReserveStatus ProgramImplCore::reserve_active_capture
         skip_capture(std::move(offer));
         return runtime::ContextTransactionReserveStatus::Aborted;
     }
-    const CaptureAssessment assessment = inspect_capture(
+    CaptureAssessment assessment = inspect_capture(
         offer, exact_shared, replacement, private_replacement, permit_shared_publication);
     if (!assessment.publishes_private && !assessment.publishes_shared) {
         skip_capture(std::move(offer));
@@ -7839,6 +7839,7 @@ runtime::ContextTransactionReserveStatus ProgramImplCore::reserve_active_capture
                 skip_capture(std::move(offer));
                 return runtime::ContextTransactionReserveStatus::Aborted;
             }
+            assessment = std::move(reassessed);
         } else {
             skip_capture(std::move(offer));
             return runtime::ContextTransactionReserveStatus::Aborted;
