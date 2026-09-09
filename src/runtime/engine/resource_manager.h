@@ -10,6 +10,7 @@
 #include <array>
 #include <bit>
 #include <chrono>
+#include <cstdio>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -275,6 +276,12 @@ public:
                                      const RequestBasePlan& base, std::uint64_t publication_order) {
         if (!std::holds_alternative<std::monostate>(transaction_) ||
             program.has_context_transaction()) {
+            if (const char* trace = std::getenv("NINFER_ADMISSION_TRACE");
+                trace != nullptr && trace[0] != '\0') {
+                std::fprintf(stderr,
+                             "[admission-trace] inspect: blocked (open transaction)\n");
+                std::fflush(stderr);
+            }
             return {.readiness = Readiness::TemporarilyBlocked};
         }
         if (publication_order == 0) {
@@ -290,7 +297,15 @@ public:
                 break;
             }
         }
-        if (!destination) { return {.readiness = Readiness::TemporarilyBlocked}; }
+        if (!destination) {
+            if (const char* trace = std::getenv("NINFER_ADMISSION_TRACE");
+                trace != nullptr && trace[0] != '\0') {
+                std::fprintf(stderr,
+                             "[admission-trace] inspect: blocked (no free lane)\n");
+                std::fflush(stderr);
+            }
+            return {.readiness = Readiness::TemporarilyBlocked};
+        }
 
         const typename Planner::Clock::time_point planning_started = Planner::Clock::now();
         rebuild_prefix_index();
@@ -397,7 +412,17 @@ public:
         std::optional<Choice> selected =
             plan_materialization(program, prompt, base, *destination, candidates, publication_order,
                                  planning_started, provisional_demand);
-        if (!selected) { return {.readiness = Readiness::TemporarilyBlocked}; }
+        if (!selected) {
+            if (const char* trace = std::getenv("NINFER_ADMISSION_TRACE");
+                trace != nullptr && trace[0] != '\0') {
+                std::fprintf(stderr,
+                             "[admission-trace] inspect: blocked (no selection; "
+                             "candidates=%llu)\n",
+                             static_cast<unsigned long long>(candidates.size()));
+                std::fflush(stderr);
+            }
+            return {.readiness = Readiness::TemporarilyBlocked};
+        }
         return {
             .readiness = selected->needs_transfer() ? Readiness::NeedsTransfer : Readiness::Ready,
             .choice    = std::move(selected),

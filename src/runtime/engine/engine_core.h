@@ -18,6 +18,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -1891,6 +1892,15 @@ private:
                 scheduler_.active_admission_set(slots_, max_concurrency_);
             if (active.size == 0) {
                 throw std::logic_error("isolated-feasible request is blocked in an idle Engine");
+                if (const char* trace = std::getenv("NINFER_ADMISSION_TRACE");
+                    trace != nullptr && trace[0] != '\0') {
+                    std::fprintf(stderr,
+                                 "[admission-trace] IDLE-BLOCK head=%llu readiness=%d active=%llu\n",
+                                 static_cast<unsigned long long>(head->id),
+                                 static_cast<int>(head_inspection.readiness),
+                                 static_cast<unsigned long long>(active.size));
+                    std::fflush(stderr);
+                }
             }
             if (!scheduler_.protect_blocked_head(head->id, active.span(),
                                                  instance_.program->resource_revision())) {

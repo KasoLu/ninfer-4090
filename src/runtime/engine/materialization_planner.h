@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdio>
 #include <cstdint>
 #include <limits>
 #include <optional>
@@ -273,6 +274,25 @@ public:
                 session.root_maximal_target(candidates[root_candidate_index].id);
             AssessedPressureTarget assessed            = session.assess(root_maximal);
             const PressureTargetAssessment& assessment = assessed.assessment();
+            if (const char* trace = std::getenv("NINFER_ADMISSION_TRACE");
+                trace != nullptr && trace[0] != '\0') {
+                std::fprintf(stderr,
+                             "[admission-trace] planner root: status=%llu owners=%llu",
+                             static_cast<unsigned long long>(assessment.physical_status),
+                             static_cast<unsigned long long>(pressure.protected_owners.size()));
+                std::fprintf(stderr, " outcomes=");
+                for (const auto& outcome : assessment.owner_outcomes) {
+                    std::fprintf(stderr, "%llu:%llu ",
+                                 static_cast<unsigned long long>(outcome.owner.value),
+                                 static_cast<unsigned long long>(outcome.disposition));
+                }
+                std::fprintf(stderr, " protected=");
+                for (const auto& po : pressure.protected_owners) {
+                    std::fprintf(stderr, "%llu ", static_cast<unsigned long long>(po.value));
+                }
+                std::fprintf(stderr, "\n");
+                std::fflush(stderr);
+            }
             if (assessment.candidate != candidates[root_candidate_index].id) {
                 throw std::logic_error("maximal pressure target changed admission candidate");
             }
@@ -282,7 +302,17 @@ public:
             for (const auto& outcome : assessment.owner_outcomes) {
                 if (outcome.disposition != VictimDisposition::Evicted) { continue; }
                 for (const auto& po : pressure.protected_owners) {
-                    if (po == outcome.owner) { return std::nullopt; }
+                    if (po == outcome.owner) {
+                        if (const char* trace = std::getenv("NINFER_ADMISSION_TRACE");
+                            trace != nullptr && trace[0] != '\0') {
+                            std::fprintf(stderr,
+                                         "[admission-trace] planner root: PRUNED (hard "
+                                         "protection; evicted owner=%llu)\n",
+                                         static_cast<unsigned long long>(outcome.owner.value));
+                            std::fflush(stderr);
+                        }
+                        return std::nullopt;
+                    }
                 }
             }
             std::optional<LogicalGoal> goal;
@@ -290,7 +320,21 @@ public:
                 goal = logical_goal(assessment.candidate, assessment.source_mode,
                                     assessment.owner_outcomes);
             }
-            if (!goal) { return std::nullopt; }
+            if (!goal) {
+                if (const char* trace = std::getenv("NINFER_ADMISSION_TRACE");
+                    trace != nullptr && trace[0] != '\0') {
+                    std::fprintf(stderr,
+                                 "[admission-trace] planner root: goal null (status=%llu "
+                                 "logical_goal_failed=%d)\n",
+                                 static_cast<unsigned long long>(assessment.physical_status),
+                                 static_cast<int>(assessment.physical_status ==
+                                                  MaterializationPhysicalStatus::Feasible
+                                                      ? 1
+                                                      : 0));
+                    std::fflush(stderr);
+                }
+                return std::nullopt;
+            }
             const FoldedCost cost =
                 fold_assessment(candidates[root_candidate_index], assessment, pressure.owner_policy,
                                 pressure.checkpoint_policy, machine_cost);

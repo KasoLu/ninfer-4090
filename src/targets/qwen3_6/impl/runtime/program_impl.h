@@ -1257,7 +1257,18 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_admission(
 
     std::optional<AdmissionCandidate> plan = inspect_lane(
         lane, prompt, base, source_state, shared_state, checkpoint, must_retain_private_source);
-    if (!plan) { return std::nullopt; }
+    if (!plan) {
+        if (const char* trace = std::getenv("NINFER_ADMISSION_TRACE");
+            trace != nullptr && trace[0] != '\0') {
+            std::fprintf(stderr,
+                         "[admission-trace] inspect_lane rejected candidate (source=%d "
+                         "shared=%d)\n",
+                         static_cast<int>(source != nullptr),
+                         static_cast<int>(shared_source != nullptr));
+            std::fflush(stderr);
+        }
+        return std::nullopt;
+    }
     plan->impl_->destination       = destination;
     plan->impl_->destination_epoch = lane_epochs[lane];
     plan->impl_->has_source        = source != nullptr;
@@ -1280,6 +1291,28 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_admission(
         identity_status == runtime::PreflightStatus::Ready
             ? runtime::MaterializationPhysicalStatus::Feasible
             : runtime::MaterializationPhysicalStatus::Infeasible;
+        if (const char* trace = std::getenv("NINFER_ADMISSION_TRACE");
+            trace != nullptr && trace[0] != '\0') {
+            const detail::PhysicalResources deficit = plan->impl_->identity_pressure_deficit;
+            std::fprintf(stderr,
+                         "[admission-trace] inspect_admission: source=%d shared=%d "
+                         "reuse_tokens=%llu preflight=%lld identity=%lld deficit{dev "
+                         "lanes=%llu slots=%llu main=%llu backend=%llu; host slots=%llu "
+                         "kv=%llu}\n",
+                         static_cast<int>(plan->impl_->has_source ? 1 : 0),
+                         static_cast<int>(plan->impl_->has_shared_source ? 1 : 0),
+                         static_cast<unsigned long long>(
+                             plan->impl_->summary.reusable_prompt_tokens),
+                         static_cast<long long>(identity_status),
+                         static_cast<long long>(plan->impl_->identity_assessment.physical_status),
+                         static_cast<unsigned long long>(deficit.device.active_lanes),
+                         static_cast<unsigned long long>(deficit.device.state_slots),
+                         static_cast<unsigned long long>(deficit.device.main_kv_pages),
+                         static_cast<unsigned long long>(deficit.device.backend_kv_pages),
+                         static_cast<unsigned long long>(deficit.host.state_slots),
+                         static_cast<unsigned long long>(deficit.host.kv_bytes));
+            std::fflush(stderr);
+        }
     plan->impl_->identity_assessment.source_mode = plan->impl_->source_mode;
     plan->impl_->identity_assessment.pressure_may_change_machine_work =
         plan->impl_->has_source &&
