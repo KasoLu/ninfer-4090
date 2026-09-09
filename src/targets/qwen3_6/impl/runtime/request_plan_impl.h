@@ -326,6 +326,21 @@ RequestBasePlan ProgramImplCore::plan_request(const PreparedPromptData& prompt,
         base->prefix_identity_tag =
             capture_identity_tag(speculative_backend, proposal_head, kv_dtype);
     }
+    if (const char* trace = std::getenv("NINFER_ADMISSION_TRACE");
+        trace != nullptr && trace[0] != '\0') {
+        std::fprintf(stderr,
+                     "[admission-trace] plan: prompt=%llu allow=%d reusable=%d cc=%d store=%d cap=%llu backend=%d\n",
+                     static_cast<unsigned long long>(base->summary.prompt_tokens),
+                     static_cast<int>(options.allow_prefix_reuse),
+                     static_cast<int>(prompt.identity.reusable),
+                     static_cast<int>(context_cache.enabled),
+                     static_cast<int>(state_store != nullptr),
+                     static_cast<unsigned long long>(state_store != nullptr
+                                                       ? state_store->device_capacity()
+                                                       : 0),
+                     static_cast<int>(static_cast<int>(speculative_backend)));
+        std::fflush(stderr);
+    }
     if (options.allow_prefix_reuse && prompt.identity.reusable && context_cache.enabled) {
         const auto add_capture = [&](std::uint32_t frontier, std::uint32_t input_order,
                                      std::optional<RewriteCheckpointKind> rewrite, bool shared,
@@ -392,6 +407,24 @@ RequestBasePlan ProgramImplCore::plan_request(const PreparedPromptData& prompt,
             }
             boundary_group->rewrite.reset();
             boundary_group->long_anchor = false;
+        }
+        if (const char* trace = std::getenv("NINFER_ADMISSION_TRACE");
+            trace != nullptr && trace[0] != '\0') {
+            const std::uint32_t boundary    = base->summary.prompt_tokens;
+            const bool boundary_plain       =
+                std::any_of(base->capture_groups.begin(), base->capture_groups.end(),
+                            [boundary](const CaptureGroup& group) {
+                                return group.frontier == boundary && !group.rewrite &&
+                                       !group.long_anchor && !group.shared;
+                            });
+            std::fprintf(stderr,
+                         "[admission-trace] plan: boundary gate=%d groups=%llu plain_boundary=%d\n",
+                         static_cast<int>(state_store != nullptr &&
+                                         state_store->device_capacity() == 2U &&
+                                         speculative_backend != SpeculativeBackend::DFlash),
+                         static_cast<unsigned long long>(base->capture_groups.size()),
+                         static_cast<int>(boundary_plain ? 1 : 0));
+            std::fflush(stderr);
         }
         std::shared_ptr<const PreparedCaptureBacking> capture_backing;
         if (!base->capture_groups.empty() || !base->shared_candidates.empty()) {

@@ -18,6 +18,7 @@
 #include <array>
 #include <chrono>
 #include <cstdio>
+#include <atomic>
 #include <cstring>
 #include <exception>
 #include <iterator>
@@ -7242,6 +7243,20 @@ PrefillProgress ProgramImplCore::wrap_prefill(std::uint32_t lane, runtime::Prefi
         out.capture.emplace(
             ContractAccess::make_capture_offer(this, runtime::LaneId{lane}, lane_epochs[lane],
                                                requests[lane].prefill->pending_capture_offer));
+        if (const char* trace = std::getenv("NINFER_ADMISSION_TRACE");
+            trace != nullptr && trace[0] != '\0') {
+            std::fprintf(stderr,
+                         "[admission-trace] offer: lane=%u id=%llu (interior frontier=%u)\n",
+                         static_cast<unsigned>(lane),
+                         static_cast<unsigned long long>(requests[lane].prefill->pending_capture_offer),
+                         static_cast<unsigned>(requests[lane].prefill->next_capture <
+                                                      requests[lane].prefill->capture_groups.size()
+                                                  ? requests[lane].prefill
+                                                        ->capture_groups[requests[lane].prefill->next_capture]
+                                                        .frontier
+                                                  : 0U));
+            std::fflush(stderr);
+        }
     }
     return out;
 }
@@ -7429,6 +7444,15 @@ void ProgramImplCore::populate_continuation_summary(const SequenceState& sequenc
                 : sequence.rebuild_work;
         summary.endpoint =
             checkpoint_summary(sequence, endpoint, sequence.state.read, endpoint_work);
+        if (const char* trace = std::getenv("NINFER_ADMISSION_TRACE");
+            trace != nullptr && trace[0] != '\0') {
+            std::fprintf(stderr,
+                         "[admission-trace] summary: endpoint_frontier=%u exec=%u stored=%u\n",
+                         static_cast<unsigned>(sequence.endpoint_frontier),
+                         static_cast<unsigned>(sequence.execution_frontier),
+                         static_cast<unsigned>(endpoint_frontier));
+            std::fflush(stderr);
+        }
     }
     if (sequence.rewrite_checkpoint.valid) {
         if (!sequence.rewrite_state) {
@@ -7922,6 +7946,21 @@ ProgramImplCore::make_capture_physical_candidate(const CaptureAssessment& assess
 void ProgramImplCore::skip_capture(CaptureOffer&& offer) {
     if (!valid_capture_offer(offer)) { throw std::logic_error("capture offer is not skippable"); }
     const std::uint32_t lane = ContractAccess::lane(offer).value;
+    if (const char* trace = std::getenv("NINFER_ADMISSION_TRACE");
+        trace != nullptr && trace[0] != '\0') {
+        const RequestControl::Prefill& trace_prefill = *requests[lane].prefill;
+        std::fprintf(stderr,
+                     "[admission-trace] program: lane=%u SKIP frontier=%u next=%u/%u cursor=%u prompt=%u\n",
+                     static_cast<unsigned>(lane),
+                     static_cast<unsigned>(trace_prefill.next_capture < trace_prefill.capture_groups.size()
+                                             ? trace_prefill.capture_groups[trace_prefill.next_capture].frontier
+                                             : 0U),
+                     static_cast<unsigned>(trace_prefill.next_capture),
+                     static_cast<unsigned>(trace_prefill.capture_groups.size()),
+                     static_cast<unsigned>(trace_prefill.cursor),
+                     static_cast<unsigned>(trace_prefill.prompt_tokens));
+        std::fflush(stderr);
+    }
     ContractAccess::consume(offer);
     RequestControl::Prefill& prefill = *requests[lane].prefill;
     prefill.pending_capture_offer    = 0;
@@ -8007,6 +8046,21 @@ runtime::ContextTransactionReserveStatus ProgramImplCore::reserve_active_capture
     transaction.lane                = lane;
     transaction.lane_epoch          = lane_epochs[lane];
     transaction.group               = prefill.capture_groups[prefill.next_capture];
+    if (const char* trace = std::getenv("NINFER_ADMISSION_TRACE");
+        trace != nullptr && trace[0] != '\0') {
+        std::fprintf(stderr,
+                     "[admission-trace] program: lane=%u RESERVE frontier=%u pp=%d pf=%d placement=%d reserved=%d rw=%d la=%d sh=%d\n",
+                     static_cast<unsigned>(lane),
+                     static_cast<unsigned>(transaction.group.frontier),
+                     static_cast<int>(transaction.publish_private),
+                     static_cast<int>(assessment.physically_feasible),
+                     static_cast<int>(static_cast<int>(transaction.state_placement)),
+                     static_cast<int>(sequence.reserved_state ? 1 : 0),
+                     static_cast<int>(transaction.group.rewrite ? 1 : 0),
+                     static_cast<int>(transaction.group.long_anchor),
+                     static_cast<int>(transaction.group.shared));
+        std::fflush(stderr);
+    }
     transaction.publish_private     = assessment.publishes_private;
     transaction.publish_shared      = assessment.publishes_shared;
     transaction.private_replacement = private_replacement;
@@ -8276,6 +8330,18 @@ void ProgramImplCore::prepare_active_capture(ActiveCaptureTransaction& transacti
             throw std::logic_error("selected capture has no prepared Device State capacity");
         }
         transaction.destination_state = *destination;
+    }
+    if (const char* trace = std::getenv("NINFER_ADMISSION_TRACE");
+        trace != nullptr && trace[0] != '\0') {
+        const char* dest = transaction.state_placement == qwen3_6::CaptureStatePlacement::HostSnapshot
+                               ? "host"
+                               : (transaction.recycles_private_state ? "recycle" : "device");
+        std::fprintf(stderr,
+                     "[admission-trace] prepare: lane=%u frontier=%u dest=%s reserved_left=%d\n",
+                     static_cast<unsigned>(transaction.lane),
+                     static_cast<unsigned>(transaction.group.frontier), dest,
+                     static_cast<int>(sequence.reserved_state ? 1 : 0));
+        std::fflush(stderr);
     }
 
     if (transaction.publish_shared) {
@@ -8591,6 +8657,16 @@ ActiveCaptureResult ProgramImplCore::publish_active_capture(ActiveCaptureTransac
     ++prefill.next_capture;
     if (transaction.group.frontier == prefill.prompt_tokens) {
         sequence.endpoint_frontier = prefill.prompt_tokens;
+    }
+    if (const char* trace = std::getenv("NINFER_ADMISSION_TRACE");
+        trace != nullptr && trace[0] != '\0') {
+        std::fprintf(stderr,
+                     "[admission-trace] publish: lane=%u frontier=%u endpoint_frontier=%u prompt=%u\n",
+                     static_cast<unsigned>(transaction.lane),
+                     static_cast<unsigned>(transaction.group.frontier),
+                     static_cast<unsigned>(sequence.endpoint_frontier),
+                     static_cast<unsigned>(prefill.prompt_tokens));
+        std::fflush(stderr);
     }
     if (post_begin_prompt_frontier_capture) { request.prefill.reset(); }
     transaction.published = true;
@@ -9278,6 +9354,21 @@ CommitResult ProgramImplCore::commit(PendingBatch&& pending,
             RequestControl& request = requests[lanes[row]];
             if (decisions[row].terminal) {
                 request.prefill.reset();
+                if (const char* trace = std::getenv("NINFER_ADMISSION_TRACE");
+                    trace != nullptr && trace[0] != '\0') {
+                    std::fprintf(stderr, "[admission-trace] carrier: lane=%u terminal-reset\n",
+                                 static_cast<unsigned>(lanes[row]));
+                    std::fflush(stderr);
+                }
+                continue;
+            }
+            if (!request.prefill) {
+                if (const char* trace = std::getenv("NINFER_ADMISSION_TRACE");
+                    trace != nullptr && trace[0] != '\0') {
+                    std::fprintf(stderr, "[admission-trace] carrier: lane=%u no-prefill (reset)\n",
+                                 static_cast<unsigned>(lanes[row]));
+                    std::fflush(stderr);
+                }
                 continue;
             }
             if (!request.prefill) { continue; }
@@ -9286,6 +9377,21 @@ CommitResult ProgramImplCore::commit(PendingBatch&& pending,
                 prefill.next_capture >= prefill.capture_groups.size() ||
                 prefill.capture_groups[prefill.next_capture].frontier != prefill.prompt_tokens ||
                 prefill.pending_capture_offer != 0) {
+                if (const char* trace = std::getenv("NINFER_ADMISSION_TRACE");
+                    trace != nullptr && trace[0] != '\0') {
+                    std::fprintf(stderr,
+                                 "[admission-trace] carrier: lane=%u INCONSISTENT cursor=%u prompt=%u next=%u/%u front=%u offer=%llu\n",
+                                 static_cast<unsigned>(lanes[row]),
+                                 static_cast<unsigned>(prefill.cursor),
+                                 static_cast<unsigned>(prefill.prompt_tokens),
+                                 static_cast<unsigned>(prefill.next_capture),
+                                 static_cast<unsigned>(prefill.capture_groups.size()),
+                                 static_cast<unsigned>(prefill.next_capture < prefill.capture_groups.size()
+                                                         ? prefill.capture_groups[prefill.next_capture].frontier
+                                                         : 0U),
+                                 static_cast<unsigned long long>(prefill.pending_capture_offer));
+                    std::fflush(stderr);
+                }
                 throw std::logic_error("prompt-frontier capture carrier is inconsistent");
             }
             if (++next_capture_offer_id_ == 0) { ++next_capture_offer_id_; }
@@ -9293,6 +9399,15 @@ CommitResult ProgramImplCore::commit(PendingBatch&& pending,
             out.captures[row].emplace(ContractAccess::make_capture_offer(
                 this, runtime::LaneId{lanes[row]}, lane_epochs[lanes[row]],
                 prefill.pending_capture_offer));
+            if (const char* trace = std::getenv("NINFER_ADMISSION_TRACE");
+                trace != nullptr && trace[0] != '\0') {
+                std::fprintf(stderr,
+                             "[admission-trace] carrier: lane=%u OFFER frontier=%u id=%llu\n",
+                             static_cast<unsigned>(lanes[row]),
+                             static_cast<unsigned>(prefill.prompt_tokens),
+                             static_cast<unsigned long long>(prefill.pending_capture_offer));
+                std::fflush(stderr);
+            }
         }
         if (released_resource) { advance_resource_revision(); }
         out.timing = timing.finish();
@@ -11654,6 +11769,23 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
     }
 
     RequestControl::Prefill& staged = *request.prefill;
+    if (staged.cursor == staged.base) {
+        static std::atomic<std::uint32_t> prefill_session_counter{0};
+        const std::uint32_t prefill_session = prefill_session_counter.fetch_add(1) + 1;
+        if (const char* tripwire = std::getenv("NINFER_PREFILL_TRIPWIRE");
+            tripwire != nullptr && tripwire[0] != '\0') {
+            std::fprintf(stderr,
+                         "[admission-trace] TRIPWIRE: prefill session=%u prompt=%u base=%u\n",
+                         static_cast<unsigned>(prefill_session),
+                         static_cast<unsigned>(staged.prompt_tokens),
+                         static_cast<unsigned>(staged.base));
+            std::fflush(stderr);
+            if (prefill_session > 1) {
+                throw std::logic_error(
+                    "NINFER_PREFILL_TRIPWIRE: prefill session 2 triggered - prefix reuse not effective; aborting to capture logs");
+            }
+        }
+    }
     if (staged.pending_capture_offer != 0) {
         throw std::logic_error("prefill cannot advance while a capture offer is pending");
     }
@@ -11915,6 +12047,19 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
             staged.next_capture < staged.capture_groups.size() &&
             staged.capture_groups[staged.next_capture].frontier == prompt_tokens;
         if (!prompt_frontier_capture) { request.prefill.reset(); }
+        if (const char* trace = std::getenv("NINFER_ADMISSION_TRACE");
+            trace != nullptr && trace[0] != '\0') {
+            std::fprintf(stderr,
+                         "[admission-trace] prefill-end: prompt=%u pfc=%d next=%u/%u next_frontier=%u\n",
+                         static_cast<unsigned>(prompt_tokens),
+                         static_cast<int>(prompt_frontier_capture ? 1 : 0),
+                         static_cast<unsigned>(staged.next_capture),
+                         static_cast<unsigned>(staged.capture_groups.size()),
+                         static_cast<unsigned>(staged.next_capture < staged.capture_groups.size()
+                                                   ? staged.capture_groups[staged.next_capture].frontier
+                                                   : 0U));
+            std::fflush(stderr);
+        }
         request.pending   = PendingCandidate{.kind          = PendingKind::Begin,
                                              .base_E        = 0,
                                              .base_S        = 0,

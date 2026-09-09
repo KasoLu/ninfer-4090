@@ -606,6 +606,13 @@ public:
             throw std::logic_error("capture observes inconsistent transaction ownership");
         }
         if (program_transaction) {
+            if (const char* trace = std::getenv("NINFER_ADMISSION_TRACE");
+                trace != nullptr && trace[0] != '\0') {
+                std::fprintf(stderr,
+                             "[admission-trace] engine: lane=%u capture SKIP (program transaction open)\n",
+                             static_cast<unsigned>(lane.value));
+                std::fflush(stderr);
+            }
             program.skip_capture(std::move(offer));
             return ActiveCaptureReserveResult::Skipped;
         }
@@ -628,6 +635,18 @@ public:
 
         CaptureAssessment candidate =
             program.inspect_capture(offer, nullptr, nullptr, private_replacement, true);
+        if (const char* trace = std::getenv("NINFER_ADMISSION_TRACE");
+            trace != nullptr && trace[0] != '\0') {
+            std::fprintf(stderr,
+                         "[admission-trace] engine: lane=%u verdict pp=%d pf=%d shared=%d base_pf=%d base_pp=%d\n",
+                         static_cast<unsigned>(lane.value),
+                         static_cast<int>(candidate.publishes_private),
+                         static_cast<int>(candidate.physically_feasible),
+                         static_cast<int>(candidate.publishes_shared),
+                         static_cast<int>(private_baseline.physically_feasible),
+                         static_cast<int>(private_baseline.publishes_private));
+            std::fflush(stderr);
+        }
         const SharedPrefixHandle* exact_shared = nullptr;
         if (candidate.publishes_shared) {
             for (const PrefixIndexEntry& index : prefix_index_) {
@@ -645,6 +664,13 @@ public:
         if (exact_shared != nullptr) {
             if (!private_baseline.publishes_private || !private_baseline.physically_feasible) {
                 program.skip_capture(std::move(offer));
+                if (const char* trace = std::getenv("NINFER_ADMISSION_TRACE");
+                    trace != nullptr && trace[0] != '\0') {
+                    std::fprintf(stderr,
+                                 "[admission-trace] engine: lane=%u capture SKIP (exact shared, infeasible)\n",
+                                 static_cast<unsigned>(lane.value));
+                    std::fflush(stderr);
+                }
                 return ActiveCaptureReserveResult::Skipped;
             }
             transaction_.template emplace<ActiveCaptureRecord>(ActiveCaptureRecord{
@@ -656,6 +682,12 @@ public:
             if (reserved == ContextTransactionReserveStatus::Aborted) {
                 transaction_.template emplace<std::monostate>();
                 return ActiveCaptureReserveResult::Skipped;
+            }
+            if (const char* trace = std::getenv("NINFER_ADMISSION_TRACE");
+                trace != nullptr && trace[0] != '\0') {
+                std::fprintf(stderr, "[admission-trace] engine: lane=%u capture RESERVE (exact shared)\n",
+                             static_cast<unsigned>(lane.value));
+                std::fflush(stderr);
             }
             return ActiveCaptureReserveResult::Reserved;
         }
@@ -908,6 +940,13 @@ public:
 
         if (!selected) {
             if (!private_baseline.publishes_private || !private_baseline.physically_feasible) {
+                if (const char* trace = std::getenv("NINFER_ADMISSION_TRACE");
+                    trace != nullptr && trace[0] != '\0') {
+                    std::fprintf(stderr,
+                                 "[admission-trace] engine: lane=%u capture SKIP (no selection, infeasible)\n",
+                                 static_cast<unsigned>(lane.value));
+                    std::fflush(stderr);
+                }
                 program.skip_capture(std::move(offer));
                 return ActiveCaptureReserveResult::Skipped;
             }
@@ -917,6 +956,13 @@ public:
             });
             const ContextTransactionReserveStatus reserved = program.reserve_active_capture(
                 std::move(offer), nullptr, nullptr, private_replacement, false, cancellation);
+            if (const char* trace = std::getenv("NINFER_ADMISSION_TRACE");
+                trace != nullptr && trace[0] != '\0') {
+                std::fprintf(stderr, "[admission-trace] engine: lane=%u capture reserve_status=%d\n",
+                             static_cast<unsigned>(lane.value),
+                             static_cast<int>(static_cast<int>(reserved)));
+                std::fflush(stderr);
+            }
             if (reserved == ContextTransactionReserveStatus::Aborted) {
                 transaction_.template emplace<std::monostate>();
                 return ActiveCaptureReserveResult::Skipped;
