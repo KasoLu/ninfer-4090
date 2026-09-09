@@ -310,6 +310,29 @@ public:
 
         const typename Planner::Clock::time_point planning_started = Planner::Clock::now();
         rebuild_prefix_index();
+        if (const char* trace = std::getenv("NINFER_ADMISSION_TRACE");
+            trace != nullptr && trace[0] != '\0') {
+            std::fprintf(stderr,
+                         "[admission-trace] inspect: index entries=%llu base_prompt=%llu",
+                         static_cast<unsigned long long>(prefix_index_.size()),
+                         static_cast<unsigned long long>(base.summary().prompt_tokens));
+            for (const PrefixIndexEntry& item : prefix_index_) {
+                if (!item.occupied) { continue; }
+                std::fprintf(stderr,
+                             " | slot=%llu shared=%d kind=%llu front=%llu ord=%llu",
+                             static_cast<unsigned long long>(item.slot),
+                             static_cast<int>(item.shared ? 1 : 0),
+                             static_cast<unsigned long long>(item.checkpoint.kind),
+                             static_cast<unsigned long long>(item.checkpoint.frontier),
+                             static_cast<unsigned long long>(item.checkpoint.ordinal));
+                if constexpr (requires { item.key.identity_tag; }) {
+                    std::fprintf(stderr, " tag=%llu",
+                                 static_cast<unsigned long long>(item.key.identity_tag));
+                }
+            }
+            std::fprintf(stderr, "\n");
+            std::fflush(stderr);
+        }
         PrefixDemandRecord provisional_demand;
         provisional_demand.domain =
             reuse_domain(base.context_cache().session_key, publication_order);
@@ -337,10 +360,49 @@ public:
 
         if (cache_enabled_) {
             for (const PrefixIndexEntry& index : prefix_index_) {
-                if (!valid_prefix_index_entry(index)) { continue; }
+                if (!valid_prefix_index_entry(index)) {
+                    if (const char* trace = std::getenv("NINFER_ADMISSION_TRACE");
+                        trace != nullptr && trace[0] != '\0') {
+                        std::fprintf(stderr,
+                                     "[admission-trace] index-invalid slot=%llu shared=%d "
+                                     "kind=%llu front=%llu owner=%llu rev=%llu occupied=%d\n",
+                                     static_cast<unsigned long long>(index.slot),
+                                     static_cast<int>(index.shared ? 1 : 0),
+                                     static_cast<unsigned long long>(index.checkpoint.kind),
+                                     static_cast<unsigned long long>(index.checkpoint.frontier),
+                                     static_cast<unsigned long long>(index.owner_id),
+                                     static_cast<unsigned long long>(index.revision),
+                                     static_cast<int>(index.occupied ? 1 : 0));
+                        std::fflush(stderr);
+                    }
+                    continue;
+                }
                 const std::optional<PrefixShortlistKey> incoming =
                     base.prefix_shortlist_key(index.key.frontier);
-                if (!incoming || *incoming != index.key) { continue; }
+                if (!incoming || *incoming != index.key) {
+                    if (const char* trace = std::getenv("NINFER_ADMISSION_TRACE");
+                        trace != nullptr && trace[0] != '\0') {
+                        std::fprintf(stderr,
+                                     "[admission-trace] key-miss slot=%llu shared=%d kind=%llu "
+                                     "front=%llu ord=%llu incoming=%d",
+                                     static_cast<unsigned long long>(index.slot),
+                                     static_cast<int>(index.shared ? 1 : 0),
+                                     static_cast<unsigned long long>(index.checkpoint.kind),
+                                     static_cast<unsigned long long>(index.key.frontier),
+                                     static_cast<unsigned long long>(index.checkpoint.ordinal),
+                                     incoming.has_value() ? 1 : 0);
+                        if constexpr (requires { index.key.identity_tag; }) {
+                            std::fprintf(stderr, " tag=%llu in_tag=%llu\n",
+                                         static_cast<unsigned long long>(index.key.identity_tag),
+                                         incoming ? static_cast<unsigned long long>(incoming->identity_tag)
+                                                  : 0ULL);
+                        } else {
+                            std::fprintf(stderr, "\n");
+                        }
+                        std::fflush(stderr);
+                    }
+                    continue;
+                }
 
                 if (!index.shared) {
                     const CatalogEntry& entry = catalog_[index.slot];
