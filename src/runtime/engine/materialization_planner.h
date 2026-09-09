@@ -89,6 +89,8 @@ public:
         std::span<const PlanningOwnerId> shared_owner_ids;
         std::span<const MaterializationOwnerPolicy> owner_policy;
         std::span<const MaterializationCheckpointPolicy> checkpoint_policy;
+        // PREFIX-PLAN P1: owners whose checkpoints are hard-protected (never evicted).
+        std::span<const PlanningOwnerId> protected_owners;
     };
 
     struct Result {
@@ -188,7 +190,22 @@ public:
             const bool needs_optional_search =
                 std::any_of(roots.begin(), roots.end(),
                             [](const IdentityRoot& root) { return root.expandable; });
-            if (!needs_optional_search) {
+            // PREFIX-PLAN P1: M2 — root gating blocks fast path when non-root reuse candidates
+            // are feasible/progressable (root would discard a recoverable prefix).
+            const bool root_gating_blocks =
+                identity_best->candidate_index == root_candidate_index &&
+                best_offered_reuse(candidates) > 0 &&
+                [&]() {
+                    for (std::size_t i = 0; i < candidates.size(); ++i) {
+                        if (i == root_candidate_index) { continue; }
+                        const auto& ci = candidates[i];
+                        if (ci.candidate->summary().reusable_prompt_tokens == 0) { continue; }
+                        if (ci.candidate->identity_assessment().physical_status !=
+                            MaterializationPhysicalStatus::StructuralInvalid) { return true; }
+                    }
+                    return false;
+                }();
+            if (!needs_optional_search && !root_gating_blocks) {
                 const CandidateInput& selected = candidates[identity_best->candidate_index];
                 const auto price_split         = [&](std::span<const std::uint32_t> frontiers) {
                     const std::uint64_t baseline =
@@ -261,6 +278,13 @@ public:
             }
             ++targets_evaluated;
             planning_saturating_add(projection_work, assessment.projection_work);
+            // PREFIX-PLAN P1: hard protection — root_maximal target evicts a protected owner → infeasible.
+            for (const auto& outcome : assessment.owner_outcomes) {
+                if (outcome.disposition != VictimDisposition::Evicted) { continue; }
+                for (const auto& po : pressure.protected_owners) {
+                    if (po == outcome.owner) { return std::nullopt; }
+                }
+            }
             std::optional<LogicalGoal> goal;
             if (assessment.physical_status == MaterializationPhysicalStatus::Feasible) {
                 goal = logical_goal(assessment.candidate, assessment.source_mode,
@@ -350,6 +374,13 @@ public:
             mark_target(assessment.stable_target_ordinal, kTargetDiscovered | kTargetAssessed);
             ++targets_evaluated;
             planning_saturating_add(projection_work, assessment.projection_work);
+            // PREFIX-PLAN P1: hard protection — prune targets that evict a protected owner.
+            for (const auto& outcome : assessment.owner_outcomes) {
+                if (outcome.disposition != VictimDisposition::Evicted) { continue; }
+                for (const auto& po : pressure.protected_owners) {
+                    if (po == outcome.owner) { return std::nullopt; }
+                }
+            }
             const FoldedCost cost =
                 fold_assessment(candidates[expected_candidate], assessment, pressure.owner_policy,
                                 pressure.checkpoint_policy, machine_cost);
@@ -629,6 +660,22 @@ public:
         result.owner_outcomes      = std::move(incumbent.owner_outcomes);
         result.checkpoint_outcomes = std::move(incumbent.checkpoint_outcomes);
         result.diagnostics         = diagnostics;
+
+        // PREFIX-PLAN P1: M2 root gating — when reuse candidates exist and at least one is
+        // feasible/progressable (not structurally dead), root is forbidden. The engine keeps the
+        // request TemporarilyBlocked and re-admits on the next decode round.
+        if (incumbent.candidate_index == root_candidate_index &&
+            best_offered_reuse(candidates) > 0) {
+            for (std::size_t i = 0; i < candidates.size(); ++i) {
+                if (i == root_candidate_index) { continue; }
+                const auto& input = candidates[i];
+                if (input.candidate->summary().reusable_prompt_tokens == 0) { continue; }
+                if (input.candidate->identity_assessment().physical_status !=
+                    MaterializationPhysicalStatus::StructuralInvalid) {
+                    return std::nullopt;
+                }
+            }
+        }
         return result;
     }
 

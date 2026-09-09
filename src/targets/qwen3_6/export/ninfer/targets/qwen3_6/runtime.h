@@ -855,6 +855,9 @@ struct ReleaseResult {
     runtime::ConsumeStatus status = runtime::ConsumeStatus::InvariantMismatch;
 };
 
+// PREFIX-PLAN P0: per-sequence decode KV growth probe result (request-scoped capacity semantics).
+enum class SequenceGrowth : std::uint8_t { Ok, PoolExhausted, InvalidTarget };
+
 template <class Variant>
 class Program {
 public:
@@ -902,6 +905,11 @@ public:
     progress_context_transaction(runtime::CancellationFlagView cancellation);
     void finalize_context_transaction() noexcept;
     [[nodiscard]] bool has_context_transaction() const noexcept;
+
+    // PREFIX-PLAN P0: request-scoped decode KV growth probe and capacity stall marker.
+    [[nodiscard]] SequenceGrowth probe_decode_capacity(SequenceHandle<Variant> sequence,
+                                                       std::uint32_t remaining) const;
+    void mark_capacity_stalled(SequenceHandle<Variant> sequence);
     [[nodiscard]] PrefillProgress<Variant>
     advance_prefill(SequenceHandle<Variant> sequence,
                     runtime::ExecutionTiming* failed_timing = nullptr);

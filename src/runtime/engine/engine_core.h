@@ -1139,7 +1139,7 @@ private:
             const std::optional<std::uint32_t> publication =
                 resources_.lane_publication_slot(LaneId{lane});
             auto finished =
-                resources_.finish(*instance_.program, *request->lane, *request->sequence);
+                resources_.finish(*instance_.program, *request->lane, *request->sequence, request->capacity_stalled);
             request->generation_timings = finished.timings;
             request->speculative_stats  = std::move(finished.speculative);
             if (finished.disposition == FinishDisposition::Catalogued && publication) {
@@ -1606,6 +1606,12 @@ private:
         const RequestPlanSummary& summary = request->base_plan->summary();
         if (summary.service_work_quanta == 0) {
             throw std::logic_error("target request plan has invalid admission accounting");
+        }
+        // PREFIX-PLAN P1: register pending demand for hard protection while request is queued.
+        if (auto key = request->base_plan->prefix_shortlist_key(summary.prompt_tokens)) {
+            const auto domain = resources_.reuse_domain(
+                request->base_plan->context_cache().session_key, request->publication_order);
+            resources_.note_pending_demand(request->id, {&*key, 1}, domain);
         }
     }
 
@@ -2127,6 +2133,29 @@ private:
                 (void)settle_terminal_requests(boundary);
                 const auto cancelled_at_boundary = snapshot_cancellations();
                 cancel_active_requests(cancelled_at_boundary, boundary);
+
+            // PREFIX-PLAN P0: probe decode-ready lanes for KV pool headroom before round
+            // membership construction; a lane that cannot grow its KV ends normally with
+            // ContextCapacity (pool exhaustion is a normal request limit, not an engine fault).
+            for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+                std::shared_ptr<Request> stalled = slots_[lane];
+                if (stalled == nullptr || !stalled->is_decode_ready() || stalled->capture_pending ||
+                    !stalled->sequence || !stalled->lane || stalled->lane->value != lane) {
+                    continue;
+                }
+                const std::uint32_t remaining = stalled->budget ? stalled->budget->remaining() : 0;
+                if (instance_.program->probe_decode_capacity(*stalled->sequence, remaining) !=
+                    targets::qwen3_6::SequenceGrowth::PoolExhausted) {
+                    continue;
+                }
+                if (stalled->budget) { stalled->budget->commit(remaining); }
+(void)stalled->output.preview_terminal(FinishReason::ContextCapacity);
+                instance_.program->mark_capacity_stalled(*stalled->sequence);
+resources_.mark_terminal_pending(LaneId{lane});
+                stalled->terminal_reason  = FinishReason::ContextCapacity;
+                stalled->capacity_stalled = true;
+                stalled->model_state      = EngineRequestState::ModelFinished;
+            }
                 RoundMembership membership =
                     scheduler_.build_round_membership(slots_, max_concurrency_);
                 const bool admission_check_pending =
@@ -2175,6 +2204,7 @@ private:
                     set_host_work_class(HostWorkClass::Decode, membership.lane_span());
                     finish_engine_phase(boundary, EngineHostPhase::Boundary);
                     run_decode_round(membership, cancelled_at_unit_start);
+                    request_admission_check(); // PREFIX-PLAN P0 (S3): re-arm admission after a decode round (30s blind spot)
                     previous_unit_was_decode = true;
                     continue;
                 }

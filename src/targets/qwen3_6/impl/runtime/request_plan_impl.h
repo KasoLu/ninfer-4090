@@ -263,17 +263,13 @@ RequestBasePlan ProgramImplCore::plan_request(const PreparedPromptData& prompt,
     base->allow_prefix_reuse             = options.allow_prefix_reuse;
     base->summary.publish_continuation =
         options.allow_prefix_reuse && prompt.identity.reusable && context_cache.enabled;
-    const std::uint32_t reserved_context_tokens =
-        base->summary.prompt_tokens + (base->summary.effective_output_tokens == 0
-                                           ? 0U
-                                           : base->summary.effective_output_tokens - 1U);
-    base->text_kv_page_entitlement = pages_for_tokens(reserved_context_tokens);
+    base->text_kv_page_entitlement = pages_for_tokens(base->summary.prompt_tokens);
     if (speculative_backend == SpeculativeBackend::Mtp) {
         const std::uint32_t mtp_tokens    = static_cast<std::uint32_t>(std::min<std::uint64_t>(
-            capacity, static_cast<std::uint64_t>(reserved_context_tokens) + draft_window - 1ULL));
+            capacity, static_cast<std::uint64_t>(base->summary.prompt_tokens) + draft_window - 1ULL));
         base->backend_kv_page_entitlement = pages_for_tokens(mtp_tokens);
     } else if (speculative_backend == SpeculativeBackend::DFlash) {
-        base->backend_kv_page_entitlement = pages_for_tokens(reserved_context_tokens);
+        base->backend_kv_page_entitlement = pages_for_tokens(base->summary.prompt_tokens);
     }
     detail::PhysicalDeviceResources root_active{
         .active_lanes     = 1,
@@ -417,7 +413,7 @@ RequestBasePlan ProgramImplCore::plan_request(const PreparedPromptData& prompt,
             group.identity = std::move(identity);
         }
     }
-    root_active.state_slots = 1U;
+    root_active.state_slots = 2U; // PREFIX-PLAN P2 Mechanism A: root run reserves 1 capture destination slot
     const detail::PhysicalResources root_vector{.device = root_active};
     base->root_demand = detail::PhysicalDemand{
         .active_entitlement       = root_vector,

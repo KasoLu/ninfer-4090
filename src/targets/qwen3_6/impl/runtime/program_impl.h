@@ -1094,7 +1094,11 @@ std::vector<float> ProgramImplCore::causal_score(PreparedPromptData&& prompt,
         if (text_kv_addresses->bound_row(*address) != 0) {
             throw std::logic_error("causal score did not bind the unique Main KV row");
         }
-        text_kv_addresses->materialize_to_tokens(*address, predictor_count, device.stream);
+        const KvGrowth causal_growth =
+            text_kv_addresses->materialize_to_tokens(*address, predictor_count, device.stream);
+        if (causal_growth != KvGrowth::Ok) {
+            throw std::logic_error("causal score KV materialization failed");
+        }
 
         const std::int32_t state_slot = state_store->physical_slot(*state);
         const auto flush              = [&] {
@@ -6722,11 +6726,11 @@ detail::PhysicalResources ProgramImplCore::resident_resources(const SequenceStat
                 const std::uint32_t mapped      = addresses.mapped_pages(address);
                 const std::uint32_t entitlement = addresses.entitlement(address);
                 if (entitlement < mapped ||
-                    entitlement - mapped >
+mapped >
                         std::numeric_limits<std::uint32_t>::max() - device_pages) {
                     throw std::logic_error("resident active KV entitlement is inconsistent");
                 }
-                device_pages += entitlement - mapped;
+                device_pages += mapped;
             }
         };
         add_kv(*text_kv_addresses, *text_kv_pages, sequence.kv->text, out.device.main_kv_pages);
@@ -7821,8 +7825,19 @@ runtime::ContextTransactionReserveStatus ProgramImplCore::reserve_active_capture
         return runtime::ContextTransactionReserveStatus::Aborted;
     }
     if (!pressure && !assessment.physically_feasible) {
-        skip_capture(std::move(offer));
-        return runtime::ContextTransactionReserveStatus::Aborted;
+        // PREFIX-PLAN P2 Mechanism C: try releasing a superseded LongAnchor to free state capacity.
+        const std::uint32_t probe_lane = ContractAccess::lane(offer).value;
+        if (try_release_superseded_anchor(probe_lane)) {
+            const CaptureAssessment reassessed =
+                inspect_capture(offer, exact_shared, replacement, private_replacement, permit_shared_publication);
+            if (!reassessed.physically_feasible) {
+                skip_capture(std::move(offer));
+                return runtime::ContextTransactionReserveStatus::Aborted;
+            }
+        } else {
+            skip_capture(std::move(offer));
+            return runtime::ContextTransactionReserveStatus::Aborted;
+        }
     }
 
     const std::uint32_t lane         = ContractAccess::lane(offer).value;
@@ -8092,6 +8107,10 @@ void ProgramImplCore::prepare_active_capture(ActiveCaptureTransaction& transacti
         transaction.destination_state = *sequence.rewrite_state;
         transaction.recycled_state_epoch =
             state_store->recycle_checkpoint_destination(transaction.destination_state);
+    } else if (sequence.reserved_state) {
+        // PREFIX-PLAN P2 Mechanism B: use the reserved capture destination slot (Mechanism A).
+        transaction.destination_state = *sequence.reserved_state;
+        sequence.reserved_state.reset();
     } else {
         std::optional<StateImageHandle> destination = state_store->reserve_destination();
         if (!destination) {
@@ -9144,6 +9163,89 @@ DiscardResult ProgramImplCore::abort_pending(PendingBatch&& pending) noexcept {
     if (out.row_count != 0) { advance_resource_revision(); }
     out.status = runtime::ConsumeStatus::Consumed;
     return out;
+}
+
+SequenceGrowth ProgramImplCore::probe_decode_capacity(SequenceHandle sequence,
+                                                      std::uint32_t remaining) const {
+    if (has_context_transaction() || pending_transaction_ || !valid_sequence(sequence)) {
+        return SequenceGrowth::InvalidTarget;
+    }
+    const std::uint32_t lane = ContractAccess::lane(sequence).value;
+    const SequenceState& state = active_sequence(lane);
+    if (!state.kv) { return SequenceGrowth::InvalidTarget; }
+    const std::uint32_t frontier = state.execution_frontier;
+    if (frontier >= capacity) { return SequenceGrowth::InvalidTarget; }
+    std::uint32_t text_target    = frontier + 1U;
+    std::uint32_t backend_target = 0;
+    if (state.kv->backend) {
+        const std::uint32_t max_by_budget = remaining > 1U ? remaining - 1U : 0U;
+        if (speculative_backend == SpeculativeBackend::Mtp) {
+            const std::uint32_t extent = std::min({state.mtp_draft_count, draft_window,
+                                                    max_by_budget, capacity - frontier - 1U});
+            text_target    = frontier + extent + 1U;
+            backend_target = static_cast<std::uint32_t>(std::min<std::uint64_t>(
+                capacity, static_cast<std::uint64_t>(frontier + extent) + draft_window));
+        } else {
+            const std::uint32_t extent =
+                std::min({draft_window, max_by_budget, capacity - frontier - 1U});
+            text_target    = frontier + extent + 1U;
+            backend_target = frontier;
+        }
+    }
+    if (!text_kv_addresses->can_materialize_to_tokens(state.kv->text, text_target)) {
+        return SequenceGrowth::PoolExhausted;
+    }
+    if (state.kv->backend &&
+        !backend_kv_addresses->can_materialize_to_tokens(*state.kv->backend, backend_target)) {
+        return SequenceGrowth::PoolExhausted;
+    }
+    return SequenceGrowth::Ok;
+}
+
+void ProgramImplCore::mark_capacity_stalled(SequenceHandle sequence) {
+    if (has_context_transaction() || pending_transaction_) {
+        throw std::logic_error("capacity stall overlaps an open context transaction");
+    }
+    if (!valid_sequence(sequence)) {
+        throw std::logic_error("capacity stall target is not a live sequence");
+    }
+    const std::uint32_t lane = ContractAccess::lane(sequence).value;
+    RequestControl& request  = requests[lane];
+    SequenceState& state     = active_sequence(lane);
+    if (!state.kv) { throw std::logic_error("capacity stall target has no KV bundle"); }
+    if (request.lifecycle != Lifecycle::Active) {
+        throw std::logic_error("capacity stall requires an active decode lane");
+    }
+    request.lifecycle = Lifecycle::Finishable;
+    request.pending   = {};
+    state.mtp_draft_count = 0;
+}
+
+std::uint32_t ProgramImplCore::checkpoint_references(StateImageHandle handle) const noexcept {
+    return state_store->checkpoint_references(handle);
+}
+
+bool ProgramImplCore::try_release_superseded_anchor(std::uint32_t lane) {
+    if (lane >= max_concurrency) { return false; }
+    SequenceState& sequence = active_sequence(lane);
+    if (sequence.long_anchors.empty()) { return false; }
+    // Find the LongAnchor with the highest ordinal (deepest).
+    std::size_t deepest = 0;
+    for (std::size_t i = 1; i < sequence.long_anchors.size(); ++i) {
+        if (sequence.long_anchors[i].ordinal > sequence.long_anchors[deepest].ordinal) {
+            deepest = i;
+        }
+    }
+    const auto& anchor = sequence.long_anchors[deepest];
+    // Only release if this is the only checkpoint reference (no other holders).
+    if (state_store->checkpoint_references(anchor.state) != 1) { return false; }
+    // Release the checkpoint reference and the state image slot.
+    state_store->release_checkpoint_reference(anchor.state);
+    if (!state_store->release(anchor.state)) { return false; }
+    // Remove from long_anchors.
+    sequence.long_anchors.erase(sequence.long_anchors.begin() + static_cast<std::ptrdiff_t>(deepest));
+    refresh_state_views(sequence);
+    return true;
 }
 
 FinishResult ProgramImplCore::finish(SequenceHandle sequence) noexcept {
@@ -10760,10 +10862,18 @@ void ProgramImplCore::materialize_sequence_kv(SequenceState& sequence, std::uint
     if (backend_tokens != 0 && !sequence.kv->backend) {
         throw std::logic_error("backend KV materialization requested without an allocation");
     }
-    text_kv_addresses->materialize_to_tokens(sequence.kv->text, main_tokens, device.stream);
+    const KvGrowth text_growth =
+        text_kv_addresses->materialize_to_tokens(sequence.kv->text, main_tokens, device.stream);
+    if (text_growth != KvGrowth::Ok) {
+        throw std::logic_error("text KV growth failed during sequence materialization");
+    }
     if (backend_tokens != 0) {
-        backend_kv_addresses->materialize_to_tokens(*sequence.kv->backend, backend_tokens,
-                                                    device.stream);
+        const KvGrowth backend_growth =
+            backend_kv_addresses->materialize_to_tokens(*sequence.kv->backend, backend_tokens,
+                                                        device.stream);
+        if (backend_growth != KvGrowth::Ok) {
+            throw std::logic_error("backend KV growth failed during sequence materialization");
+        }
     }
 }
 
@@ -10922,7 +11032,11 @@ void ProgramImplCore::prepare_graphs() {
                 addresses.create_active(1, static_cast<std::int32_t>(row));
             if (!allocation) { throw std::bad_alloc(); }
             allocations.push_back(*allocation);
-            addresses.materialize_to_tokens(*allocation, 1, device.stream);
+            const KvGrowth capture_growth =
+                addresses.materialize_to_tokens(*allocation, 1, device.stream);
+            if (capture_growth != KvGrowth::Ok) {
+                throw std::logic_error("capture KV materialization failed");
+            }
 
             // Capture profiles exercise arbitrary context envelopes. Repeating each row's private
             // page across its temporary table keeps every dummy read/write address valid without

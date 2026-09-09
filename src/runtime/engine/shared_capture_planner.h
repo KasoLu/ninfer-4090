@@ -60,6 +60,8 @@ public:
         std::uint32_t blocked_runnable_requests     = 0;
         std::uint32_t stable_scenario_ordinal       = 0;
         std::uint32_t target_budget                 = kTargetBudget;
+        // PREFIX-PLAN P1: owners whose checkpoints are hard-protected (never evicted).
+        std::span<const PlanningOwnerId> protected_owners;
     };
 
     struct Result {
@@ -85,6 +87,12 @@ public:
     [[nodiscard]] std::optional<Result>
     plan(Program& program, const ContextMachineCostModel& machine_cost, const Input& input) {
         validate(input);
+        // PREFIX-PLAN P1: if the direct victim is a protected owner, the scenario is infeasible.
+        if (input.direct_shared_victim.has_value()) {
+            for (const auto& po : input.protected_owners) {
+                if (po == *input.direct_shared_victim) { return std::nullopt; }
+            }
+        }
         queue_.clear();
         target_ledger_.reset(static_cast<std::size_t>(input.target_budget) + 1U);
 

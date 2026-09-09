@@ -124,6 +124,7 @@ public:
         std::vector<PrefixShortlistKey> candidate_keys;
         std::vector<PrefixShortlistKey> exact_resident_keys;
         std::optional<PrefixShortlistKey> selected_source_key;
+        std::uint64_t owner = 0;
     };
 
     enum class CatalogState : std::uint8_t {
@@ -759,6 +760,16 @@ public:
                             owner_id_for(LogicalOwnerKind::SharedPrefix, slot));
                     }
                 }
+                // PREFIX-PLAN P1: derive hard-protection set from checkpoint policies with demand.
+                std::vector<PlanningOwnerId> protected_owner_ids;
+                for (const auto& cp : checkpoint_policies) {
+                    if (cp.demand_mask == 0) { continue; }
+                    bool already = false;
+                    for (const auto& po : protected_owner_ids) {
+                        if (po == cp.owner) { already = true; break; }
+                    }
+                    if (!already) { protected_owner_ids.push_back(cp.owner); }
+                }
                 const typename CapturePlanner::Input input{
                     .capture             = &scenario.assessment,
                     .private_owners      = private_owners,
@@ -781,6 +792,7 @@ public:
                     .blocked_runnable_requests = blocked_runnable_requests,
                     .stable_scenario_ordinal   = scenario.stable_ordinal,
                     .target_budget             = scenario_budget,
+                    .protected_owners          = protected_owner_ids,
                 };
                 std::optional<typename CapturePlanner::Result> planned =
                     capture_planner_.plan(program, cost_model_, input);
@@ -929,7 +941,7 @@ public:
         lanes_[lane.value] = LogicalLaneState::TerminalPending;
     }
 
-    [[nodiscard]] FinishResult finish(Program& program, LaneId lane, SequenceHandle sequence) {
+    [[nodiscard]] FinishResult finish(Program& program, LaneId lane, SequenceHandle sequence, bool allow_abort_fallback = true) {
         require_lane(lane, LogicalLaneState::TerminalPending);
         if (!std::holds_alternative<std::monostate>(transaction_) ||
             program.has_context_transaction()) {
@@ -938,6 +950,9 @@ public:
         ActiveEntry& active = active_[lane.value];
         FinishResult result = program.finish(sequence);
         if (result.status != ConsumeStatus::Consumed) {
+            if (!allow_abort_fallback) {
+                throw std::logic_error("capacity-stalled terminal settlement did not consume the sequence");
+            }
             AbortResult discarded = program.abort(sequence);
             if (discarded.status != ConsumeStatus::Consumed) {
                 throw std::logic_error(
@@ -1438,6 +1453,8 @@ private:
                (demand.selected_source_key && *demand.selected_source_key == key);
     }
 
+    // PREFIX-PLAN P1: public API for engine to compute reuse domain.
+    public:
     [[nodiscard]] static ReuseDomainId reuse_domain(const std::optional<CacheSessionKey>& session,
                                                     std::uint64_t publication_order) noexcept {
         if (!session) {
@@ -2081,6 +2098,20 @@ private:
                 });
             }
 
+            // PREFIX-PLAN P1: derive the hard-protection set P from the demand window and the
+            // current request's provisional demand. An owner is protected if any of its
+            // checkpoints is matched by at least one demand record.
+            std::vector<PlanningOwnerId> protected_owner_ids;
+            protected_owner_ids.reserve(owner_policies.size());
+            for (const auto& cp : checkpoint_policies) {
+                if (cp.demand_mask == 0) { continue; }
+                bool already = false;
+                for (const auto& po : protected_owner_ids) {
+                    if (po == cp.owner) { already = true; break; }
+                }
+                if (!already) { protected_owner_ids.push_back(cp.owner); }
+            }
+
             return typename Planner::PressureInputs{
                 .private_owners    = private_owners,
                 .private_owner_ids = private_owner_ids,
@@ -2088,6 +2119,7 @@ private:
                 .shared_owner_ids  = shared_owner_ids,
                 .owner_policy      = owner_policies,
                 .checkpoint_policy = checkpoint_policies,
+                .protected_owners  = protected_owner_ids,
             };
         };
 
@@ -2452,6 +2484,63 @@ private:
                 selected->last_hit_epoch = ++retention_epoch_;
             }
         }
+    }
+
+    // PREFIX-PLAN P1: public API for engine to register pending demand.
+    public:
+    // PREFIX-PLAN P1: pure window insertion for pending (queued) requests. Unlike commit_demand,
+    // this does NOT trigger the explicit_credit clearing side effect — it only records that a
+    // request matching these keys is waiting, so its prefix owners enter the hard protection set.
+    void note_pending_demand(std::uint64_t owner, std::span<const PrefixShortlistKey> keys,
+                             ReuseDomainId domain) noexcept {
+        if (demand_window_.capacity() < kDemandWindowCapacity) { std::terminate(); }
+        if (demand_window_.size() == kDemandWindowCapacity) {
+            demand_window_.erase(demand_window_.begin());
+        }
+        PrefixDemandRecord record;
+        record.domain           = domain;
+        record.candidate_keys.assign(keys.begin(), keys.end());
+        record.exact_resident_keys.clear();
+        record.selected_source_key = std::nullopt;
+        record.owner = owner;
+        demand_window_.push_back(std::move(record));
+        saturating_increment(demand_epoch_);
+    }
+
+
+    // PREFIX-PLAN P2 Mechanism C: drop a superseded LongAnchor from a Catalogued entry.
+    // noexcept, zero state change on any validation failure.
+    [[nodiscard]] std::optional<ContinuationSummary>
+    drop_superseded_anchor(Program& program, std::uint32_t continuation_index,
+                           std::uint64_t generation, CheckpointRef anchor) noexcept {
+        // 1. No open context transaction.
+        if (program.has_context_transaction()) { return std::nullopt; }
+        // 2. Slot within capacity.
+        if (continuation_index >= catalog_.size()) { return std::nullopt; }
+        CatalogEntry& entry = catalog_[continuation_index];
+        // 3. Entry must be Catalogued.
+        if (entry.state != CatalogState::Catalogued) { return std::nullopt; }
+        // 4. Generation must match.
+        if (entry.revision != generation) { return std::nullopt; }
+        // 5. Anchor must be a LongAnchor.
+        if (anchor.kind != CheckpointKind::LongAnchor) { return std::nullopt; }
+        // 6. Anchor must be present in the entry's observations.
+        bool anchor_present = false;
+        for (const auto& obs : entry.observations) {
+            if (obs.checkpoint == anchor) { anchor_present = true; break; }
+        }
+        if (!anchor_present) { return std::nullopt; }
+        // 7. (checkpoint_references check deferred to Program-side wrapper)
+
+        // All validations passed: remove the anchor from observations.
+        entry.observations.erase(
+            std::remove(entry.observations.begin(), entry.observations.end(), anchor),
+            entry.observations.end());
+        // Increment revision and advance resource revision.
+        ++entry.revision;
+        advance_revision(entry.revision);
+        rebuild_prefix_index();
+        return entry.summary;
     }
 
     void commit_demand(PrefixDemandRecord&& demand) noexcept {

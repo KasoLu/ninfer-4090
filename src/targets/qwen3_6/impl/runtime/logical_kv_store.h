@@ -21,6 +21,16 @@ class HostKVExtentStore;
 class KVPrefixForkReservation;
 class KVActiveSnapshotReservation;
 
+// Outcome of on-demand KV reservation growth. PoolExhausted reports page-pool
+// exhaustion as a status (request-level ContextCapacity termination) instead of
+// an exception; InvalidTarget marks a target outside the static address space.
+enum class KvGrowth : std::uint8_t {
+    Ok,
+    PoolExhausted,
+    InvalidTarget,
+};
+
+
 class HostKVExtentCapability {
 public:
     HostKVExtentCapability() noexcept = default;
@@ -1434,14 +1444,29 @@ public:
         pages_->physical_pool().resize_reservation(address.reservation, 0);
     }
 
-    void materialize_to_tokens(KVAddressSpaceHandle handle, std::uint32_t tokens,
-                               cudaStream_t stream = nullptr) {
+    // Materialize [0, tokens) of the address space. Growing beyond the current
+    // entitlement extends the reservation from the page pool in one atomic batch;
+    // pool exhaustion is reported as KvGrowth::PoolExhausted instead of throwing
+    // (request-level ContextCapacity path), while a target smaller than the mapped
+    // prefix violates monotonicity and stays fatal.
+    [[nodiscard]] KvGrowth materialize_to_tokens(KVAddressSpaceHandle handle, std::uint32_t tokens,
+                                                 cudaStream_t stream = nullptr) {
         Address& address           = require_active(handle);
         const std::uint32_t target = pages_for_tokens(tokens);
-        if (target < address.page_count || target > entitlement(address)) {
+        if (target < address.page_count) {
             throw std::invalid_argument("KV materialization exceeds active entitlement");
         }
-        if (target == address.page_count) { return; }
+        if (target > page_capacity_) {
+            return KvGrowth::InvalidTarget;
+        }
+        if (target == address.page_count) { return KvGrowth::Ok; }
+        const std::uint32_t needed = target - address.page_count;
+        if (needed > address.reservation.pages()) {
+            if (!pages_->physical_pool().can_resize_reservation(address.reservation, needed)) {
+                return KvGrowth::PoolExhausted;
+            }
+            pages_->physical_pool().resize_reservation(address.reservation, needed);
+        }
         const std::uint32_t begin       = address.page_count;
         const std::uint32_t count       = target - begin;
         const std::size_t address_index = static_cast<std::size_t>(&address - addresses_.data());
@@ -1466,6 +1491,23 @@ public:
         }
         for (const LogicalKVPageHandle page : added) { pages_->retain_active_reference(page); }
         address.page_count = target;
+        return KvGrowth::Ok;
+    }
+
+    // Non-throwing capacity probe for materialize_to_tokens: reports whether the
+    // target fits the current reservation headroom or the page pool can still grow
+    // the reservation by the missing pages.
+    [[nodiscard]] bool can_materialize_to_tokens(KVAddressSpaceHandle handle,
+                                                 std::uint32_t tokens) const noexcept {
+        if (!valid(handle)) { return false; }
+        const Address& address = addresses_[handle.index_];
+        if (!address.active || !address.row || !address.reservation.valid()) { return false; }
+        const std::uint32_t target = pages_for_tokens(tokens);
+        if (target < address.page_count || target > page_capacity_) { return false; }
+        if (target == address.page_count) { return true; }
+        const std::uint32_t needed = target - address.page_count;
+        if (needed <= address.reservation.pages()) { return true; }
+        return pages_->physical_pool().can_resize_reservation(address.reservation, needed);
     }
 
     void commit_frontier(KVAddressSpaceHandle handle, std::uint32_t frontier) {

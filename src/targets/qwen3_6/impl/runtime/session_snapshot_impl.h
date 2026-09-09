@@ -863,7 +863,11 @@ ProgramImplCore::restore_continuation(std::span<const std::uint8_t> snapshot,
             if (page_count == 0) { return *address; }
             try {
                 addresses.activate(*address, page_count, *free_row);
-                addresses.materialize_to_tokens(*address, committed, device.stream);
+                const KvGrowth snapshot_growth =
+                    addresses.materialize_to_tokens(*address, committed, device.stream);
+                if (snapshot_growth != KvGrowth::Ok) {
+                    throw std::logic_error("session snapshot KV materialization failed");
+                }
                 addresses.commit_frontier(*address, committed);
                 std::vector<DeviceKVPageHandle> destinations;
                 destinations.reserve(page_count);

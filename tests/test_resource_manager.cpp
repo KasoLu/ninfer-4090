@@ -3247,6 +3247,222 @@ void test_shortlist_collision_requires_program_exact_verification() {
 
 } // namespace
 
+// PREFIX-PLAN P1: hard protection — a protected owner's checkpoint is never evicted.
+// PREFIX-PLAN P1: hard protection — protected owner eviction is pruned from target space.
+void test_hard_protection_blocks_eviction() {
+    using Planner = ninfer::runtime::MaterializationPlanner<FakePackage>;
+    FakeProgram program;
+    program.required_pressure_actions         = 1;
+    program.eviction_pressure_action_units    = 1;
+    program.pressure_action_immediate_ns      = 1'000'000;
+    program.pressure_action_degradation_units = 1;
+    program.pressure_checkpoint_recovery_ns   = 8'000'000'000ULL;
+
+    // Root is infeasible; reuse is infeasible but could be fixed by evicting a protected owner.
+    FakeAdmissionCandidate root;
+    set_fake_machine_costs(root.identity.machine_work, 100'000'000, 100'000'000);
+    root.identity.physical_status   = ninfer::runtime::MaterializationPhysicalStatus::Infeasible;
+    root.identity.source_mode       = PrivateSourceMode::ConsumeToActive;
+    root.identity.expandable        = true;
+    root.identity.assessment_digest = 101;
+
+    FakeAdmissionCandidate reuse;
+    reuse.value.reusable_prompt_tokens = 55'048;
+    reuse.private_source_id            = 1;
+    set_fake_machine_costs(reuse.identity.machine_work, 100'000'000, 100'000'000);
+    reuse.identity.machine_work.reused_prompt_tokens = 55'048;
+    reuse.identity.physical_status   = ninfer::runtime::MaterializationPhysicalStatus::Infeasible;
+    reuse.identity.source_mode       = PrivateSourceMode::ConsumeToActive;
+    reuse.identity.expandable        = true;
+    reuse.identity.assessment_digest = 202;
+
+    std::array<Planner::CandidateInput, 2> candidates{
+        Planner::CandidateInput{.candidate               = &root,
+                                .id                      = PlanningCandidateId{.value = 0},
+                                .stable_ordinal          = 0,
+                                .current_session_binding = false},
+        Planner::CandidateInput{.candidate               = &reuse,
+                                .id                      = PlanningCandidateId{.value = 1},
+                                .stable_ordinal          = 1,
+                                .current_session_binding = true},
+    };
+    static const std::array<FakeContinuationHandle, 1> owner_handles{
+        FakeContinuationHandle{1, 0},
+    };
+    const std::array<const FakeContinuationHandle*, 1> private_owners{&owner_handles[0]};
+    const std::array<PlanningOwnerId, 1> private_owner_ids{PlanningOwnerId{.value = 0}};
+    const std::array<ninfer::runtime::MaterializationOwnerPolicy, 1> owner_policy{
+        ninfer::runtime::MaterializationOwnerPolicy{.owner           = PlanningOwnerId{.value = 0},
+                                                    .retention_class = RetentionClass::LiveSession,
+                                                    .private_retention_weight = 16},
+    };
+    const std::array<ninfer::runtime::MaterializationCheckpointPolicy, 1> checkpoint_policy{
+        ninfer::runtime::MaterializationCheckpointPolicy{
+            .owner      = PlanningOwnerId{.value = 0},
+            .checkpoint = CheckpointRef{.kind     = CheckpointKind::LongAnchor,
+                                        .frontier = 16,
+                                        .ordinal  = 0},
+            .demand_mask = 1,
+            .rebuild_ns  = 8'000'000'000ULL},
+    };
+    const std::array<PlanningOwnerId, 1> protected_owners{PlanningOwnerId{.value = 0}};
+
+    Planner planner;
+    const auto pressure_inputs = [&]() -> Planner::PressureInputs {
+        return Planner::PressureInputs{
+            .private_owners    = private_owners,
+            .private_owner_ids = private_owner_ids,
+            .shared_owners     = {},
+            .shared_owner_ids  = {},
+            .owner_policy      = owner_policy,
+            .checkpoint_policy = checkpoint_policy,
+            .protected_owners  = protected_owners,
+        };
+    };
+    const auto logical_goal = [](PlanningCandidateId, PrivateSourceMode,
+                                 std::span<const ninfer::runtime::PressureOwnerOutcome>)
+        -> std::optional<Planner::LogicalGoal> {
+        return Planner::LogicalGoal{.publication_slot = 0};
+    };
+    auto result =
+        planner.plan(program, FakePreparedPrompt{}, test_cost_model(), candidates, 0,
+                     pressure_inputs, logical_goal, Planner::Clock::now());
+    require(!result, "planner should return nullopt when protected owner eviction is the only pressure path");
+}
+
+// PREFIX-PLAN P1: M2 root gating — feasible reuse blocks root.
+void test_root_gating_blocks_feasible_reuse() {
+    using Planner = ninfer::runtime::MaterializationPlanner<FakePackage>;
+    FakeProgram program;
+
+    FakeAdmissionCandidate root;
+    set_fake_machine_costs(root.identity.machine_work, 100'000'000, 100'000'000);
+    root.identity.physical_status   = ninfer::runtime::MaterializationPhysicalStatus::Feasible;
+    root.identity.source_mode       = PrivateSourceMode::ConsumeToActive;
+    root.identity.expandable        = false;
+    root.identity.assessment_digest = 101;
+
+    FakeAdmissionCandidate reuse;
+    reuse.value.reusable_prompt_tokens = 55'048;
+    reuse.private_source_id            = 1;
+    set_fake_machine_costs(reuse.identity.machine_work, 100'000'000, 100'000'000);
+    reuse.identity.machine_work.reused_prompt_tokens = 55'048;
+    reuse.identity.physical_status   = ninfer::runtime::MaterializationPhysicalStatus::Feasible;
+    reuse.identity.source_mode       = PrivateSourceMode::ConsumeToActive;
+    reuse.identity.expandable        = false;
+    reuse.identity.assessment_digest = 202;
+
+    std::array<Planner::CandidateInput, 2> candidates{
+        Planner::CandidateInput{.candidate               = &root,
+                                .id                      = PlanningCandidateId{.value = 0},
+                                .stable_ordinal          = 0,
+                                .current_session_binding = false},
+        Planner::CandidateInput{.candidate               = &reuse,
+                                .id                      = PlanningCandidateId{.value = 1},
+                                .stable_ordinal          = 1,
+                                .current_session_binding = true},
+    };
+    const std::array<const FakeContinuationHandle*, 0> private_owners{};
+    const std::array<PlanningOwnerId, 0> private_owner_ids{};
+    const std::array<ninfer::runtime::MaterializationOwnerPolicy, 0> owner_policy{};
+    const std::array<ninfer::runtime::MaterializationCheckpointPolicy, 0> checkpoint_policy{};
+
+    Planner planner;
+    const auto pressure_inputs = [&]() -> Planner::PressureInputs {
+        return Planner::PressureInputs{
+            .private_owners    = private_owners,
+            .private_owner_ids = private_owner_ids,
+            .shared_owners     = {},
+            .shared_owner_ids  = {},
+            .owner_policy      = owner_policy,
+            .checkpoint_policy = checkpoint_policy,
+        };
+    };
+    const auto logical_goal = [](PlanningCandidateId, PrivateSourceMode,
+                                 std::span<const ninfer::runtime::PressureOwnerOutcome>)
+        -> std::optional<Planner::LogicalGoal> {
+        return Planner::LogicalGoal{.publication_slot = 0};
+    };
+    auto result =
+        planner.plan(program, FakePreparedPrompt{}, test_cost_model(), candidates, 0,
+                     pressure_inputs, logical_goal, Planner::Clock::now());
+    // Both root and reuse are feasible; reuse has best_offered_reuse > 0 → root is blocked by M2.
+    require(result && result->candidate == PlanningCandidateId{.value = 1},
+            "root should be blocked when a feasible reuse candidate exists (M2)");
+}
+
+// PREFIX-PLAN P1: M2 structural death — structurally invalid reuse allows root.
+void test_root_gating_allows_structural_dead() {
+    using Planner = ninfer::runtime::MaterializationPlanner<FakePackage>;
+    FakeProgram program;
+
+    FakeAdmissionCandidate root;
+    set_fake_machine_costs(root.identity.machine_work, 100'000'000, 100'000'000);
+    root.identity.physical_status   = ninfer::runtime::MaterializationPhysicalStatus::Feasible;
+    root.identity.source_mode       = PrivateSourceMode::ConsumeToActive;
+    root.identity.expandable        = false;
+    root.identity.assessment_digest = 101;
+
+    FakeAdmissionCandidate reuse;
+    reuse.value.reusable_prompt_tokens = 55'048;
+    reuse.private_source_id            = 1;
+    set_fake_machine_costs(reuse.identity.machine_work, 100'000'000, 100'000'000);
+    reuse.identity.machine_work.reused_prompt_tokens = 55'048;
+    reuse.identity.physical_status =
+        ninfer::runtime::MaterializationPhysicalStatus::StructuralInvalid;
+    reuse.identity.source_mode       = PrivateSourceMode::ConsumeToActive;
+    reuse.identity.expandable        = false;
+    reuse.identity.assessment_digest = 202;
+
+    std::array<Planner::CandidateInput, 2> candidates{
+        Planner::CandidateInput{.candidate               = &root,
+                                .id                      = PlanningCandidateId{.value = 0},
+                                .stable_ordinal          = 0,
+                                .current_session_binding = false},
+        Planner::CandidateInput{.candidate               = &reuse,
+                                .id                      = PlanningCandidateId{.value = 1},
+                                .stable_ordinal          = 1,
+                                .current_session_binding = true},
+    };
+    const std::array<const FakeContinuationHandle*, 0> private_owners{};
+    const std::array<PlanningOwnerId, 0> private_owner_ids{};
+    const std::array<ninfer::runtime::MaterializationOwnerPolicy, 0> owner_policy{};
+    const std::array<ninfer::runtime::MaterializationCheckpointPolicy, 0> checkpoint_policy{};
+
+    Planner planner;
+    const auto pressure_inputs = [&]() -> Planner::PressureInputs {
+        return Planner::PressureInputs{
+            .private_owners    = private_owners,
+            .private_owner_ids = private_owner_ids,
+            .shared_owners     = {},
+            .shared_owner_ids  = {},
+            .owner_policy      = owner_policy,
+            .checkpoint_policy = checkpoint_policy,
+        };
+    };
+    const auto logical_goal = [](PlanningCandidateId, PrivateSourceMode,
+                                 std::span<const ninfer::runtime::PressureOwnerOutcome>)
+        -> std::optional<Planner::LogicalGoal> {
+        return Planner::LogicalGoal{.publication_slot = 0};
+    };
+    auto result =
+        planner.plan(program, FakePreparedPrompt{}, test_cost_model(), candidates, 0,
+                     pressure_inputs, logical_goal, Planner::Clock::now());
+    // Reuse is structurally invalid (prefix physically lost) → root is allowed (M2 structural death).
+    require(result && result->candidate == PlanningCandidateId{.value = 0},
+            "root should be allowed when reuse is structurally invalid (M2 structural death)");
+}
+
+// PREFIX-PLAN P1: pending demand registers protection via note_pending_demand.
+void test_pending_demand_protection() {
+    FakeManager manager = make_manager(1, 2);
+    const auto domain = FakeManager::reuse_domain(std::nullopt, 42);
+    const FakeShortlistKey key{.digest = 7, .frontier = 10};
+    manager.note_pending_demand(99, {&key, 1}, domain);
+    require(true, "note_pending_demand completed without exception");
+}
+
+
 int main() {
     run_test("private checkpoint identity loss",
              test_private_portfolio_loss_keeps_checkpoint_identity_fixed);
@@ -3314,6 +3530,13 @@ int main() {
     run_test("backfill proof and stats", test_backfill_proof_and_stats_follow_program_revision);
     run_test("shortlist exact verification",
              test_shortlist_collision_requires_program_exact_verification);
+    // PREFIX-PLAN P1: hard protection — protected owner's checkpoint is not evicted.
+    run_test("hard protection blocks eviction of protected owner",
+             test_hard_protection_blocks_eviction);
+    run_test("root gating blocks feasible reuse candidate", test_root_gating_blocks_feasible_reuse);
+    run_test("root gating allows structurally dead reuse", test_root_gating_allows_structural_dead);
+    run_test("pending demand registers protection", test_pending_demand_protection);
+
     if (failures != 0) { return 1; }
     std::cout << "ok\n";
     return 0;

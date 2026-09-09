@@ -184,7 +184,8 @@ void test_kv_store(ninfer::DeviceContext& device) {
 
     const auto address = addresses.create_active(3, 0);
     expect(address.has_value(), "active KV address allocation");
-    addresses.materialize_to_tokens(*address, 65, device.stream);
+    expect(addresses.materialize_to_tokens(*address, 65, device.stream) == store::KvGrowth::Ok,
+           "KV materialization returns Ok");
     device.synchronize();
     expect(addresses.mapped_pages(*address) == 2 && addresses.committed_frontier(*address) == 0,
            "physical KV append does not publish canonical coverage before commit");
@@ -197,7 +198,8 @@ void test_kv_store(ninfer::DeviceContext& device) {
     expect(pages.active_address_references(addresses.logical_page(*address, 0)) == 1 &&
                pages.active_address_references(addresses.logical_page(*address, 1)) == 1,
            "active KV membership is counted on each logical page");
-    addresses.materialize_to_tokens(*address, 129, device.stream);
+    expect(addresses.materialize_to_tokens(*address, 129, device.stream) == store::KvGrowth::Ok,
+           "KV materialization returns Ok");
     device.synchronize();
     expect(read_block_table(physical_tables, 0, 3) == std::vector<std::int32_t>({0, 1, 2}),
            "incremental KV materialization preserves the existing mapping prefix");
@@ -319,7 +321,8 @@ void test_kv_store(ninfer::DeviceContext& device) {
     const auto snapshot_source      = addresses.create_active(3, 0);
     const auto snapshot_destination = addresses.create_inactive();
     expect(snapshot_source && snapshot_destination, "active KV snapshot endpoints allocate");
-    addresses.materialize_to_tokens(*snapshot_source, 65, device.stream);
+    expect(addresses.materialize_to_tokens(*snapshot_source, 65, device.stream) == store::KvGrowth::Ok,
+           "KV materialization returns Ok");
     addresses.commit_frontier(*snapshot_source, 65);
     const auto snapshot_full = addresses.logical_page(*snapshot_source, 0);
     const auto snapshot_tail = addresses.logical_page(*snapshot_source, 1);
@@ -344,7 +347,8 @@ void test_kv_store(ninfer::DeviceContext& device) {
 
     const auto alternating = addresses.create_active(4, 0);
     expect(alternating.has_value(), "alternating Host release address allocation");
-    addresses.materialize_to_tokens(*alternating, 193, device.stream);
+    expect(addresses.materialize_to_tokens(*alternating, 193, device.stream) == store::KvGrowth::Ok,
+           "KV materialization returns Ok");
     addresses.commit_frontier(*alternating, 193);
     addresses.deactivate(*alternating);
     const std::array alternating_pages{
@@ -377,7 +381,8 @@ void test_kv_store(ninfer::DeviceContext& device) {
 
     const auto shared = addresses.create_active(3, 0);
     expect(shared.has_value(), "shared-prefix source address allocation");
-    addresses.materialize_to_tokens(*shared, 65, device.stream);
+    expect(addresses.materialize_to_tokens(*shared, 65, device.stream) == store::KvGrowth::Ok,
+           "KV materialization returns Ok");
     addresses.commit_frontier(*shared, 65);
     addresses.set_checkpoint_requirement(*shared, 65);
     addresses.deactivate(*shared);
@@ -399,7 +404,8 @@ void test_kv_store(ninfer::DeviceContext& device) {
                branch_one_tail != shared_tail && pages.address_references(shared_full) == 2 &&
                pages.address_references(shared_tail) == 1,
            "shared branch references full pages and publishes a private partial tail");
-    addresses.materialize_to_tokens(*branch_one, 66, device.stream);
+    expect(addresses.materialize_to_tokens(*branch_one, 66, device.stream) == store::KvGrowth::Ok,
+           "KV materialization returns Ok");
     addresses.commit_frontier(*branch_one, 66);
     expect(pages.committed_columns(shared_tail) == 1 &&
                pages.committed_columns(branch_one_tail) == 2,
@@ -432,7 +438,8 @@ void test_kv_store(ninfer::DeviceContext& device) {
 
     const auto mixed_source = addresses.create_active(4, 0);
     expect(mixed_source.has_value(), "mixed snapshot retained-prefix source allocation");
-    addresses.materialize_to_tokens(*mixed_source, 65, device.stream);
+    expect(addresses.materialize_to_tokens(*mixed_source, 65, device.stream) == store::KvGrowth::Ok,
+           "KV materialization returns Ok");
     addresses.commit_frontier(*mixed_source, 65);
     addresses.set_checkpoint_requirement(*mixed_source, 65);
     addresses.deactivate(*mixed_source);
@@ -446,7 +453,8 @@ void test_kv_store(ninfer::DeviceContext& device) {
                              device.transfer_stream);
     CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
     addresses.commit_prefix_fork(std::move(mixed_fork), device.stream);
-    addresses.materialize_to_tokens(*mixed_active, 130, device.stream);
+    expect(addresses.materialize_to_tokens(*mixed_active, 130, device.stream) == store::KvGrowth::Ok,
+           "KV materialization returns Ok");
     addresses.commit_frontier(*mixed_active, 130);
     const auto mixed_mutable_full = addresses.logical_page(*mixed_active, 1);
     const auto mixed_tail         = addresses.logical_page(*mixed_active, 2);
@@ -495,7 +503,8 @@ void test_kv_store(ninfer::DeviceContext& device) {
             pages.writer_references(first_snapshot_tail) == 1,
         "mixed snapshot reuses immutable full pages, freezes mutable full pages, and copies tail");
 
-    addresses.materialize_to_tokens(*first_snapshot_active, 192, device.stream);
+    expect(addresses.materialize_to_tokens(*first_snapshot_active, 192, device.stream) == store::KvGrowth::Ok,
+           "KV materialization returns Ok");
     addresses.commit_frontier(*first_snapshot_active, 192);
     const store::KVActiveSnapshotShape aligned_shape =
         addresses.active_snapshot_shape(*first_snapshot_active, 192);
@@ -509,7 +518,8 @@ void test_kv_store(ninfer::DeviceContext& device) {
         addresses.prepare_active_snapshot(*first_snapshot_active, *aligned_active, 192);
     expect(!aligned_snapshot.needs_tail_copy(), "aligned mixed snapshot requires no KV copy");
     addresses.commit_active_snapshot(std::move(aligned_snapshot), device.stream);
-    addresses.materialize_to_tokens(*aligned_active, 193, device.stream);
+    expect(addresses.materialize_to_tokens(*aligned_active, 193, device.stream) == store::KvGrowth::Ok,
+           "KV materialization returns Ok");
     addresses.commit_frontier(*aligned_active, 193);
     expect(addresses.active(*aligned_active) && addresses.mapped_pages(*aligned_active) == 4 &&
                pages.writer_references(addresses.logical_page(*aligned_active, 3)) == 1,
@@ -523,14 +533,16 @@ void test_kv_store(ninfer::DeviceContext& device) {
 
     const auto filler = addresses.create_active(4, 0);
     expect(filler.has_value(), "full-capacity staged-fork filler allocation");
-    addresses.materialize_to_tokens(*filler, 193, device.stream);
+    expect(addresses.materialize_to_tokens(*filler, 193, device.stream) == store::KvGrowth::Ok,
+           "KV materialization returns Ok");
     addresses.commit_frontier(*filler, 193);
     addresses.set_checkpoint_requirement(*filler, 193);
     addresses.deactivate(*filler);
 
     const auto retained = addresses.create_active(4, 0);
     expect(retained.has_value(), "full-capacity retained source allocation");
-    addresses.materialize_to_tokens(*retained, 65, device.stream);
+    expect(addresses.materialize_to_tokens(*retained, 65, device.stream) == store::KvGrowth::Ok,
+           "KV materialization returns Ok");
     addresses.commit_frontier(*retained, 65);
     addresses.set_checkpoint_requirement(*retained, 65);
     addresses.deactivate(*retained);
@@ -578,6 +590,71 @@ void test_kv_store(ninfer::DeviceContext& device) {
            "staged retained fork closes Device and Host ownership without leaks");
 }
 
+void test_kv_growth(ninfer::DeviceContext& device) {
+    // PREFIX-PLAN P0: growth beyond entitlement uses resize_reservation; pool exhaustion is a
+    // normal KvGrowth::PoolExhausted result, never an exception; sub-frontier targets stay an I1 bug.
+    ninfer::LayoutBuilder builder;
+    ninfer::DeviceKVPagePoolSpec page_spec{
+        .page_group_count = 8,
+        .geometry =
+            {
+                .page_tokens        = static_cast<std::uint32_t>(ninfer::kPagedKVPageSize),
+                .device_plane_order = ninfer::PagedKVPlaneOrder::PageMajor,
+                .planes = {{.dtype = ninfer::DType::BF16, .leading_extent = 8, .head_extent = 2}},
+            },
+    };
+    const ninfer::DeviceKVPagePoolLayout page_layout =
+        ninfer::plan_device_kv_page_pool(builder, page_spec);
+    const ninfer::KVExecutionTableLayout table_layout =
+        ninfer::plan_kv_execution_tables(builder, {.logical_page_capacity = 4, .table_rows = 2});
+    ninfer::DeviceArena arena(builder.finish(256));
+    const ninfer::DeviceSpan backing{arena.base(), arena.capacity()};
+    ninfer::DeviceKVPagePool physical_pages(backing, page_layout);
+    ninfer::KVExecutionTablePool physical_tables(backing, table_layout, physical_pages);
+    const ninfer::HostKVPageLayout host_layout =
+        ninfer::plan_host_kv_page_layout(physical_pages.geometry());
+    const std::array host_layouts{host_layout};
+    ninfer::HostKVArena host_arena(host_layout.page_stride * 8, host_layouts);
+    store::LogicalKVPageStore pages(physical_pages, physical_pages.capacity_pages() + 8U);
+    store::HostKVExtentStore extents(host_arena, 8);
+    store::KVAddressSpaceStore addresses(pages, physical_tables, 4, 4);
+
+    const auto grow = addresses.create_active(2, 0);
+    expect(grow.has_value(), "KV growth address allocation");
+    expect(addresses.materialize_to_tokens(*grow, 65, device.stream) == store::KvGrowth::Ok,
+           "in-entitlement KV materialization returns Ok");
+    device.synchronize();
+    expect(addresses.mapped_pages(*grow) == 2, "KV growth address maps two pages");
+
+    bool monotonic_threw = false;
+    try {
+        (void)addresses.materialize_to_tokens(*grow, 32, device.stream);
+    } catch (const std::invalid_argument&) {
+        monotonic_threw = true;
+    }
+    expect(monotonic_threw, "sub-frontier KV materialization target is an invariant violation");
+
+    std::vector<std::optional<store::KVAddressSpaceHandle>> fillers;
+    while (physical_pages.available_pages() > 0) {
+        std::optional<store::KVAddressSpaceHandle> filler;
+        try {
+            filler = addresses.create_active(1, 0);
+        } catch (const std::bad_alloc&) {
+            break;
+        }
+        if (!filler.has_value()) { break; }
+        fillers.push_back(std::move(filler));
+    }
+    const auto growth = addresses.materialize_to_tokens(*grow, 130, device.stream);
+    expect(growth == store::KvGrowth::PoolExhausted,
+           "pool exhaustion returns PoolExhausted without throwing");
+    expect(!addresses.can_materialize_to_tokens(*grow, 130),
+           "can_materialize_to_tokens agrees with PoolExhausted");
+    expect(addresses.can_materialize_to_tokens(*grow, 65),
+           "can_materialize_to_tokens is true for the mapped frontier");
+    expect(addresses.mapped_pages(*grow) == 2, "failed growth leaves the mapped prefix untouched");
+}
+
 } // namespace
 
 int main() {
@@ -593,6 +670,7 @@ int main() {
         ninfer::DeviceContext device(0);
         test_state_store(device);
         test_kv_store(device);
+        test_kv_growth(device);
         device.synchronize();
     } catch (const std::exception& error) {
         std::cerr << "FAIL: unexpected exception: " << error.what() << '\n';

@@ -411,6 +411,19 @@ bool Program<Variant>::has_context_transaction() const noexcept {
 }
 
 template <>
+SequenceGrowth Program<Variant>::probe_decode_capacity(SequenceHandle<Variant> sequence,
+                                                       std::uint32_t remaining) const {
+    return impl_->probe_decode_capacity(sequence, remaining);
+}
+
+template <>
+void Program<Variant>::mark_capacity_stalled(SequenceHandle<Variant> sequence) {
+    impl_->mark_capacity_stalled(sequence);
+}
+
+
+
+template <>
 PrefillProgress<Variant>
 Program<Variant>::advance_prefill(SequenceHandle<Variant> sequence,
                                   runtime::ExecutionTiming* failed_timing) {

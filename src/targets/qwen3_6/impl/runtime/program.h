@@ -1267,6 +1267,13 @@ private:
     [[nodiscard]] std::uint32_t backend_kv_valid(const SequenceState& sequence) const noexcept;
     [[nodiscard]] qwen3_6::PagedKVCacheView text_kv_view(const SequenceState& sequence) const;
     [[nodiscard]] qwen3_6::PagedKVCacheView mtp_kv_view(const SequenceState& sequence) const;
+public:
+    // PREFIX-PLAN P0: request-scoped decode KV growth probe and capacity stall marker (core).
+    [[nodiscard]] SequenceGrowth probe_decode_capacity(SequenceHandle sequence,
+                                                       std::uint32_t remaining) const;
+    void mark_capacity_stalled(SequenceHandle sequence);
+    [[nodiscard]] std::uint32_t checkpoint_references(StateImageHandle handle) const noexcept;
+    [[nodiscard]] bool try_release_superseded_anchor(std::uint32_t lane);
 };
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS
