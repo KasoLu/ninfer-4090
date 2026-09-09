@@ -6726,11 +6726,14 @@ detail::PhysicalResources ProgramImplCore::resident_resources(const SequenceStat
                 const std::uint32_t mapped      = addresses.mapped_pages(address);
                 const std::uint32_t entitlement = addresses.entitlement(address);
                 if (entitlement < mapped ||
-mapped >
+                    mapped >
                         std::numeric_limits<std::uint32_t>::max() - device_pages) {
                     throw std::logic_error("resident active KV entitlement is inconsistent");
                 }
-                device_pages += mapped;
+                // PREFIX-PLAN E4: the loop above already counts this owner's exclusive mapped
+                // device pages (shared pages survive this owner's release). No bulk term is
+                // added: the unmapped reservation headroom is pool-level accounting and would
+                // overstate the owner's footprint under dynamic pages.
             }
         };
         add_kv(*text_kv_addresses, *text_kv_pages, sequence.kv->text, out.device.main_kv_pages);
