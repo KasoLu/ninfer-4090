@@ -634,14 +634,11 @@ void test_kv_growth(ninfer::DeviceContext& device) {
     }
     expect(monotonic_threw, "sub-frontier KV materialization target is an invariant violation");
 
-    // Exhaust the page pool with a single large filler on row 1 (grow holds row 0).
-    std::optional<store::KVAddressSpaceHandle> filler;
-    try {
-        filler = addresses.create_active(physical_pages.available_pages(), 1);
-    } catch (const std::bad_alloc&) {
-        // Pool already exhausted by grow's reservation.
+    // Exhaust the page pool with a standalone reservation (no new address/row needed).
+    std::optional<ninfer::DeviceKVPageReservation> pool_exhauster;
+    if (physical_pages.available_pages() > 0) {
+        pool_exhauster = physical_pages.reserve(physical_pages.available_pages());
     }
-    (void)filler;
     const auto growth = addresses.materialize_to_tokens(*grow, 130, device.stream);
     expect(growth == store::KvGrowth::PoolExhausted,
            "pool exhaustion returns PoolExhausted without throwing");

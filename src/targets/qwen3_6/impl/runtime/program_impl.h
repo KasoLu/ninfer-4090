@@ -7181,7 +7181,14 @@ StartResult ProgramImplCore::start_request(MaterializationTransaction& transacti
             actual.device.main_kv_pages > expected.device.main_kv_pages ||
             actual.device.backend_kv_pages > expected.device.backend_kv_pages ||
             actual.host != expected.host) {
-            throw std::logic_error("materialized sequence does not match its active entitlement");
+            throw std::logic_error(
+                "materialized sequence does not match its active entitlement: "
+                "state_slots " + std::to_string(actual.device.state_slots) + " vs " +
+                std::to_string(expected.device.state_slots) +
+                "; main_kv " + std::to_string(actual.device.main_kv_pages) + " vs " +
+                std::to_string(expected.device.main_kv_pages) +
+                "; backend_kv " + std::to_string(actual.device.backend_kv_pages) + " vs " +
+                std::to_string(expected.device.backend_kv_pages));
         }
         if (details.reuse != ReusePath::Root) {
             if (transaction.state_restored) {
