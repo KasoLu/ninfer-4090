@@ -413,7 +413,11 @@ RequestBasePlan ProgramImplCore::plan_request(const PreparedPromptData& prompt,
             group.identity = std::move(identity);
         }
     }
-    root_active.state_slots = 2U; // PREFIX-PLAN P2 Mechanism A: root run reserves 1 capture destination slot
+    // PREFIX-PLAN P2 Mechanism A: root run reserves 1 capture destination slot.  Single-slot
+    // Device pools cannot host active + destination, so fall back to the baseline in-place
+    // freeze (the frozen active image is the capture destination; nothing can contend).
+    root_active.state_slots =
+        (state_store != nullptr && state_store->device_capacity() >= 2U) ? 2U : 1U;
     const detail::PhysicalResources root_vector{.device = root_active};
     base->root_demand = detail::PhysicalDemand{
         .active_entitlement       = root_vector,
