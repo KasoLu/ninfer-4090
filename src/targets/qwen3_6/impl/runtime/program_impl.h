@@ -2855,6 +2855,7 @@ void ProgramImplCore::publish_checkpoint_drop(SequenceState& sequence,
         }
         dropped_state              = sequence.state.read;
         sequence.endpoint_valid    = false;
+        sequence.endpoint_frontier = 0;
         sequence.state             = {};
         sequence.tail_hidden       = {};
         sequence.tail_hidden_valid = false;
@@ -4687,6 +4688,7 @@ void ProgramImplCore::prepare_consumed_source(MaterializationTransaction& transa
     if (source.endpoint_valid && source.execution_frontier > details.reuse_base) {
         const StateImageHandle endpoint = source.state.read;
         source.endpoint_valid           = false;
+        source.endpoint_frontier          = 0;
         source.state                    = {};
         source.tail_hidden              = {};
         source.tail_hidden_valid        = false;
@@ -6733,6 +6735,7 @@ void ProgramImplCore::retire_continuation_slot(std::uint32_t index) noexcept {
     sequence.mtp_draft_count         = 0;
     sequence.tail_hidden_valid       = false;
     sequence.endpoint_valid          = false;
+    sequence.endpoint_frontier    = 0;
     sequence.rewrite_checkpoint      = {};
     sequence.rebuild_work            = {};
     sequence.rebuild_tail_begin      = 0;
@@ -7408,11 +7411,22 @@ void ProgramImplCore::populate_continuation_summary(const SequenceState& sequenc
     summary.long_anchors.clear();
     summary.active_references = 0;
     if (sequence.endpoint_valid) {
+        const std::uint32_t endpoint_frontier =
+            (sequence.endpoint_frontier != 0 &&
+             sequence.endpoint_frontier < sequence.execution_frontier)
+                ? sequence.endpoint_frontier
+                : sequence.execution_frontier;
         const runtime::CheckpointRef endpoint{
             .kind     = runtime::CheckpointKind::SessionEndpoint,
-            .frontier = sequence.execution_frontier,
+            .frontier = endpoint_frontier,
         };
-        runtime::PrefillWork endpoint_work = sequence.rebuild_work;
+        const runtime::PrefillWork endpoint_work =
+            (endpoint_frontier < sequence.execution_frontier)
+                ? runtime::make_prefill_work(0, endpoint_frontier,
+                                                      sequence.rebuild_work.vision_items,
+                                                      sequence.rebuild_work.vision_patches,
+                                                      prefill_chunk)
+                : sequence.rebuild_work;
         summary.endpoint =
             checkpoint_summary(sequence, endpoint, sequence.state.read, endpoint_work);
     }
@@ -8562,6 +8576,9 @@ ActiveCaptureResult ProgramImplCore::publish_active_capture(ActiveCaptureTransac
     const bool post_begin_prompt_frontier_capture =
         prefill.cursor == prefill.prompt_tokens && request.lifecycle != Lifecycle::Prefilling;
     ++prefill.next_capture;
+    if (transaction.group.frontier == prefill.prompt_tokens) {
+        sequence.endpoint_frontier = prefill.prompt_tokens;
+    }
     if (post_begin_prompt_frontier_capture) { request.prefill.reset(); }
     transaction.published = true;
     return out;
@@ -10109,6 +10126,7 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
         }
 
         sequence.endpoint_valid = false;
+        sequence.endpoint_frontier = 0;
         if (!preserving_source) { trim_sequence_kv(sequence, base, backend_kv_valid(sequence)); }
         bind_sequence_kv(sequence);
         const std::uint32_t backend_materialized =
@@ -10750,6 +10768,7 @@ void ProgramImplCore::release_active_sequence_state_strict(SequenceState& sequen
     sequence.rewrite_state  = std::nullopt;
     sequence.reserved_state = std::nullopt;
     sequence.endpoint_valid = false;
+    sequence.endpoint_frontier = 0;
     sequence.long_anchors.clear();
     sequence.tail_hidden               = {};
     sequence.rewrite_checkpoint_hidden = {};
@@ -10820,6 +10839,7 @@ void ProgramImplCore::release_sequence_state_strict(SequenceState& sequence) noe
     sequence.rewrite_state  = std::nullopt;
     sequence.reserved_state = std::nullopt;
     sequence.endpoint_valid = false;
+    sequence.endpoint_frontier = 0;
     sequence.long_anchors.clear();
     sequence.tail_hidden               = {};
     sequence.rewrite_checkpoint_hidden = {};
@@ -10885,6 +10905,7 @@ void ProgramImplCore::release_sequence_state(SequenceState& sequence) noexcept {
     sequence.rewrite_state  = std::nullopt;
     sequence.reserved_state = std::nullopt;
     sequence.endpoint_valid = false;
+    sequence.endpoint_frontier = 0;
     sequence.long_anchors.clear();
     sequence.tail_hidden               = {};
     sequence.rewrite_checkpoint_hidden = {};

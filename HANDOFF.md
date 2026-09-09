@@ -1,108 +1,90 @@
-# HANDOFF.md — PREFIX-PLAN v2 实施交接（ninfer-4090-kaso / prefix-v2）
+# HANDOFF.md — PREFIX-PLAN v2 前缀复用失效调查（当前状态快照）
 
-> 写于本会话切换前。目标会话从本文 + `PREFIX-PLAN.md` v2 + `NOTE.md` 恢复。
-> 仓库：`C:\Workspace\codes\ninfer-4090-kaso`，分支 prefix-v2（HEAD 4f0faf0c，前两条 5a09e419 / d24fdb90）。
-> **工作树已含 P0 全部未提交改动（11 文件，未编译）**。
+> 生成时间：2026-09-09（本轮会话末尾，会话已因特殊控制符号反复异常停止）。本文件是**当前唯一权威交接**：旧版 HANDOFF.md（P0 时代，HEAD 4f0faf0c）已作废；NOTE.md 为本仓库持久工作日志（§0–§13，未跟踪），上下文被压缩后应重读本文件 + NOTE.md。
+> **会话卫生警告**：后续会话的回复中**不要**复现聊天模板的控制序列文本；讨论相关 token 一律用数字 ID（如 198 / 271 / 248068 / 248069），否则模型输出会被截断。
 
-## 1. 任务与三目标（用户原话，任务依据）
+## 1. 任务与现状一句话
+PREFIX-PLAN v2（分支 prefix-v2，HEAD `0766142a`）在 4090 真实 serve 部署下**前缀复用完全失效**：每轮对话/工具回报都全量 re-prefill（`prefix_reuse_path=root, prefix_cache_hit_tokens=0`）。已确诊到 digest 链分歧的精确位置与形态；修复方案待按 §6 定案实施。相同客户端在 prefix-v1 分支上复用正常 → 客户端侧已排除（用户原话裁决）。
 
-- 原始任务："对当前分支中，涉及到kvcache和prefix以及prefill相关的逻辑，进行一个全面完善的梳理，将结果落盘至KVCACHE.md中"（已完成：KVCACHE.md 984行）。
-- 派生："结合KVCACHE.md分析我实际使用中的三个问题，落盘PREFIX-ISSUS.md"（已完成 v2）。
-- 设计三目标（PREFIX-PLAN.md §0）："1.max_tokens只是最大值的约束，不做强制性的page占用，动态申请，申请失败=上下文窗口到极限=正常逻辑 2.渲染结果与prefix匹配时无论如何不得丢prefix（除非一开始就不匹配才全量prefill） 3.所有page按需分配，prefix稳定必复用，禁止prefix匹配时触发全量prefill"。
-- 实施任务："现在，按照PREFIX-PLAN.md，开始执行"；可行性审查已完成并合并（"将本次分析，合并至PREFIX-PLAN.md文档中，对列出的问题给予修正"）。
-- 持续约束：**改动最小、不引入新 bug**；prefix-v1 分支（= prefix-v2 + 15 commits，tip b806b2f6）**仅作方向参考，不能照搬**（§9 对照表：fail_all 明确放弃）；"记得实时更新TODO和GOAL"。
-- 用户三令：**禁止使用 edit 工具**（本会话连续退化），文件修改一律 `write` 落 PS1 到 `.tmp-prefix-plan\` + `pwsh -NoProfile -File` 执行。
+## 2. 环境
+- 本地仓库：`C:\Workspace\codes\ninfer-4090-kaso`（分支 prefix-v2）。
+- 本地编译/ctest：`docker run --rm -v C:\Workspace\codes\ninfer-4090-kaso:/src -w /src/build ninfer-local-build:latest sh -c "ninja && ctest --output-on-failure"`（无 GPU；GPU 测试本地 skip；期望 ninja 32–33/33 + ctest 100% 104/104）。
+- 4090 远程：`py -3 scripts/remote_4090.py run "<cmd>" inf`（**cmd 语法直传，勿嵌套 powershell/管道**；同步代码用 `git merge --ff-only origin/prefix-v2`——`git pull --ff-only` 在该仓库报 "Cannot fast-forward to multiple branches" 歧义）。
+- 4090 仓库：`C:\Data\ninfer\ninfer-4090-kaso`；devel 容器 `66e132d9aa6a`（ninfer-4090-kaso-devel，镜像 `ninfer-4090-kaso-devel:0905`，bind 挂载 + `/models` 卷，仅含 `qwen3_8_27b.ninfer` 18.2GB）。
+- 4090 编译：`docker run --rm -v C:\Data\ninfer\ninfer-4090-kaso:/ninfer-4090-kaso -w /ninfer-4090-kaso/build ninfer-4090-kaso-devel:0905 ninja`（当前增量基线 43/43）。
+- 4090 复现 serve（需先请用户停常驻推理容器，GPU 被占即 nvidia-smi 显存 >20GB）：
+  `NINFER_ADMISSION_TRACE=1 build/apps/ninfer-serve /models/qwen3_8_27b.ninfer --preserve-thinking --chat-template v22_4 --spec mtp --draft-tokens 3 --lm-head-draft --kv-dtype rk8v4 --max-context 200000 --request-log-jsonl logs/log.txt`
+- serve 引擎配置（实测自 startup 日志）：max_concurrency=1、kv_capacity=200000（3125 page groups）、prefix_reuse=true、prefill_chunk=1024；context_cache：device_state_slots=1、host_state_slots=0、host_kv_bytes=0、max_shared_prefixes=1、max_private_continuations=2、automatic_private_anchors=2、**total_device_state_slots=2**（device 池 1 + shared 池 1）。
+- DSH 约束：file policy=danger-full-access；approval prompts **禁用**（不得设 sandbox_permissions）；文件修改走 PS1/write 范式（.tmp-prefix-plan/ + `pwsh -NoProfile -File`，单引号 here-string，CRLF 保持，UTF8 no-BOM，锚点断言 count==1）；edit 工具历史上易退化（小范围可用，退化立即切 write）；中间结论落盘 NOTE.md。
 
-## 2. 磁盘权威文档（全部在仓库根）
+## 3. 提交链（全部已 push origin/prefix-v2 = KasoLu/ninfer-4090；4090 已同步并编译）
+```
+4f0faf0c 基线
+→ 2c26c74f, 809537ff, bbb41e3b, a066cb15   （P0/P1/P2-A 实现）
+→ 3a6b7d06  fix(P2-A): root state slot reservation capacity-adaptive
+→ 83f60ca9  chore(debug): NINFER_ADMISSION_TRACE gates（埋点第一层）
+→ e341e68f  fix(P1): hard protection UAF + M3 window exit + committed-record exclusion
+→ 1300f493  fix(P1-M3): release queued hard-protection record on admission
+→ ca208f76  chore(debug): trace prefix-index key-miss
+→ 0766142a  chore(debug): prefix digest divergence trace（= 当前 HEAD = 4090 二进制）
+```
+已修复并验证的准入死锁链（勿回归）：UAF（protected_owners span 悬垂）→ M3 需求窗口只进不出 → 已终结请求的 committed 记录误参与硬保护 → admit 成功后 pending 记录永留自保护。四层修复后 4090 上**无死锁**、请求全部正常完成；唯一剩余缺陷 = §4 的复用失效。
 
-| 文件 | 状态 |
-|---|---|
-| `KVCACHE.md` | 分支全景 §0-§13（984 行），已完成 |
-| `PREFIX-ISSUS.md` | 三问题归因 v2（250 行），已完成 |
-| `PREFIX-PLAN.md` v2 | **执行规格**（376 行/56948B，§0-§11；已并入 7 处小误修正 + M1-M7 设计修正） |
-| `PREFIX-PLAN-REVIEW.md` | 可行性审查报告（181 行/34352B；判定=条件通过，M1-M7 + F-2） |
-| `NOTE.md` | 本会话持久工作日志（28829B：任务/定案/代码事实/进度/环境备忘） |
-| `.tmp-prefix-plan\` | apply_p0a/p0b/p0c/p0d/p0g.ps1 + patch_p0d/patch_f6b/patch_f7c.ps1（**已执行完毕的锚点脚本，不可重跑**——锚点已消耗，Subst 会 count=0） |
+## 4. 当前缺陷：前缀复用全失效（已确诊至 digest 分歧形态）
+### 4.1 现象（logs/log.txt + logs/admission_serve_trace.log，2026-09-09 22:01–22:05，0766142a 二进制，单会话多轮 + tool history + thinking）
+- 7 个请求全部 `prefix_reuse_path=root, prefix_cache_hit_tokens=0` → 每轮全量 re-prefill（prompt 58712/60328/61605/…，ttft 最高 37s）。
+- 每轮 admission：私有索引恰 1 个 occupied 条目 = 上一轮 retained root 的 SessionEndpoint（kind=0），随后 **key-miss**；identity_tag 两侧一致（327937），排除 spec/draft/kv_dtype 记账差异 → root 全量重算 + 驱逐上一轮 owner（private_owners_evicted=1/轮）。
+- 全程 **captures=0、forks/moves/restores=0、anchors=0**（automatic_private_anchors=2 从未生效）。
 
-## 3. P0 改动清单（全部已落盘，全部未编译）
+### 4.2 决定性分歧数据（divergence trace，0766142a 埋点输出；st@ 行 token_type 恒 0、三轴位置恒=index、rope_delta=0）
+| 轮次 | stored_size | incoming_size | first（首个分歧 frontier） | stored 侧 [first-4..first] token ID 序列 |
+|---|---|---|---|---|
+| req2 | 58822 | 60328 | 58743 | 13, 198, 248069, 271, 97625 |
+| req3 | 60734 | 61605 | 60574 | 13, 198, 248069, 271, 98428 |
+| req4 | 63401 | 14751（新会话，incoming 远短于 stored）| 9186 | 198, 248068, 198, 760, 1156 |
+| req5 | 15728 | 15931 | 15451 | 13, 198, 248069, 271, 100875 |
+| req6 | 16251 | 16469 | 16024 | 13, 198, 248069, 271, 63 |
+| req7 | 16698 | 16945 | 16504 | 13, 198, 248069, 271, 111708 |
 
-### 3.1 支柱一：动态 KV 页（已实现）
+（stored_size = 上轮 prompt+completion，如 req1: 58712+110=58822 ✓，ledger 记账自洽。）
 
-1. **`src/targets/qwen3_6/impl/runtime/logical_kv_store.h`**（93252B/1908 行，CRLF）
-   - detail 命名空间加 `enum class KvGrowth : std::uint8_t { Ok, PoolExhausted, InvalidTarget };`（:27 区）。
-   - `materialize_to_tokens(handle, tokens, stream)` 由 `void` 改 `[[nodiscard]] KvGrowth`：
-     - `target < page_count` → `throw std::invalid_argument("KV materialization exceeds active entitlement")`（I1 单调性，原串保留）；
-     - `target > page_capacity_` → `KvGrowth::InvalidTarget`（**基线无此分支**——新代码移除 entitlement 守卫后必须显式补，否则 memberships span 越界写穿）；
-     - `target == page_count` → Ok；
-     - `needed = target - page_count > reservation.pages()` 时：`can_resize_reservation(reservation, needed)==false` → `PoolExhausted`（无异常），否则 `resize_reservation` 原子批后继续物化。
-     - publish try/catch 回滚 dematerialize 结构未动，物化异常仍上抛（E2：其他路径池耗尽=bug→fail_all 暴露）。
-   - 新增 `[[nodiscard]] bool can_materialize_to_tokens(handle, tokens) const noexcept`（valid/active/row/reservation.valid → target 边界 → needed<=headroom → can_resize_reservation）。
-   - 语义依据：`entitlement(address) = page_count + reservation.pages()`（:1822 区）；页池 `can_resize_reservation(reservation,new) const noexcept`（`src/core/paged_kv_cache.h:226-228`/`.cpp`，used=allocated+(reserved-reservation.pages)+new≤capacity）= 无异常预检；`resize_reservation` 失败 throw bad_alloc。
-2. **调用方 `!= KvGrowth::Ok` → throw**（5 处，错误串即调试索引）：
-   - `program_impl.h` `materialize_sequence_kv`（:10755 区）：text → `logic_error("text KV growth failed during sequence materialization")`；backend → `("backend KV growth failed during sequence materialization")`。decode/prefill 路径的 PoolExhausted 结构性不该发生（decode 有轮首 probe+stall；prefill 只从激活期已预留页物化，M4），发生=bug。
-   - `program_impl.h` causal score 行 → `"causal score KV materialization failed"`；capture 行 → `"capture KV materialization failed"`。
-   - `session_snapshot_impl.h` → `"session snapshot KV materialization failed"`。
-   - `tests/targets/qwen3_6/test_context_store.cpp` 原 12 处调用全改 `expect(... == store::KvGrowth::Ok, "KV materialization returns Ok");`（12 场景全 target≤entitlement，行为不变；构建无 -Werror）。
-3. **`request_plan_impl.h`**（75275B/1306 行）：删 `reserved_context_tokens` 局部；`text_kv_page_entitlement = pages_for_tokens(base->summary.prompt_tokens)`；MTP backend = `pages_for_tokens(min(capacity, prompt_tokens + draft_window - 1))`；DFlash backend = `pages_for_tokens(prompt_tokens)`。`capacity_output/effective_output_tokens/effective_limit_reason` 保持基线语义不动（M6：`requested<=capacity_output ? OutputLimit : ContextCapacity`）。`root_active.state_slots=1U` 不动（P2 机制 A 才改 2）。
-4. **新 API（7 文件）**：
-   - `src/targets/qwen3_6/export/ninfer/targets/qwen3_6/runtime.h`：`class Program` 前加 `enum class SequenceGrowth : std::uint8_t { Ok, PoolExhausted, InvalidTarget };`（与 detail::KvGrowth 不同名防遮蔽）；public 声明 `[[nodiscard]] SequenceGrowth probe_decode_capacity(SequenceHandle<Variant> sequence, std::uint32_t remaining) const;` + `void mark_capacity_stalled(SequenceHandle<Variant> sequence);`（`has_context_transaction()` 声明后）。
-   - `api_impl.h`：两个 `template <>` 委托透传 `impl_->`。
-   - `program.h`：core 声明（裸 `SequenceHandle`）。
-   - `program_impl.h` 实现（`ProgramImplCore::finish` 前插入）：
-     - `probe_decode_capacity`（const 纯查询，不 throw）：`has_context_transaction()||pending_transaction_||!valid_sequence` → InvalidTarget；`lane = ContractAccess::lane(sequence).value`；`state = active_sequence(lane)`；`!state.kv` / `frontier>=capacity` → InvalidTarget。目标公式（镜像 decode 增长，冻结）：ordinary `text=frontier+1`；MTP `extent=min{state.mtp_draft_count, draft_window, remaining>1?remaining-1:0, capacity-frontier-1U}`、`text=frontier+extent+1`、`backend=min(capacity, frontier+extent+draft_window)`；DFlash `extent=min{draft_window, max_by_budget, capacity-frontier-1U}`、`text=frontier+extent+1`、`backend=frontier`（不增长）。`can_materialize_to_tokens` false → PoolExhausted，否则 Ok。
-     - `mark_capacity_stalled`：前置 `!has_context_transaction()&&!pending_transaction_`（否则 `logic_error("capacity stall overlaps an open context transaction")`）；`!valid_sequence`/`!state.kv` throw；`lifecycle != Lifecycle::Active` → `logic_error("capacity stall requires an active decode lane")`。迁移（镜像 terminal commit `program_impl.h:12231` 基线）：`request.lifecycle = Lifecycle::Finishable; request.pending = {}; state.mtp_draft_count = 0;`（probe 在轮首 progress 之后，无需 settle_state_fork/trim）。
-   - `src/runtime/engine/request_record.h`：`terminal_reason` 后加 `bool capacity_stalled = false;`。
-   - `src/runtime/engine/resource_manager.h`：`finish(program, lane, sequence)` 签名加尾参 `bool allow_abort_fallback = true`；`result.status != ConsumeStatus::Consumed` 分支内、`program.abort` fallback **之前**：`if (!allow_abort_fallback) { throw std::logic_error("capacity-stalled terminal settlement did not consume the sequence"); }`（**M5**：stall 请求禁 abort fallback——abort 会 `clear_catalog_entry` 丢该请求自己的 endpoint 目录条目→下轮 prefix 匹配断裂→违反目标2）。
-   - `src/runtime/engine/engine_core.h`：
-     - settle：`resources_.finish(*instance_.program, *request->lane, *request->sequence, request->capacity_stalled);`（第 4 参）。
-     - **stall 循环**（worker_loop，`cancel_active_requests(cancelled_at_boundary, boundary);` 后、首次 `build_round_membership` 前——M1：必须早于 membership 构建，stall lane 被清预算后结构性排除，零预算 lane 进 decode membership 必 throw `"ordinary batch row is not decode-ready"`）：
-       ```cpp
-       // 对 lane 0..max_concurrency_：
-       //   stalled = slots_[lane]；null / !is_decode_ready() / capture_pending / !sequence / !lane / lane->value!=lane → continue
-       //   remaining = stalled->budget ? stalled->budget->remaining() : 0;
-       //   if (instance_.program->probe_decode_capacity(*stalled->sequence, remaining)
-       //       != targets::qwen3_6::SequenceGrowth::PoolExhausted) continue;
-       //   if (stalled->budget) { stalled->budget->commit(remaining); }            // 清零（commit(remaining) 安全）
-       //   stalled->output.preview_terminal(FinishReason::ContextCapacity);        // 引擎侧唯一 reason 来源
-       //   instance_.program->mark_capacity_stalled(*stalled->sequence);
-       //   resources_.mark_terminal_pending(LaneId{static_cast<std::int32_t>(lane)}); // note_capacity_stall 复用
-       //   stalled->terminal_reason = FinishReason::ContextCapacity;
-       //   stalled->capacity_stalled = true;
-       //   stalled->model_state = EngineRequestState::ModelFinished;
-       ```
-       下一轮 `settle_terminal_requests`（:1109 区）自然交付：ownership 校验（`is_model_finished && !capture_pending && lane 匹配 && TerminalPending`，违反 → `logic_error("terminal-pending request has invalid ownership")`→fail_all，**这正是 stall 循环必须检查 `!capture_pending` 的原因**）→ `resources_.finish`（strict）→ program.finish 应 Consumed（lifecycle 已置 Finishable；`!publish_continuation`→Released 合法；Catalogued→记 retained_slot/retained_session_digest）→ `complete_success`（对任意 reason 通用，协议映射已齐备：`FinishReason::ContextCapacity` 在 `include/ninfer/types.h:555`；OpenAI→"length"（`src/serve/openai_chat_response.cpp:46`）、Anthropic→"model_context_window_exceeded"（`anthropic_messages_response.cpp:64`））→ `remove_completed_slot` 内部触发 `request_admission_check` 排队补位。
-     - **§3.5**：worker_loop decode 分支 `run_decode_round(membership, cancelled_at_unit_start);` 后（20 空格缩进）`request_admission_check(); // PREFIX-PLAN P0 (S3): re-arm admission after a decode round (30s blind spot)`（消除 TemporarilyBlocked 者最长等 pending_timeout 的盲区；既有 gate `should_attempt_admission` 含 `previous_unit_was_decode` 已能放行）。
-5. **E4 统计**：`program_impl.h` add_kv lambda `device_pages += entitlement - mapped;` → `device_pages += mapped;`（guard `entitlement - mapped >` → `mapped >`；`entitlement < mapped` 不一致 guard 保留，串 `"resident active KV entitlement is inconsistent"`）。
-6. **P0-g 单测**：`tests/targets/qwen3_6/test_context_store.cpp`（41376B/681 行）新增 `test_kv_growth(ninfer::DeviceContext& device)`（独立 fixture 同 `test_kv_store` 模式）：`grow=create_active(2,0)`→`materialize_to_tokens(*grow,65)==Ok`→`mapped==2`；`materialize_to_tokens(*grow,32)` 期望 `std::invalid_argument`（I1）；filler 循环 `create_active(1,0)`（catch bad_alloc）耗尽 `available_pages()`；`materialize_to_tokens(*grow,130)==store::KvGrowth::PoolExhausted`（**无异常**）；`!can_materialize_to_tokens(*grow,130)`、`can_materialize_to_tokens(*grow,65)==true`；`mapped` 仍 `==2`。main 内 `test_kv_store(device);` 后注册 `test_kv_growth(device);`。
+**形态解读**：
+- req2/3/5/6/7（同会话续轮）：分歧点 = stored 链中第一个**控制 token 簇**（13=换行；198/248068/248069/271 = 本模板的角色/边界类特殊 token；簇后紧跟正常内容 token）。簇位于**生成段前部**（req2 中约为生成偏移 30，即 thinking 段边界标记附近）。簇之前两侧链逐 token 完全一致（prompt 段 + 生成段前缀吻合），簇处 stored=原始特殊 token ID、incoming=客户端从解析后文本重新序列化产生的不同 token。
+- req4（新会话）：incoming 表（14751）远短于 stored（63401），first=9186 处 stored 为模板边界簇 → 新会话 prompt 与 retained 旧会话链自然分歧，**属预期行为**（跨会话本不该复用）。
+- 结论：**不是 v2 的记账 bug**（token/位置/token_type 三输入与 incoming 侧口径一致；v1/v2 的 digest 代码无 diff），而是**存储链把“原始生成 token 流（含模型在生成途中吐出的模板控制 token）”原样纳入 digest，而客户端回放的是“解析后文本的重序列化”**，在第一个控制 token 位置必然分叉。
 
-### 3.2 P0 未做（有意）
+### 4.3 为什么 v1 能复用而 v2 不能（核心未决问题）
+- 本部署两条复用通道在 v2 下全部死亡：
+  1. **Endpoint 通道**：key 打在生成段末尾 frontier（execution_frontier），受 §4.2 分叉影响 → 恒 miss。
+  2. **Anchor/TurnClosure 通道**：`anchors=0` 恒成立 —— total 状态槽=2，retained root 占 1 + 运行中 root 占 1 = 池满，锚点 capture 目的地槽永远无空闲（state_image_store reserve_destination：device 池 free=0 且 host 池=0 → nullopt）→ 自动锚点结构性不可行。
+- v1 在同客户端/同部署下复用正常（用户已验证）。**未核实**：v1 当时靠哪条通道命中（v1 恒 root state_slots=2 的槽位算术与本配置不同；v1 部署的 context_cache 参数是否与本 serve 一致未查）——若 v1 也走 endpoint，则需 diff v1 的 populate_continuation_summary 调用点与存储 frontier 口径（§5 代码锚）。
+- 用户裁决记录（原话）："客户端肯定是没问题的，相同的客户端，已经在prefix-v1分支上验证过，可以直接排除客户端侧的原因。问题肯定出在推理端。"
 
-- E3 prefill stall 通道不做（新 entitlement 后 prefill 只从激活期已预留页物化，枯竭结构性自消，M4）；prefill 增长失败保留防御 throw。
-- M7（root state_slots=2 槽冲突=请求级拒绝）、P1 支柱二、P2 支柱三 均未动。
+### 4.4 修复候选（按性价比排序，尚未实施）
+1. **Endpoint key 前移至“最后一个 prompt 边界”frontier**（推荐先做）：客户端重放时 prompt 段逐 token 字节一致（digest 输入同口径，已实证前缀全匹配），只有生成段受控制 token 重序列化影响 → 把 continuation summary 的存储 key frontier 取为上一轮 prompt 结束处（= 上轮 prompt_tokens，digest 表天然覆盖该前缀），或**同时**双索引（prompt 边界 + 末尾 frontier）。复用损失仅为生成段回放的少量 re-prefill（本 run 约 110–1800 token / 58k+）。
+2. **锚点通道恢复**：让 P2-A 的第二状态槽（预置 capture destination）容量感知化（池紧张时 root 退回 1 槽），使 automatic_private_anchors 能在 total=2 配置下真正建立 prompt 边界锚点 —— 与 1 互补：1 不依赖槽位，2 依赖槽位。
+3. 生成段控制 token 的 digest 归一（模板边界 token 从生成段 digest 输入中排除/归一）——改动面大、语义风险高，列最后选项。
 
-## 4. 下一步（目标会话从这里继续）
+## 5. 关键代码锚（行号 = 0766142a）
+- key 存储：`src/targets/qwen3_6/impl/runtime/program_impl.h` `populate_continuation_summary`（~:7270-7340 区，v1 同区逐字节相同）：stored key = `sequence.prefix_digests.at(execution_frontier)` + identity_tag；`finish()`（:9293-9370）publish_continuation 时 endpoint_valid=true → Catalogued → 引擎侧 rebuild_prefix_index 入私有索引。
+- digest 算法：`src/targets/qwen3_6/impl/runtime/prefix_identity.{h,cpp}`（v1/v2 无 diff）：`append_digest(token, token_type, positions[3], rewrite_frontiers)`；prompt 侧 `assign()`、生成侧 `PrefixShortlistDigests::append_generated(span, rope_delta)`（token_type=0，position=index+rope_delta，本部署恒 0）；`at(frontier)` = digests_[frontier]（覆盖前 frontier 个 token 的链 digest）。
+- key 比对门：`src/runtime/engine/resource_manager.h` inspect 候选循环（~:295-460）：`base.prefix_shortlist_key(index.key.frontier)` 必须与 index.key 精确相等，否则 key-miss（0766142a 在此挂 divergence 扫描）；`prefix_shortlist_key`：`src/targets/qwen3_6/impl/runtime/api_impl.h:111-122`（frontier>size → nullopt → 候选静默跳过）。
+- 锚点/capture：`src/targets/qwen3_6/impl/runtime/state_image_store.h`（device_capacity() = 池总 device 槽数；reserve_destination：with_device 且 free_device_count==0 → nullopt）；P2-A 预置槽消费：`program_impl.h` terminal capture `else if (sequence.reserved_state) { destination_state = *sequence.reserved_state; sequence.reserved_state.reset(); }`（~:8159-8162）；P2-A 槽数决策：`src/targets/qwen3_6/impl/runtime/request_plan_impl.h:370` 区 `root_active.state_slots = (state_store && state_store->device_capacity() >= 2U) ? 2U : 1U;`。
+- 埋点（commit 83f60ca9/ca208f76/0766142a，全部 NINFER_ADMISSION_TRACE=1 门控）：engine_core.h 抛错前 IDLE-BLOCK；resource_manager.h inspect 三处 TB + T1 索引 dump/T2 index-invalid/T3 key-miss；materialization_planner.h root 路径（status/owners/outcomes/protected + PRUNED + goal-null）；program_impl.h inspect_admission 候选明细 + `debug_trace_prefix_divergence`（LCP 首处分歧 + st@ token 行；声明链 runtime.h → api_impl.h → program.h → program_impl.h 实现于 valid_capture_offer 前 ~:6452 区；测试假件 FakeProgram 有 no-op stub）。
+- 测试：`tests/test_resource_manager.cpp`（FakeProgram/FakeShortlistKey 假件须与引擎新增 API 同步）；`tests/targets/qwen3_6_27b/test_engine_prefix_real.cpp`（GPU 电池；本部署配置组合 = 同会话多轮 + device1/host0/shared1 + MTP + preserve_thinking 是覆盖盲区，测试通过但实跑失效）。
 
-1. **P0-h 编译验证**（用户上次说"暂停一下"，未启动）：
-   ```
-   docker run --rm -v C:\Workspace\codes\ninfer-4090-kaso:/src -w /src/build ninfer-local-build:latest ninja
-   docker run --rm -v C:\Workspace\codes\ninfer-4090-kaso:/src -w /src/build ninfer-local-build:latest ctest --output-on-failure
-   ```
-   （AGENTS.md:482 约定：本机无 NVIDIA 显卡，nvcc/ctest 一律在 `ninfer-local-build:latest`（nvidia/cuda 13.1.2 基座，`/usr/local/cuda/bin` 在 PATH，**无默认工作目录**，必须显式 `-w`）；`/src/build/build.ninja` 已存在可复用 Ninja。）
-   - 编译失败大概率点：core 里 `SequenceGrowth`（公共枚举，core 命名空间嵌套在 qwen3_6 下，未限定可见）/ `ContractAccess::lane` 用法 / stall 循环里 `targets::qwen3_6::SequenceGrowth` 解析（ninfer::runtime 内 unqualified 经 ninfer 外层可解析）/ `budget->remaining()` 存在性（GenerationBudget 有 remaining()，`commit(>remaining)` 会 `std::abort()`——`budget->commit(remaining)` 清零安全）。
-   - 通过后：GPU 4090 容器 `ninfer-4090-kaso-dev`（bind `/ninfer-4090-kaso`，端口 1234）验证 **前必须先请用户关闭其常驻推理容器**。验证项（PREFIX-PLAN.md §6 P0）：① serve + `max_tokens=100000`（超池）→ 请求以 `finish_reason="length"`/`"model_context_window_exceeded"` 正常终结、引擎不停摆；② A 占大池 → B stall 终结 → 引擎持续；③ OpenAI/Anthropic 双协议 finish_reason 一致性。
-2. **P1 支柱二**（PREFIX-PLAN.md §3，全部未动）：压力目标空间禁 Evicted 保护 owner 集 P（host 开时允许 D2H 降级，落点 `resource_manager.h build_pressure_inputs :1967-2100` + `materialization_planner.h` owner policy）；**M2 root gating 谓词细化**（仅匹配候选 feasible 或"可被进展变 feasible"时禁选 root；结构性死亡=前缀物理已丢 → 放行 root，用 planner diagnostics `observe_planner_diagnostics resource_manager.h:2482-2497` 的 budget_exhausted/stop_reason 可辨；快速路径 seal_identity 同样加守卫——root 可在快速路径胜出）；**M3 note_pending_demand**（复用 kDemandWindowCapacity=32 窗口 `resource_manager.h:1423`/`commit_demand :2457-2480`；`PrefixDemandRecord :122-126` 无 owner 字段→增 owner 或文档化 lazy expiry；**必须纯窗口插入，不得触发 explicit_credit 清除侧效应**（只看 back() 记录会误清其他请求的匹配 credit）；运维约束 pending+active≤32，serve 默认 max_pending_requests=16、pending_timeout_ms=600000（`src/serve/serve_options.h:33-34`，kMaximumConcurrency=8））。
-3. **P2 支柱三**（§4，全部未动）：机制 A root `state_slots=2`（`request_plan_impl.h root_active :284-289 区` 改 1U→2U + placement 加 reserved_state 目的分支，目的序 prepared→recycled→reserved_state→new；M7：`reserve_state_entitlement program_impl.h:9823/9871` 失败=请求级拒绝，不得 fail_all）；机制 B 轮转锚点图像回收为 fork 目的（`install_private_capture program_impl.h:7974`/`prepare_active_capture :8041`）；机制 C `drop_superseded_anchor` noexcept 七项校验（含 `checkpoint_references(anchor.state)==1`，`state_image_store.h:209-211` 原语齐备）+ skip 分支（`program_impl.h:7822-7826 if (!pressure && !assessment.physically_feasible) → skip`）先释放再重评估一次。
-4. 每完成一步：更新 NOTE.md 进度 + 实时更新 TODO/GOAL + Docker 编译/ctest 回归。
+## 6. 下一步（按序）
+1. **定案 §4.4-1**：endpoint/continuation 存储 key 的 frontier 前移至最后 prompt 边界（可双索引末尾 frontier 兜底）。先纸面设计（“prompt 结束”= prepared prompt 的 token 数 = 上轮 prompt_tokens，生成段之前的边界，digest 表天然覆盖；注意 MTP 与 thinking 段不影响该边界取值，因边界在生成段之前），再 PS1 实施。
+2. 本地 docker build+ctest 全绿 → commit/push → 4090 `git merge --ff-only origin/prefix-v2` + ninja → 请用户停常驻容器后按 §2 serve 命令重跑 2-3 轮（带 NINFER_ADMISSION_TRACE=1）→ 预期：key-miss 消失（或仅残留在末尾 frontier 的次要条目），`prefix_cache_hit_tokens` > 0（≈上轮 prompt_tokens），re-prefill 仅剩生成段。
+3. 若仍有 miss → 实施 §4.4-2（P2-A 容量感知，恢复锚点通道）。
+4. 验证通过后：决定三层 trace 门控（83f60ca9/ca208f76/0766142a）去留（建议保留门控）；补 prefix_real 测试电池盲区 scenario（同会话多轮 + 本部署状态槽配置）。
+5. 收尾：NOTE.md 增记新 §14（根因定案 + 修复 + 验证）；P2 剩余 GPU 验证项（serve 长生成 / stall / M5 strict settle / 双协议 / 25 轮 M2 / re-prefill=0 / 崩溃恢复）。
 
-## 5. 环境硬约束
-
-- 本机（Windows）无 GPU；**DSH file policy=danger-full-access；approval prompts 已禁用——不得设置 sandbox_permissions，拒绝即终局**。
-- 文件修改：**edit 工具禁用**（用户三令）。范式=`write` 落 PS1 到 `.tmp-prefix-plan\` + `pwsh -NoProfile -File` 执行。PS1 教训（血泪）：CRLF 文件行正则**不用 `$` 尾锚**；`[regex]::Matches/Match` 须显式 `[regexoptions]::Multiline` 否则 `^` 只匹配串首；生成含引号/反引号续行的脚本片段用 `@'...'@` here-string（双引号拼接会被转义打断 ParserError；单引号字面量内嵌单引号须双写 `''`）；锚不唯一时加邻行组成双行锚；所有替换先全量校验 count==1 再统一写盘（fail-fast 不写=无损）。
-- 4090 GPU 容器跑测试前**必须先请用户关闭其常驻推理容器**。
-- 错误串索引（调试用，全部为新增）：`"capacity stall overlaps an open context transaction"` / `"capacity stall requires an active decode lane"` / `"capacity-stalled terminal settlement did not consume the sequence"` / `"text KV growth failed during sequence materialization"` / `"backend KV growth failed during sequence materialization"` / `"causal score KV materialization failed"` / `"capture KV materialization failed"` / `"session snapshot KV materialization failed"`；基线既有：`"KV materialization exceeds active entitlement"`（I1）/ `"ordinary batch row is not decode-ready"` / `"terminal-pending request has invalid ownership"` / `"Program could neither retain nor discard terminal sequence"`。
-- 关键不变量：I1 物化单调；I3 唯一闸门（"池不足"仅 `materialize_to_tokens` 一源，其他路径池耗尽=bug→fail_all 暴露）；stall 请求必须走 finish 而非 cancel（cancel 的 `resources_.abort` 丢 continuation 不 catalog）；worker_loop `catch → fail_all_locked`（`engine_core.h:2073-2105`）= 引擎**永久**停摆——任何未受控 throw 都会触发，stall 链所有前置检查（!capture_pending、lifecycle==Active、事务无重叠）都是防这条命的。
-
-## 6. 目标/TODO 状态
-
-- GOAL：goal-757fe8a1-3e21-4a39-95d4-561bad506f05（按 PREFIX-PLAN.md v2 实施三支柱；active，rounds ~9/40，目标会话用 update_goal resume 重新武装）。
-- TODO（全量替换制）：P0-a/b/c/d/f/g ✅；P0-h（Docker 编译+ctest）⬜ in_progress；P1（支柱二+GPU 验证）⬜；P2（支柱三+GPU 验证）⬜。
+## 7. 踩坑备忘（后续会话直接照抄）
+- `git pull --ff-only` 在 4090 仓库报 upstream 歧义 → 一律 `git merge --ff-only origin/prefix-v2`。
+- remote_4090.py 传 cmd 语法，勿嵌套 `powershell -Command`（'inf' 会被拆成 timeout 参数报 ValueError）；拉远程文件用主机侧 `powershell -NoProfile -Command "Get-Content ... -Tail N"` 且避免引号嵌套。
+- PS1 here-string @'...'@ 是单字符串：取下标须先 `$t -split "`r?`n"` 成数组，否则拆成逐字符行（曾把 resource_manager.h 打坏）；插入 = 重建数组 `Lines[0..i] + block + Lines[i+1..]`；连续多处插入先小索引；PS1 行正则不用 $ 尾锚（CRLF）。
+- FakeShortlistKey 无 identity_tag → 打印用 `if constexpr (requires { x.identity_tag; })`；FakeProgram 缺新方法 → 加 no-op stub；注意 `base.summary` 是方法 `summary()` 非成员。
+- 4090 GPU 常驻容器（近期为 admiring_blackburn 类命名，端口 1234，占满显存）需用户自行停；nvidia-smi 显存 >20GB 占用即被占。
+- 会话卫生：回复与文档中不要复现聊天模板控制序列（用数字 token ID 代替），否则模型输出会被截断（本会话已因此多次异常停止）。
+- 本地 ctest 基线：104 项，GPU 相关本地 skip（无权重/无 CUDA），ninfer_resource_manager_test 为前缀准入核心单测（含 pending demand 窗口/硬保护/terminal release 回归）。

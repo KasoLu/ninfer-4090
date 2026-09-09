@@ -371,6 +371,28 @@ RequestBasePlan ProgramImplCore::plan_request(const PreparedPromptData& prompt,
                       return std::tie(left.frontier, left.input_order) <
                              std::tie(right.frontier, right.input_order);
                   });
+        // PREFIX-PLAN v2 prompt-boundary endpoint: on the 2-slot Device pool the pre-reserved
+        // root capture slot (P2 Mechanism A) is the only capture destination available, so pin
+        // a plain state capture at the prompt frontier into it.  The frozen image then becomes
+        // the stored endpoint at the prompt boundary, where prompt tokens are identical on both
+        // sides of a replay; the generation tail (template control tokens) never enters the key.
+        if (state_store != nullptr && state_store->device_capacity() == 2U &&
+            speculative_backend != SpeculativeBackend::DFlash) {
+            const std::uint32_t prompt_boundary = base->summary.prompt_tokens;
+            CaptureGroup* boundary_group = nullptr;
+            for (CaptureGroup& group : base->capture_groups) {
+                if (group.frontier == prompt_boundary) {
+                    boundary_group = &group;
+                    break;
+                }
+            }
+            if (boundary_group == nullptr) {
+                base->capture_groups.push_back(CaptureGroup{.frontier = prompt_boundary});
+                boundary_group = &base->capture_groups.back();
+            }
+            boundary_group->rewrite.reset();
+            boundary_group->long_anchor = false;
+        }
         std::shared_ptr<const PreparedCaptureBacking> capture_backing;
         if (!base->capture_groups.empty() || !base->shared_candidates.empty()) {
             auto backing = std::make_shared<PreparedCaptureBacking>();
@@ -498,7 +520,10 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
             if (selected.ordinal != 0) {
                 throw std::logic_error("private endpoint checkpoint ordinal is invalid");
             }
-            if (selected.frontier == 0 || selected.frontier != source->execution_frontier) {
+            if (selected.frontier == 0 ||
+                (selected.frontier != source->execution_frontier &&
+                 (source->endpoint_frontier == 0 ||
+                  selected.frontier != source->endpoint_frontier))) {
                 throw std::logic_error("catalog endpoint summary disagrees with Program state");
             }
             if (!qwen3_6::detail::prefix_matches(prompt, source->ledger, source->prefix_identity,

@@ -199,3 +199,291 @@ P0-a ✅ P0-b ✅ P0-c ✅ P0-d ✅ P0-e(§3.5 重准入，随 d) ✅ P0-f(E4，
 - P0-g ✅ test_kv_growth 单测插入 test_context_store.cpp（41376B/681 行）+ main 注册
 - 教训：PS1 行正则不用 $ 尾锚（CRLF）；LineSubst 须 [regexoptions]::Multiline；含引号文本用 @'...'@ here-string；锚不唯一时加邻行双行锚
 - P0-h ✅ Docker ninfer-local-build:latest 编译+ctest：3 轮修复（runtime.h SequenceGrowth/template 位置、program.h public 可见性、test_context_store.cpp 12 处多余分号）；ninja 101/101 exit 0；ctest 100% passed 0/104（24 passed + 80 GPU-skipped）
+
+## 6. prefix_real_test 第三轮失败诊断 + E4 修复（本轮）
+
+### 6.1 诊断（4090 诊断输出）
+- 错误：`materialized sequence does not match its active entitlement: state_slots 2 vs 2; main_kv 2 vs 1; backend_kv 2 vs 1`
+- 检查点：program_impl.h `start_request`（:7175 区，`start_sequence` 后立即比对 `resident_resources(sequence)` vs `details.demand.active_entitlement`）
+- **根因 = 我 P0-f E4 改动的双重计数 bug**：`resident_resources` 的 add_kv 闭包先在循环里 `++device_pages` 每个独占 device 页，然后 active 分支又 `device_pages += mapped`（我改的）→ 全独占序列 actual = 2×mapped。基线是 `+= entitlement - mapped`（全独占时恰好 = entitlement）
+- 失败请求 = 任意 prompt≤64 的 root 请求（mapped=1, entitlement=1 → actual=2 > 1）；4090 上 qwen3.8 groupwise 路径首个请求即触发
+- backend 同因：backend_materialized = min(capacity, prompt + (initial_mtp_extent==0?0:initial_mtp_extent-1))，initial_mtp_extent = min{draft_window, effective_output>1?effective_output-2:0, capacity-prompt>0?capacity-prompt-1:0}（program_impl.h:4489）≤ draft_window → backend mapped ≤ expected 恒成立，纯粹被双重计数放大
+- state_slots 2 vs 2 匹配（P2-A 正确）；host 两侧 0
+
+### 6.2 修复（program_impl.h resident_resources add_kv 尾段）
+- **删除 `device_pages += mapped;`**（保留 `entitlement < mapped` 不变量检查 + overflow guard `mapped > max - device_pages`）；顺带修复 P0-f 引入的 `mapped >` 顶格缩进
+- 语义（= PLAN E4 本意，PREFIX-PLAN.md:72/122/363）：owner 统计 = 循环已计的独占 mapped device 页；**不加任何 bulk 项**——未物化 reservation headroom 是池级会计（reserved_pages_），动态页下计入 owner 口径系统性高估；共享页（address_references>1）在 owner 释放后仍存活，不属于其转移效应
+- 修复后 start_request 检查：root 全独占 → actual == entitlement 相等 ✓；reuse（共享前缀）→ actual ≤ entitlement（放宽的 `>` 检查允许）✓；backend mapped ≤ expected ✓
+- `resident_resources` 其余消费者（request_plan_impl.h:814 source、5878 delta.removed 等）均为 cataloged/共享（inactive）路径，语义不变
+
+### 6.3 状态
+- 本地 Docker 增量构建 + ctest 回归进行中；之后 commit+push、4090 pull+rebuild、用户重跑 G1/G2
+- 4090 常驻推理容器现为 `quizzical_robinson`（romantic_leavitt 停掉后自动重启的新名，同镜像 0908-villina-prefix，端口 1234，GPU 全占）；**用户自行操作停/起**
+## 7. 系统性审计（用户："你再整体检查一遍，是否还存在这种潜在的问题"）→ P2-A 容量缺陷 + 修复 3a6b7d06
+
+### 7.1 审计结论（逐项，全部代码级核实）
+- ① P2-A state_slots × device 容量：**发现唯一真缺陷**（见 7.2），已修复
+- ② probe_decode_capacity 三式 vs decode 实际增长：ordinary（program_impl.h:11860 `materialize(frontier+1, 0)` = probe `frontier+1`）、MTP（:12019-12020 `materialize(frontier+extent+1, min(capacity, frontier+extent+draft_window))`，extent=min{mtp_draft_count, draft_window, max_by_budget, capacity-frontier-1}，max_by_budget=remaining>1?remaining-1:0 —— 与 probe :9184-9219 逐字段一致；remaining 来自同一 GenerationBudget，probe 与 decode 同一 worker 迭代无交错）、DFlash（:12206 `materialize(frontier+extent+1U, frontier)`，extent=min{draft_window, max_by_budget, capacity-frontier-1} —— 一致）→ probe Ok ⇒ decode 必 Ok，无 E2 误触发
+- ③ resident_resources(SharedPrefixState) shared 版（:6749+）：add_kv 只计 address_references==1 页，无 bulk 项 → 无双重计数
+- ④ 全局统计 device_main_kv_occupied_pages = program.physical_usage()（resource_manager.h:1122 ← program_impl.h:9559 ← physical_occupancy :6815-6818 = pool.allocated_pages()+reserved_pages()）：旧设计 allocated+reserved ≡ entitlement 足迹，新设计 ≡ mapped+headroom，两式数值相同 → 测试基线（127 页、>0&&<=8）仍有效
+- ⑤ 压力/capture effect：resident_resources 修复后对 active 少计 headroom（reservation 是池级会计）→ 所有消费方（effect.removed/reservation）偏保守，准入更严不会更松 → 无未定义行为
+- ⑥ resize_sequence_kv_entitlement（PrivateEndpoint/rewrite 复用路径 :9936/:9984）：append-only 保证 pages(new_prompt) ≥ pages(base)=trim 后 page_count，MTP/DFlash backend 同单调 → resize_entitlement 前置 entitlement≥page_count 恒成立
+- ⑦ 非 root 计划/实际状态槽一致性：converted=min(active, preC)，P2-A 的 +1 位移（S:1→2，count 同步 +1）保持 WSI `count==S` 与 start 检查 `actual==expected` 的相等关系不变 → P2-A 未引入新不一致，只在容量不足时失败（即 7.2 缺陷）
+- host 检查 actual.host != expected.host：h2d 恢复后 host 副本收敛语义为基线（基线全字段严格相等已验证过 4090），P0/P2 未改 host KV 会计
+- Retain+DeviceOnly 的 `++conversions.state_slots`（request_plan_impl.h:1113-1120，!state_fork_required 时 +1）语义存疑（Retain 下 source 保留副本，credit 似乎多计），但为基线逻辑且 P2-A 的 +1 位移不改变其一致性 → 不修，若 scenario（source-pressure-protection）GPU 跑挂再查
+
+### 7.2 P2-A 容量缺陷（真 bug，commit 3a6b7d06 修复）
+- 缺陷：request_plan_impl.h:370（修复前）`root_active.state_slots = 2U;` 无条件 → root_demand.reservation_added.device.state_slots=2 → prepare_materialization（program_impl.h:4811-4876）按 `state_count = reservation_added.device.state_slots` 循环 `state_store->reserve_destination()`（state_image_store.h:723-731 要求空闲 **Device** 槽）→ device_state_slots=1 的引擎上根请求**永远无法准入**（死锁在首个 engine.generate）
+- 受害引擎：tests/targets/qwen3_6_27b/test_engine_prefix_real.cpp `host_restore_engine_options`（:45-46 device=1/host=2）与 `shared_replacement_engine_options`（:65-66 device=1/host=4）—— E4 双重计数 bug 修复后 prefix_real_test 推进到这两个引擎必挂
+- 修复：`root_active.state_slots = (state_store != nullptr && state_store->device_capacity() >= 2U) ? 2U : 1U;`（容量自适应；device_capacity()=state_image_store.h:137 池总槽数，引擎内恒定）→ 单槽引擎回退基线行为（终结时 active image 原地 freeze 即 capture destination，单槽内无争用，P2-A 保证平凡成立）；≥2 槽引擎 P2-A 完全生效
+- 单槽引擎的 fallback 安全性：Both 分裂只加 host 副本不占 device 槽（reserve_logical_destination）；h2d restore 走 take_device_slot 直取；ConsumeToActive/HostOnly/Retain 各路径的 count/S +1 位移分析（7.1⑦）确认无二次不一致
+- 验证：本地 Docker ninja 32/32 + ctest 104/104；push a066cb15..3a6b7d06；4090 pull 3a6b7d06 重建中
+- 测试 fixture 不改（device=1 正是验证 host 路径的用意；改 fixture 会削弱覆盖）
+
+### 7.3 状态
+- prefix-v2 提交链：4f0faf0c → 2c26c74f → 809537ff → bbb41e3b → a066cb15 → 3a6b7d06（HEAD，4090 已同步）
+- 待用户：停 quizzical_robinson 后重跑 G1/G2；本轮修复预期使 prefix_real_test 能推进过 host_restore/shared_replacement 两个单槽引擎
+
+## 8. P1 硬保护 UAF 根因确诊 + M3 定点出窗修复（83f60ca9 之后）
+
+### 8.1 根因：build_pressure_inputs 的 protected_owner_ids 是 lambda 局部 → 返回 span 悬空（UAF）
+- 4090 trace（NINFER_ADMISSION_TRACE=1，容器 66e132d9aa6a，日志 /ninfer-4090-kaso/admission_trace.log）显示：
+  planner root 的 protected= 列出大数值 {1948717728, 28763, 1948718048, ...} 且有重复；
+  而真实集合在 builder 内有去重（if (!already) push）→ 重复值只可能是**已释放堆内存的垃圾**。
+- 机制：resource_manager.h 的 build_pressure_inputs lambda 体内声明 `std::vector<PlanningOwnerId> protected_owner_ids;`
+  （原 :2143 区），返回 `PressureInputs{.protected_owners = protected_owner_ids}` 的 span 指向 lambda 栈帧；
+  该 lambda 作为 PressureInputsFn 传入 planner_.plan()（:2258），在 lambda **返回之后**才被调用（materialization_planner.h:249
+  `const PressureInputs pressure = pressure_inputs();`）→ 之后对 pressure.protected_owners 的每次读取都是 UAF。
+  trace 的 size()（6/8）是返回前拷贝的真实值，值内容是释放后被复用的堆垃圾。
+- 误剪：`po == outcome.owner` 比较中垃圾值 0/1 与真实 positional owner ID 巧合相等 →
+  `PRUNED (hard protection; evicted owner=0)` 是**假阳性** → no selection + idle → engine_core.h:1893 抛
+  "isolated-feasible request is blocked in an idle Engine"。整个 P1 硬保护自引入起一直在读悬垂内存。
+- 对照：capture builder（:789 区）同名 lambda 局部变量**安全**——其 Input 的 span 在 lambda 体内即被
+  capture_planner_.plan() 消费（lambda 返回前），不悬空。
+- 附带发现：demand window 无定点出窗（note_pending_demand 只进不出，靠 32 槽环形挤出；旧场景的陈旧记录
+  会持续保护旧条目）——规格（PREFIX-PLAN.md §3.4 生命周期"排队 → admit/取消/超时/终结（出窗）"）要求但实现缺失。
+
+### 8.2 修复（.tmp-prefix-plan/patch_uaf_fix.ps1，已验证落盘）
+1. resource_manager.h：`protected_owner_ids` 声明从 lambda 体提升到函数作用域（:1994，与其他 builder 向量并列）
+   → span 生命周期覆盖整个 plan() 调用。capture builder 的 :789 不动（本就安全）。
+2. resource_manager.h（note_pending_demand 后，~:2540）新增：
+   `void clear_pending_demand(std::uint64_t owner) noexcept` —— 删除 demand_window_ 中
+   `owner == 该请求id && !selected_source_key && exact_resident_keys.empty()` 的记录（= 纯 pending 记录）。
+   安全前提（已核实）：request id 从 1 开始（engine_core.h:2254 `next_request_id_ = 1`）；committed 记录 owner 恒为 0
+   （inspect 路径从不设置，commit_demand 在 resource_manager.h:3160 的发布路径调用）→ 永不误删 committed。
+3. engine_core.h on_waiting_removed（:1598-1601）加 `resources_.clear_pending_demand(request->id);`
+   —— 单一汇合点覆盖全部出队路径（admit :1848/:1932 区、cancel/expired :1214-1215、error :1627、
+   准入期取消 :1760、Aborted :1807）；线程/锁纪律与既有 note（submit 侧）/commit（worker 发布路径）一致，未引入新锁。
+
+### 8.3 状态
+- 本地 docker ninfer-local-build:latest build+ctest：进行中（后台 pwsh-14，期望 32-35/35 + 104/104）。
+- 下一步：commit+push → 4090 pull+ninja → 用户停 GPU 占用后重跑
+  `export NINFER_ADMISSION_TRACE=1 && ctest --test-dir build --output-on-failure -R ninfer_qwen3_6_27b_prefix_real_test`
+  → 读新 trace：若 protected= 全为小 positional 值且仍 PRUNED → 真·保护/容量死锁（下一层：head 豁免或 P2-A 双槽贪婪）；
+  若无 PRUNED 且通过 → UAF 即根因，收尾（考虑摘除 trace 门控或保留）。
+## 9. part 3（P1 硬保护作用域）根因与修复（commit e341e68f）
+
+### 9.1 背景：UAF+M3 修复后本地 ctest 仍失败 1 例
+- `ninfer_resource_manager_test`（tests/test_resource_manager.cpp:2525，test `test_retained_source_is_protected_until_terminal` :2505-2533）
+- 断言：`FAIL retained source protection: terminal release did not return retained source to pressure policy`
+- 测试流：make_manager(2,3)；seed（digest 9，session1，LiveSession）start+finish（目录化）；fork（digest 9，session2 → Retain）start 后 abort；`inspect(77)` 期望有 choice → 实际 TB
+- 真实 trace（带 NINFER_ADMISSION_TRACE=1）：`planner root: status=0 owners=1 outcomes=0:1 protected=0` → `PRUNED (hard protection; evicted owner=0)` → `inspect: blocked (no selection; candidates=1)` → FAIL
+- protected={0} 是**真实**集合（非 UAF 垃圾）
+
+### 9.2 根因（part 3，代码级确诊）
+- `demand_window_` 同时含 pending 记录（note_pending_demand）与 committed 记录（commit_demand 于发布路径 push，owner 恒 0）；硬保护推导（resource_manager.h 原 :2142-2151）用 `demand_mask_for(checkpoint_key, provisional)` = **全部** window 记录 + provisional
+- `demand_matches`（resource_manager.h:1472-1480）= candidate_keys / exact_resident_keys / selected_source_key 任一精确相等的 OR 语义
+- fork 的 committed 记录采纳时 `exact_resident_keys` = seed 条目 key（fork 精确匹配 seed 条目）→ seed checkpoint key 匹配 fork 记录 → fork 终结（abort）后 seed owner 仍被**永久**硬保护（直至环形挤出）→ 违背规格 §7-I5「owner 仅在匹配 active/pending 请求时受保护；终结即释放」
+- 4090 映射：每个终结的 reuse 请求都留下 committed 记录钉住其匹配的旧 prefix → 保护集累积 → root 候选全被剪枝 → IDLE-BLOCK
+- 测试 fake key（tests/test_resource_manager.cpp:223-238）：`prefix_shortlist_key(frontier) = (shortlist_digest, frontier)`，`make_base(digest)` 设 shortlist_digest=digest、opportunities 空 → 无需 digest 碰撞，exact_resident_keys 即足以触发
+
+### 9.3 修复（commit e341e68f，3 文件 +46/-3）
+1. `PrefixDemandRecord.pending_origin`（resource_manager.h:129）：note_pending_demand 置 true（:2556）；committed 记录默认 false
+2. `protection_mask_for(key, provisional)`（resource_manager.h:1532）：window 仅匹配 `pending_origin` 记录 + provisional 位
+3. `MaterializationCheckpointPolicy.protection_mask`（materialization_planner.h:30，结构体尾加字段保 designated initializer 合法）；materialization 两 builder 填值（私有 :2087 / 共享 :2147）
+4. 硬保护推导（resource_manager.h:2157）：`cp.demand_mask == 0` → `cp.protection_mask == 0`
+5. **capture builder 未动**（其 protected 集仍基于 committed demand，resource_manager.h:788-800）——保守点，记为已知项
+- 语义：硬保护 = 当前 inspect 请求 provisional + 在队 pending；committed 记录仅留软 credit（符合 I5「终结即释放」与单测 terminal release 期望）
+
+### 9.4 PS1 踩坑记录（patch_part3.ps1 → repair_r4.ps1 → fix_r4_order.ps1）
+- R5 尾锚 `*entry.handle, entry.summary.checkpoint.ref)),` 出现 2 处（capture :733 + shared builder :2122）→ Trim 匹配 + 取最后一个 + 正向校验 L[i-4] 含 provisional_demand
+- R6 实际缩进 16sp（capture 侧孪生为 20sp）；初版 12sp 锚 0 匹配
+- R4 24sp 锚命中 capture 侧 `append_private_checkpoint`（私有 builder 尾部实为 28sp）→ `.protection_mask` 误插进 `CapturePlanner::CheckpointPolicy`（无此字段，必编译错）→ repair_r4 修复
+- `List.Insert(m+2, x)` 后 `List.Insert(m+1, y)` 会把 y 夹进 x 与后续行之间——连续两行插入须先小索引后大索引
+- 校验正则 `\.protection_mask =` 会前缀匹配 `cp.protection_mask ==` 行——用 `TrimStart().StartsWith('.protection_mask =')` 精确计数
+- 教训沉淀：锚点「唯一性」须先扫描全文件（含 capture 侧孪生构造器），缩进用 pwsh 实测而非目测
+
+### 9.5 验证与交接
+- 本地 docker（ninfer-local-build:latest）：ninja 33/33 + ctest **100% 104/104**（ninfer_resource_manager_test Passed）
+- commit e341e68f "fix(P1): scope hard protection to pending demand (UAF + M3 window exit + committed-record exclusion)"；首提漏 engine_core.h（M3 on_waiting_removed 钩子）已 amend 补入；push `83f60ca9..e341e68f → origin/prefix-v2`
+- 4090：pull ff OK + ninja 33/33（devel:0905 容器 66e132d9aa6a）
+- 用户重跑（需 GPU 空闲；容器内 root 执行）：`export NINFER_QWEN3_8_27B_WEIGHTS=/models/qwen3_8_27b.ninfer && export NINFER_ADMISSION_TRACE=1 && ctest --test-dir /ninfer-4090-kaso/build --output-on-failure -R ninfer_qwen3_6_27b_prefix_real_test 2>&1 | tee /ninfer-4090-kaso/admission_trace.log`
+- 判读：通过 = 三层根因（UAF+M3+part3）全部确认，随后决定 trace 门控去留；仍 PRUNED/IDLE-BLOCK = 真容量死锁，下一层 = head 豁免或 P2-A 双槽贪婪 capacity-aware
+- 提交链：4f0faf0c→2c26c74f→809537ff→bbb41e3b→a066cb15→3a6b7d06→83f60ca9→e341e68f
+
+
+## 10. M3 出窗缺陷（4090 死锁二查真因，part 4）
+
+### 10.1 trace 重读（e341e68f 二进制，UAF 修复后）
+- UAF 确认修复：protected 从垃圾大数值变为真实小 ID `2 3 4 5 6 7`；`PRUNED (hard protection; evicted owner=2)` 是真保护（非假阳性）
+- 9× inspect_admission 全 `source=0 reuse_tokens=0`（head=纯 root，短名单不匹配任何条目）；`candidates=1`（无 source 候选）
+- 死锁链不变：head TB + active 集合空 → engine_core.h try_admit_one 抛 "isolated-feasible request is blocked in an idle Engine"
+
+### 10.2 根因（代码级确诊）
+- `ensure_base_plan`（engine_core.h，P1 埋点）对每个排队请求 `note_pending_demand(request->id, {key,1}, domain)`：window 记录 `pending_origin=true`，`candidate_keys=[请求自身 prefix key]`
+- **正常 admit 路径 `admit_planned_request` 成功分支只做 `erase_pending`，从不调 `on_waiting_removed`/`clear_pending_demand`**（原 :1814-1816；on_waiting_removed 钩子只在排队期 cancel/expire/error 路径调用）
+- → 正常完成的请求其 pending 记录永不擦除 → **自保护**（记录 key == 自己 retained 条目的 checkpoint key）→ 引擎 idle 后新 root 请求须驱逐这些 owner → 全部被硬保护剪枝 → TB + idle → 抛错
+- 与 trace 精确吻合：protected=2..7 = 6 个已完成请求的 stale 记录自保护（owner 0/1 的条目 checkpoint key 与其 stale 记录不匹配故未保护）
+- active 请求保护由 active-edge 排除独立承担（builder 跳过 `private_has_active_edge`/`shared_active_edge_count!=0` 条目，不进 owner 集）→ 本修复不影响 active 保护；单测 test_retained_source_is_protected_until_terminal 靠 active-edge 而非 window，不受影响
+
+### 10.3 修复（.tmp-prefix-plan/patch_m3_admit_clear.ps1，已落盘）
+- engine_core.h：`admit_planned_request` 的 erase_pending 成功分支后加 `resources_.clear_pending_demand(request->id);` + 4 行注释（admit=离开排队=出窗）
+- tests/test_resource_manager.cpp：新增 `test_pending_demand_window_exit_releases_protection`（note→protection_mask≠0；clear→protection_mask==0，provisional 用默认空 PrefixDemandRecord）+ main 注册
+- 生命周期全路径审计：排队期 cancel/expire/error（on_waiting_removed 清 ✓）、admit 成功（新清 ✓）、reserve Stale（留队不动 ✓）、reserve Aborted（on_waiting_removed ✓）、fail_all（引擎停摆，window 随引擎销毁）
+- 不做的改动：note_pending_demand 的每轮重注是刻意的刷新机制（head 防 ring 挤出），未改一次性注册（register-once 会让 head 记录被 ring 挤出后失去保护，反而退化）
+
+### 10.4 状态与判读
+- 提交链：...→83f60ca9→e341e68f→**1300f493**（fix(P1-M3): release queued hard-protection record on admission，2 文件 +25：engine_core.h、tests/test_resource_manager.cpp；NOTE.md 保持 untracked）
+- 本地 docker ninfer-local-build:latest：ninja 33/33 + ctest **100% 104/104**（#11 ninfer_resource_manager_test 含新 test 通过；#25 prefix_real 本地无权重 skip）
+- push `e341e68f..1300f493 → origin/prefix-v2`（KasoLu/ninfer-4090）；4090 `git pull --ff-only` OK + `docker run --rm -v C:\Data\ninfer\ninfer-4090-kaso:/ninfer-4090-kaso -w /ninfer-4090-kaso/build ninfer-4090-kaso-devel:0905 ninja` 33/33
+- 待用户重跑（devel 容器 root，GPU 须空闲）：`export NINFER_QWEN3_8_27B_WEIGHTS=/models/qwen3_8_27b.ninfer && export NINFER_ADMISSION_TRACE=1 && ctest --test-dir /ninfer-4090-kaso/build --output-on-failure -R ninfer_qwen3_6_27b_prefix_real_test 2>&1 | tee /ninfer-4090-kaso/admission_trace.log`
+- 判读：通过 = 四层根因（UAF+M3 出窗时机+part3 committed 排除+admit 出窗）全部确认 → 决定 NINFER_ADMISSION_TRACE 门控（83f60ca9）去留；仍 PRUNED = 真容量死锁 → 下一层 head 豁免或 P2-A 双槽贪婪 capacity-aware（root state_slots=2 以总容量为键、未计 pinned 占用）
+
+## 11. prefix 实跑全量 re-prefill 根因分析（2026-09-09，4090 trace 实跑 + 代码级）
+
+### 11.1 现象（admission_serve_trace.log + log.txt，1300f493 二进制，serve 4 轮对话）
+- 引擎无死锁（M3 修复生效：无 IDLE-BLOCK/PRUNED，owners=0，4 请求全部 admit+done）
+- 但每轮 prefix_reuse_path=root、prefix_cache_hit_tokens=0、best_reuse_prompt_tokens=0 → 全量 re-prefill
+- admission trace 每轮仅 1 行 inspect（root 候选，source=0）→ **reuse 候选从未生成**
+- 客户端确实在回传完整历史：prompt 9185→9371→9758→23849（= 上轮 prompt+output+新内容，算术吻合）
+- 日志 request 字段：protocol=openai_chat_completions、enable_thinking=true、preserve_thinking=true、has_tool_history=true、media_items=0
+
+### 11.2 引擎侧逐项排除（代码级）
+- retained root 正常目录化：finish()（program_impl.h:9293+）publish_continuation 时 endpoint_valid=true（:9346）+ freeze 活性图 → 条目持 endpoint 检查点（populate_continuation_summary :7323-7355，endpoint 仅在 endpoint_valid 时设置）→ rebuild_prefix_index（resource_manager.h:1750-1770）为 endpoint/rewrite/long_anchors 建索引项；空闲 occupancy=1 槽佐证条目存活
+- 候选生成（resource_manager.h:336-344）：`base.prefix_shortlist_key(index.key.frontier)` 必须 **==** 存储的 index.key，否则静默 continue → source=0 唯一解释 = **key 失配**（索引非空已证）
+- 摘要对称性（prefix_identity.cpp）：`append_digest(token, token_type, positions, rewrite_frontiers, vision)`；纯文本 prompt 路径 assign_text_positions（frontend.cpp:355-372）token_types 全 0、positions=index、rope_delta=0；生成路径 append_generated（:464-483）= (token, 0, {index+rope_delta}) —— **本场景（无媒体）两者输入完全一致** → 失配只能来自 token 序列本身不同
+- identity_tag（program_impl.h:7285-7288：speculative_backend|proposal_head<<8|kv_dtype<<16）两端同源
+- 结论：引擎复用路径完好；失配 = **传入 prompt 的 token 序列与上轮上下文（prompt+生成 output，含 thinking）在 token 级不完全相同**
+
+### 11.3 根因（客户端回传保真度）
+- 多轮 chat-completions 复用要求：新 prompt 的 token 前缀 == 上轮上下文 token（摘要+精确双重校验，prefix_matches 为权威）。生成 token 含 thinking 全文（enable_thinking=true 时每轮产出）；协议虽双向支持 reasoning_content（openai_chat_response.cpp:196-197 输出、openai_chat_request.cpp:414-434 解析回传），但**客户端若未在下一轮 assistant 消息中原样带回 reasoning_content（或回传文本与原始生成 token 有转义/边界差异）→ 摘要在首个 assistant 消息处发散 → 全前缀失配 → 无候选**
+- 次级真缺陷（配置级，复用一旦生效就会咬人）：本部署 device 槽总量=2（device 1+shared 1），P2-A（3a6b7d06）新 root 恒需 2 槽（capacity>=2 → state_slots=2）→ 1(retained)+2(root)>2 永不可共存 → 每次 root fallback 必驱逐 retained owner（日志 private_owners_evicted=1/轮）→ 此配置下 retained prefix 结构性无用
+- Responses API（/v1/responses + parent_response_id）是引擎设计的多轮复用通道：session_key=response_id → LiveSession+session 索引 → PrivateTurnClosure/rewrite 路径可容忍非逐 token 相同的回传（仅重编发散后缀）；chat completions 无 session 通道（frontend.cpp:1532 update_session_index=false）→ 只能精确匹配
+
+### 11.4 建议（按优先级）
+1. 客户端侧：agent loop 每轮保存响应 reasoning_content，下一轮 assistant 消息原样带回（含工具结果等全部历史逐字回传）
+2. 决定性 A/B：同客户端同流程加 enable_thinking=false 跑一轮——若 prefix 复用生效=thinking 丢失实锤；若仍 0=模板边界/转义差异，再做 token 级 diff
+3. 或改用 Responses API（parent_response_id）走 session 通道
+4. 配置缓解（次级缺陷）：device_state_slots 提到 2-3（total>=3）让 retained 与新 root 可共存；P2-A 占用感知（按 pinned 占用降档 state_slots）列为后续引擎改进
+
+## 12. 客户端假设被用户推翻 + v1/v2 全量静态对比 + KEY-MISS 埋点
+
+### 12.1 用户裁决（推翻 §11.3 客户端根因）
+- 用户原话："客户端肯定是没问题的，相同的客户端，已经在prefix-v1分支上验证过，可以直接排除客户端侧的原因。问题肯定出在推理端。"
+- 同客户端在 prefix-v1 上 prefix 复用正常 → §11.3"客户端回传保真度"根因作废；根因在 v2 推理端（引擎/运行时行为差异）。
+
+### 12.2 v1/v2 全量静态对比（merge-base(prefix-v1, prefix-v2)=4f0faf0c；v1 tip=b806b2f6；diff=13 文件 +626/-541）
+- 结论：**key/digest/frontier 全路径代码 v1/v2 结构相同或逐字节相同**，静态找不到能致 key 失配的代码差异：
+  - prefix_identity.{h,cpp}：无 diff（摘要函数完全一致）
+  - append_generated 调用点：每分支 4 主位 + 2 MTP-spec 位，一一对应、同参 (tokens, sequence.rope_delta)；MTP 投机提交主体（ledger.insert + append_generated(span, rope_delta) + execution_frontier=base_E+committed + mtp_draft_count 更新）**逐字节相同**
+  - ledger.push_back 仅 2 处（两分支同）；reuse 回滚 ledger.resize(base)+prefix_digests.truncate(base)：v1 3 处（resident/rewrite/long-anchor-consume），v2 2 处（long-anchor consume 分支被删，与 v2 强制 Retain 对应，非缺陷）
+  - execution_frontier 更新点结构相同（prefill =end；ordinary =base_E+committed；settle =pending.base_E+produced / prompt_tokens）；resolve_non_speculative_pending 不变量 prefix_digests.size()==ledger_frontier 两侧相同
+  - prefix_shortlist_key（api_impl.h:111-122）逐字节相同：frontier>prefix_digests.size() → nullopt → 候选循环静默 continue（=serve trace 无 source 行的机制）
+  - checkpoint_summary/populate_continuation_summary（stored key = sequence.prefix_digests.at(execution_frontier) + identity_tag；tag = speculative_backend | proposal_head<<8 | kv_dtype<<16）逐字节相同
+  - resource_manager.h 候选循环：v2 仅删 v1 特有机制（long-anchor conservative_anchor_first retain→consume 回退、release_superseded_source_anchor 取代通道），对 endpoint 候选无影响；rebuild_prefix_index/valid_prefix_index_entry 无 diff
+  - request_plan_impl.h diff = P0-c 注释删减 + P2-A state_slots 容量自适应 + inspect_lane long-anchor 强制 Retain + state_exclusive_to_sequence 过滤（均候选可行性侧，与 key 匹配无关）
+  - 引擎层其余差异 = P0 stall 链/P1 硬保护/M2 root gating/M3 窗口（不影响 key 生成）
+- 推论：差异只能在运行时行为/输入（resident 侧 token 记账 vs 客户端回放的长度或序列、或 retained 条目根本没入索引）→ 上埋点实测裁决
+- 保留的次级配置缺陷（§11.3）：本部署 device 槽总量=2，P2-A 新 root 恒需 2 槽 → retained+root 不可共存，每轮 root fallback 驱逐 retained owner（private_owners_evicted=1/轮）——即使 key 修好，此配置下 reuse 候选也须靠 ConsumeToActive 就地接管才可行
+
+### 12.3 KEY-MISS 埋点（resource_manager.h inspect 候选循环，3 处，NINFER_ADMISSION_TRACE=1 门控）
+- T1（rebuild_prefix_index 后）：`inspect: index entries=N base_prompt=M | slot=.. shared=.. kind=.. front=.. ord=.. [tag=..]`（全量索引项 dump）
+- T2（valid_prefix_index_entry 失败）：`index-invalid slot=.. shared=.. kind=.. front=.. owner=.. rev=.. occupied=..`
+- T3（key 门失败）：`key-miss slot=.. shared=.. kind=.. front=.. ord=.. incoming=0/1 [tag=.. in_tag=..]`
+- 判读表：entries=0 → retained root 从未入索引（publish_continuation/prompt.identity.reusable/settle 路径问题）；key-miss incoming=0 → 存储 frontier 超出 incoming base digest 表覆盖 → resident 侧 token 记账变长（MTP 提交或 settle 多计）；incoming=1 同 tag 不同 digest → token/位置序列漂移；tag≠in_tag → identity_tag 记账差异
+- 编译踩坑：base.summary 是方法 summary() 非成员；测试 FakeShortlistKey 无 identity_tag 字段 → tag 打印用 if constexpr (requires { x.identity_tag; }) 泛型保护（C++20）
+- PS1 踩坑：here-string 是单字符串，$t[$k] 取的是字符 → 首跑把 resource_manager.h 拆成逐字符行（已 git checkout 恢复）；正确：$tlines = $t -split "`r?`n" 后逐行 Insert
+- 状态：本地 docker build+ctest 验证中 → commit+push → 4090 同步 → 用户 serve 重跑（NINFER_ADMISSION_TRACE=1）贴 trace → 按判读表定位真因
+
+### 12.4 状态更新（KEY-MISS 埋点已发布，等用户 serve trace）
+- 本地 docker：ninja 33/33 + ctest 100% 104/104（首轮 compile 失败=base.summary 误用成员+FakeShortlistKey 无 identity_tag，已修：summary() 方法 + if constexpr (requires { x.identity_tag; }) 泛型保护）
+- commit **ca208f76** "chore(debug): trace prefix-index key-miss in admission inspection"（1 文件 +64/-2：resource_manager.h；NOTE.md 保持 tracked-but-uncommitted）；push `1300f493..ca208f76 → origin/prefix-v2`
+- 4090：`py -3 scripts/remote_4090.py run "cd C:\Data\ninfer\ninfer-4090-kaso && git pull --ff-only" inf` → ff OK；`docker run --rm -v C:\Data\ninfer\ninfer-4090-kaso:/ninfer-4090-kaso -w /ninfer-4090-kaso/build ninfer-4090-kaso-devel:0905 ninja` → 33/33（容器 66e132d9aa6a）
+- 用户重跑（devel 容器 root，GPU 须空闲）：`NINFER_ADMISSION_TRACE=1 ./build/apps/ninfer-serve /models/qwen3_8_27b.ninfer --preserve-thinking --chat-template v22_4 --spec mtp --draft-tokens 3 --lm-head-draft --kv-dtype rk8v4 --max-context 200000 --request-log-jsonl logs/log.txt` 跑 2-3 轮对话，贴 logs/ 下 trace 行（grep `admission-trace`）
+- 判读：§12.3 判读表（entries=0 / index-invalid / key-miss incoming=0|1 / tag 对比）→ 定位后修复+本地 build+ctest+4090 同步
+- 提交链：…→3a6b7d06→83f60ca9→e341e68f→1300f493→**ca208f76**
+## 13. LCP 分歧扫描埋点（commit 0766142a）+ 4090 同步 + 交接
+
+### 13.1 本轮动作
+- 补丁 .tmp-prefix-plan/patch_divergence_trace.ps1（A runtime.h 声明 / B api_impl.h 委托 / C program.h core 声明 / D program_impl.h 实现 @valid_capture_offer 前 / E resource_manager.h key-miss 分支调用）+ patch_divergence_E.ps1（E 单独重做）
+- D 实现 = ProgramImplCore::debug_trace_prefix_divergence(stored, base) const：env 门控 NINFER_ADMISSION_TRACE；打印 stored_size/incoming_size/stored_frontier/ledger_frontier/ledger_tokens/rope_delta/in_tag/endpoint_valid/anchors + 每锚点 front/ord；线性扫 1..min(overlap) 首处分歧；first==0 打 "chains identical through N"；否则打 first + 两侧 digest 词 + stored 侧 [first-4..first] 每 token tok/tt/p0/p1/p2（tt=prefix_identity.token_types，p=position_axis 0/1/2）
+- E 落点：resource_manager.h key-miss 分支（`if (!incoming || *incoming != index.key)`）内 env-gate 闭括号后、continue 前（403 行后），`if (!index.shared) { key_probe=catalog_[slot]; if (key_probe.handle) program.debug_trace_prefix_divergence(*key_probe.handle, base); }`
+- 编译炸点：tests/test_resource_manager.cpp FakeProgram 无此方法 → 加 no-op stub（`void debug_trace_prefix_divergence(const FakeContinuationHandle&, const FakeRequestBasePlan&) const {}`，isolated_request_feasible 之后）
+- 本地 docker：ninja 32/32 exit 0 + ctest 100% 104/104
+- commit 0766142a "chore(debug): prefix digest divergence trace on key-miss"（6 文件 +112/-1）；push ca208f76..0766142a → origin/prefix-v2
+- 4090：git pull --ff-only 报 "Cannot fast-forward to multiple branches"（upstream 歧义，仓库状态实际 behind 1 干净）→ 改 `git merge --ff-only origin/prefix-v2` 成功；devel 容器 ninja 43/43 exit 0
+
+### 13.2 判读表（读 divergence 行）
+- first ≥ stored prompt 长度（≈2.6万 类值）且 st@ 行 tok 合理 → 客户端回显 re-tokenize 漂移 → 但用户已排除客户端（v1 同客户端复用正常）→ 该形态实际指向 v2 缺锚点（状态槽预算 device1+shared1=2，root 占满 → 锚点 capture 结构性不可行，automatic_private_anchors 恒 0）使 endpoint-only 匹配过严；v1 靠锚点兜底
+- first 处 st@ 行 tok 异常（0/草稿/巨大值）→ resident 侧 token 记账 bug（MTP 提交 span 错位类）
+- "chains identical through N" → stored 链与 incoming 完全同前缀但 stored frontier 超出 incoming 表（客户端回显截短/驻留侧多记账）
+- anchors=N（本配置预期 0）
+- 若 divergence 行根本没出现 → key-miss 分支未走到该条目（索引/valid_prefix_index_entry 门）→ 回查 T1/T2 行
+
+### 13.3 交接用户（GPU 须先停常驻推理容器）
+- serve：`build/apps/ninfer-serve /models/qwen3_8_27b.ninfer --preserve-thinking --chat-template v22_4 --spec mtp --draft-tokens 3 --lm-head-draft --kv-dtype rk8v4 --max-context 200000 --request-log-jsonl logs/log.txt`，env `NINFER_ADMISSION_TRACE=1`，跑 2-3 轮对话
+- 贴回：stderr（含 [admission-trace] divergence: 行）+ logs/log.txt
+
+### 13.4 踩坑
+- 主 PS1 E 步误断言 continue 前两个 `}`（实际 key-miss 结构 = env-gate 单 `}` + continue + key-miss `}`）→ hits 空 → 拆出 patch_divergence_E.ps1 用"anchor 后向前扫 `}`+continue+`}` 三连"定位
+- remote_4090 `git pull --ff-only` 歧义 → 一律 `git merge --ff-only origin/prefix-v2`
+
+### 13.5 提交链
+- …→1300f493→ca208f76(key-miss trace)→**0766142a**(divergence trace) = 本地 HEAD = 4090 二进制
+
+
+## 14. 会话污染 → HANDOFF.md 转写（2026-09-09 末）
+
+- 本轮会话因推理产物中的模板控制 token（数字 ID 198/248068/248069/271 簇）多次异常停止，用户裁决转写交接：当前完整状态（环境/提交链/分歧数据表/根因形态/修复候选/代码锚/下一步/踩坑）已落盘 **HANDOFF.md**（覆盖 P0 时代旧版），为该时点唯一权威交接。
+- 核心结论快照：分歧非 v2 记账 bug（token/位置/token_type 口径两侧一致、v1/v2 digest 代码无 diff），而是存储链含原始生成段控制 token、客户端回放为解析后文本重序列化 → 首控制 token 处必分叉；本部署锚点通道同时死亡（total 状态槽=2 池满，captures/anchors 恒 0）。
+- 首选修复 = endpoint 存储 key frontier 前移至最后 prompt 边界（上轮 prompt_tokens，digest 表天然覆盖）；备选 = P2-A 第二槽容量感知恢复锚点通道。下轮会话从 HANDOFF.md §6 继续。
+- 会话卫生：回复/文档不复现聊天模板控制序列，token 一律用数字 ID。
+
+
+## 15. 根因定案 + 修复设计：Prompt 边界 Endpoint（2026-09-09 末，接手 HANDOFF.md §6）
+
+### 15.1 根因定案（0766142a divergence trace 解读）
+- 分歧点 = 生成段内首个模板控制 token 簇（st@ token ID 13/198/248069/271 簇）；round2 req：stored 首分歧 58743 / stored 全长 58822，incoming 60328
+- 存储链 = 原始生成 token 流（含生成段控制 token）；客户端回放 = 解析后文本重序列化 → 在生成段首个控制 token 处必分叉；两侧记账均无错（token/位置/token_type 口径一致，v1/v2 digest 代码字节相同）
+- 用户裁决（原文）："客户端肯定是没问题的，相同的客户端，已经在prefix-v1分支上验证过，可以直接排除客户端侧的原因。问题肯定出在推理端。" → 修复 = 让 resident 侧存储 key 落到 prompt 边界（两侧 token 相同段）
+- anchors=0 通道第二根因（本会话新确认）：inspect_capture（program_impl.h:7526-7760）把 capture 目的地按"新池槽"计费（:7671-7678 `device_destination_available = recycles_private_state || (device_occupied() - replaced_shared) < device_capacity()`；DeviceFork → added.device.state_slots=1），从不计入 sequence 自身 P2-A 预预留槽 → root 占满 2 池槽期间，带标志 capture → HostSnapshot（host 池=0）→ physically_feasible=false → reserve_active_capture skip_capture。执行侧已支持预留槽（prepare_active_capture :8242-8245 `else if (sequence.reserved_state) { destination = *reserved_state; reset(); }`），判定侧未计 ⇒ 本部署锚点通道结构性死亡，不修（最小改动原则），主修 endpoint 通道
+- 关键事实：PLAIN capture group（无 rewrite/long_anchor/shared 标志）走 inspect_capture :7564-7569 早退 → 恒 physically_feasible=true，不计费不判 placement → plain 组无需改 inspect_capture
+
+### 15.2 修复设计："Prompt 边界 Endpoint"
+- 概念：endpoint 存储 key+image 前移至上一轮 prompt 边界（prev prompt_tokens）。prompt 段两侧 token 恒同 → incoming prefix_shortlist_key(prompt_boundary) 命中。prompt 边界状态 image = prefill 末（group.frontier == prompt_tokens）的普通 capture → root 的 P2-A 预预留槽（2 槽池：root 自持 active+reserved=2，plain capture 用预留槽不占新池）；finish 的 fork-abort 使 state.read = 冻结的 prompt 边界 image（生成尾 image 被释放），tail_hidden view → prompt 边界 hidden 槽（恰为 BeforeSuffix MTP 桥输入，program_impl.h:11672-11697）
+- 下一轮：ConsumeToActive 将该 image 移入新 lane（retained 1 + 新 root 1 = 2/2 无驱逐），只 re-prefill base..prompt_tokens；其自身 prefill 末 capture 延续链。复用损失 = 生成段 + 新消息（≈110-1800 / 58k+ tokens）
+- 刻意放弃：tail-frontier 双索引（尾 image 在 finish 被释放；客户端恒在生成段内分歧）；inspect_capture 预留槽修复（§4.4-2 锚点通道，仅 auto-anchors 必须生效时才需要 —— 缓办）；root 槽容量感知（2 槽池靠 ConsumeToActive 即可运转）；DFlash 支持（dflash_context_frontier==base 精确检查堵死 early-base 复用 → DFlash 保持 legacy endpoint）
+- 组选择（要点）：2 槽引擎上带标志 capture（auto-anchors）判 infeasible 被 skip，从不占预留槽、从不 throw → 无需移除其他组；若 auto-anchor 恰落 prompt_tokens 边界与本组合并 → 清除其 rewrite/long_anchor 标志转 plain（否则带标志组被判 infeasible 跳过，endpoint 失效）
+
+### 15.3 变更集（5 处，无新 Program API → test fakes 不动）
+- D1 program.h:429（SequenceState，`endpoint_valid` 后）加 `std::uint32_t endpoint_frontier = 0;`（endpoint image 所在 frontier；0 = legacy execution_frontier）；program_impl.h 七个 `endpoint_valid = false` 点同步清零：2857 / 4689 / 6735 / 10111 / 10752 / 10822 / 10887（finish 的 :9429 `= true` 不动）
+- D2 request_plan_impl.h plan_request（shared_candidates sort 结束 :375 后、capture_backing :376 前，已处于 publish_continuation + allow_prefix_reuse + reusable + context_cache.enabled 门内）：`state_store != nullptr && state_store->device_capacity() == 2U && speculative_backend != SpeculativeBackend::DFlash` → 在 base->capture_groups 里 find-or-create frontier=prompt_tokens 的 plain 组（append 尾部保持 (frontier,input_order) 排序，prompt_tokens=最大 frontier）；若与既有带标志组合并 → `rewrite.reset(); long_anchor=false;`（shared 标志在另一向量 shared_candidates，无交叉）
+- D3 program_impl.h publish_active_capture（`++prefill.next_capture;` 后，~:8566）：`if (transaction.group.frontier == prefill.prompt_tokens) { sequence.endpoint_frontier = prefill.prompt_tokens; }`（plain 组不触发 populate_continuation_summary；finish() :9435 直调 populate_continuation_summary 读到冻结 image + 新 frontier ✓）
+- D4 program_impl.h populate_continuation_summary（:7410-7417 段）：endpoint frontier = `(endpoint_frontier != 0 && endpoint_frontier < execution_frontier) ? endpoint_frontier : execution_frontier`；endpoint_work = 前式 ? `runtime::make_prefill_work(0, frontier, sequence.rebuild_work.vision_items, sequence.rebuild_work.vision_patches, prefill_chunk)` : `sequence.rebuild_work`（validated_rebuild_work 仅要求 work.tokens == frontier；vision 量全在 prompt 内 ✓；make_prefill_work 签名 (prefix_tokens, suffix_tokens, items, patches, chunk)，src/runtime/contract/types.h:229）；image 恒 = sequence.state.read
+- D5 request_plan_impl.h :497-503（inspect_lane SessionEndpoint 分支）：throw 条件改 `selected.frontier == 0 || (selected.frontier != source->execution_frontier && (source->endpoint_frontier == 0 || selected.frontier != source->endpoint_frontier))`
+- 无需改：MTP 门（:546-560，mtp_kv_valid=execution_frontier ≥ base-1、tail_hidden_valid 恒 true、view 指 hidden@base-1 正确）；selected_state（PrivateEndpoint → state.read 不变）；materialization PrivateEndpoint（:10016-10109，text_kv_valid/mtp_kv_valid 均 ≥ base）；selected_state_requires_fork（本部署无 alias 引用 → ConsumeToActive 免 fork）；inspect_capture（plain 组走早退）
+- 预期：prompt 边界条目 key-miss 消失；prefix_cache_hit_tokens ≈ 上轮 prompt_tokens；re-prefill = 生成段 + 新内容；captures≥1/轮；无 private_owners_evicted
+- 降级路径：单槽引擎（capacity≠2 → 组不加 → legacy endpoint）；DFlash → legacy；运行时 capture offer 被跳过（program transaction 占用）→ endpoint_frontier 恒 0 → execution_frontier legacy，不 crash
+- 容量 ==2U（非 >=2U）：3+ 槽引擎上 plain 尾组需与带标志组争免费池槽，reserve_destination 竞争可能 throw（未验证的失败模式）→ 严格限定 ==2U 匹配本部署；≥3 槽推广留 follow-up
+- 风险：test_engine_prefix_real battery 中 device_capacity≥2 的引擎将新增该 plain 组，reuse 量断言可能偏移；本部署组合（同会话多轮 + 2 槽池 + MTP + preserve_thinking）是 battery 盲区 → 验证后补场景
+
+### 15.4 执行记录
+- 2026-09-10 实施：edit 工具本会话失效（E_BAD_SHAPE）→ 全部改用 PS1：.tmp-prefix-plan/patch_prompt_boundary_endpoint.ps1（锚点计数断言、自底向上行操作）+ fix_alignment.ps1；program.h 首次失败后曾需 git checkout 还原再重跑
+- git diff 复核（HEAD 0766142a 之上未提交）：program.h +1（endpoint_frontier 字段 @428）；program_impl.h D1b×7（2858/4691/6738/10129/10771/10842/10908）+ D4（:7414-7429 endpoint_frontier 三元 + make_prefill_work(0, frontier, vision_items, vision_patches, prefill_chunk) 分支）+ D3（:8579-8581 publish 后 `if (transaction.group.frontier == prefill.prompt_tokens) sequence.endpoint_frontier = prefill.prompt_tokens;`）；request_plan_impl.h D2（:374-395，gate `state_store && device_capacity() == 2U && backend != DFlash`，find-or-create frontier=prompt_tokens 的 plain 组并清 rewrite/long_anchor）+ D5（:520-527 throw 条件接受 source->endpoint_frontier）
+- 本地 docker build+ctest（job pwsh-22）：ninja 32/32、ctest 104/104 全绿（GPU 用例本地跳过）
+- 池公式定案（layouts_impl.h:119-121）：StateImage Device 槽数 = max_concurrency + device_state_slots → 部署=2（1+1，shared 另计使总 device 池=2）、pressure_resume=4（2+2）、private_checkpoint_pressure=4、host_restore=2（1+1，host=2）、shared_replacement=2（host=4）、rewrite-branch=3、base=5、concurrent=24
+- 终端 plain 组目的地安全性证明（==2U gate 下 throw 不可达）：池=2 且 host=0 → 内部带标志 capture 判 infeasible（occupied==capacity、DeviceFork peak+1 无 host 可落）→ 引擎 skip_capture，预留槽完好；池=2 且 host>0 → 内部 capture → HostSnapshot（仅 logical+host 槽，不占 device 槽）→ 预留槽完好；池≥3 引擎被 ==2U gate 排除。prepare_active_capture 目的地序：recycles → sequence.reserved_state（P2-B :8256-8259）→ reserve_destination()（池≥3 且有预留槽被内部 capture 占用时 free=C-2≥1）
+- 部署 captures=0 与 pressure_resume 测试通过的矛盾由此消解：两池均=2 时带标志 capture 一律 skip（部署 MTP ResponseReplay 同此），pressure_resume 池=4 时 rewrite 经预留槽捕获成功（reused_pages=120 = generation_begin 7680 边界）
+- 降级路径：运行时 offer 被跳过（program transaction 占用）→ endpoint_frontier 恒 0 → D4 三元回落 execution_frontier（legacy endpoint），不 crash
+- battery 影响面（==2U gate）：仅 host_restore / shared_replacement 两引擎新增 plain 组（池=2、host>0 → 内部 HostSnapshot 路径安全）；endpoint 前移至 prompt 边界可能偏移 reuse 量断言 → 4090 ctest 验证
+- 后续：commit+push → 4090 merge --ff-only + ninja → 用户停常驻 GPU 容器后：4090 ctest battery + serve 重跑（NINFER_ADMISSION_TRACE=1，2-3 轮；判据：prompt 边界 key-miss 消失、prefix_cache_hit_tokens ≈ 上轮 prompt_tokens、captures≥1、无 private_owners_evicted）；仍 miss 则上 §4.4-2（inspect_capture 预留槽计费）
