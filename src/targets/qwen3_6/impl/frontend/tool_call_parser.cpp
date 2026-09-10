@@ -9,9 +9,55 @@
 #include <utility>
 
 namespace ninfer::targets::qwen3_6::frontend_internal {
+#ifdef NINFER_TOOL_CALL_TRACE
+// Diagnostic hook: a host tool that compiles this translation unit with NINFER_TOOL_CALL_TRACE
+// defined provides this sink. Every NINFER_TC_TRACE call expands to a no-op otherwise.
+void tool_call_trace(const char* stage, std::string_view detail);
+#define NINFER_TC_TRACE(stage, ...)                                                                \
+    ::ninfer::targets::qwen3_6::frontend_internal::tool_call_trace(stage, __VA_ARGS__)
+#else
+#define NINFER_TC_TRACE(...) ((void)0)
+#endif
+
 namespace {
 
 using Json = nlohmann::json;
+
+#ifdef NINFER_TOOL_CALL_TRACE
+const char* encoding_name(const ToolArgumentTypeContracts::Parameter* contract) {
+    if (contract == nullptr) { return "legacy"; }
+    return contract->encoding == ToolArgumentTypeContracts::Encoding::String ? "String" : "Json";
+}
+
+std::string trace_snippet(std::string_view text, std::size_t max_length) {
+    const std::size_t limit = std::min(max_length, text.size());
+    std::string result;
+    result.reserve(limit + 4);
+    for (std::size_t index = 0; index < limit; ++index) {
+        const char byte = text[index];
+        if (byte == '\n') {
+            result += "\\n";
+        } else if (byte == '\r') {
+            result += "\\r";
+        } else if (byte == '\t') {
+            result += "\\t";
+        } else {
+            result += byte;
+        }
+    }
+    if (text.size() > limit) { result += "..."; }
+    return result;
+}
+
+std::string trace_json_error(const std::string& text) {
+    try {
+        [[maybe_unused]] const Json parsed = Json::parse(text);
+        return "parse ok";
+    } catch (const std::exception& error) {
+        return error.what();
+    }
+}
+#endif
 
 std::string trim_ascii(std::string_view text) {
     std::size_t begin = 0;
@@ -35,6 +81,27 @@ void skip_ws(std::string_view text, std::size_t& pos) {
 
 bool starts_with_at(std::string_view text, std::size_t pos, std::string_view prefix) {
     return pos <= text.size() && text.substr(pos, prefix.size()) == prefix;
+}
+
+bool has_non_whitespace(std::string_view text) {
+    for (const unsigned char c : text) {
+        if (std::isspace(c) == 0) { return true; }
+    }
+    return false;
+}
+
+// Qwen's closing tags are line-anchored: the template requires tags to start a line. Prefer the
+// first close tag that starts a line so literal tag text embedded inside a parameter value does
+// not terminate the value early, and fall back to the first plain occurrence for inputs that do
+// not follow the line contract. Returns the close tag's offset, or npos.
+std::size_t find_closing_tag(std::string_view text, std::size_t pos, std::string_view close) {
+    std::string anchored;
+    anchored.reserve(close.size() + 1);
+    anchored.push_back('\n');
+    anchored.append(close);
+    const std::size_t line_anchored = text.find(anchored, pos);
+    if (line_anchored != std::string_view::npos) { return line_anchored + 1; }
+    return text.find(close, pos);
 }
 
 bool valid_function_name(std::string_view name, std::size_t max_name_length) {
@@ -166,29 +233,68 @@ bool parse_parameter(std::string_view inner, std::size_t& pos, Json& args,
                      std::string_view tool_name, const ToolArgumentTypeContracts& contracts) {
     constexpr std::string_view kParamOpen  = "<parameter=";
     constexpr std::string_view kParamClose = "</parameter>";
-    if (!starts_with_at(inner, pos, kParamOpen)) { return false; }
+    if (!starts_with_at(inner, pos, kParamOpen)) {
+        NINFER_TC_TRACE("parameter", "FAIL: expected '<parameter=' at offset " +
+                                         std::to_string(pos) + " of " +
+                                         std::to_string(inner.size()) + ", found '" +
+                                         trace_snippet(inner.substr(pos, 32), 32) + "'");
+        return false;
+    }
     const std::size_t name_begin = pos + kParamOpen.size();
     const std::size_t name_end   = inner.find('>', name_begin);
-    if (name_end == std::string_view::npos || name_end == name_begin) { return false; }
+    if (name_end == std::string_view::npos || name_end == name_begin) {
+        NINFER_TC_TRACE("parameter", "FAIL: '<parameter=' without a key or '>' at offset " +
+                                         std::to_string(pos) + ", found '" +
+                                         trace_snippet(inner.substr(pos, 32), 32) + "'");
+        return false;
+    }
     const std::string key       = std::string(inner.substr(name_begin, name_end - name_begin));
     pos                         = name_end + 1;
-    const std::size_t value_end = inner.find(kParamClose, pos);
-    if (value_end == std::string_view::npos) { return false; }
+    const std::size_t value_end = find_closing_tag(inner, pos, kParamClose);
+    if (value_end == std::string_view::npos) {
+        NINFER_TC_TRACE("parameter", "FAIL: missing '</parameter>' for key '" + key +
+                                         "' at offset " + std::to_string(pos));
+        return false;
+    }
     const std::string_view encoded_value = inner.substr(pos, value_end - pos);
     const ToolArgumentTypeContracts::Parameter* contract =
         find_parameter_contract(contracts, tool_name, key);
+    NINFER_TC_TRACE("parameter", "key '" + key + "' value [" + std::to_string(pos) + ", " +
+                                     std::to_string(value_end) + ") len " +
+                                     std::to_string(encoded_value.size()) + ", encoding " +
+                                     encoding_name(contract));
     if (contract == nullptr) {
         const std::string legacy_value = trim_ascii(encoded_value);
         Json parsed                    = Json::parse(legacy_value, nullptr, false);
+        NINFER_TC_TRACE("parameter", "key '" + key + "': legacy trimmed len " +
+                                         std::to_string(legacy_value.size()) + ", JSON " +
+                                         (parsed.is_discarded() ? "discarded -> raw string"
+                                                                : "decoded"));
         args[key] = parsed.is_discarded() ? Json(legacy_value) : std::move(parsed);
     } else {
         const std::string value(remove_parameter_framing_newlines(encoded_value));
         if (contract->encoding == ToolArgumentTypeContracts::Encoding::String) {
+            NINFER_TC_TRACE("parameter",
+                            "key '" + key + "': String len " + std::to_string(value.size()) +
+                                " (framing strip removed " +
+                                std::to_string(encoded_value.size() - value.size()) + " bytes)");
             args[key] = value;
         } else {
             Json parsed = Json::parse(value, nullptr, false);
-            if (parsed.is_discarded()) { return false; }
-            args[key] = std::move(parsed);
+            if (parsed.is_discarded()) {
+                // Best-effort: a value that is not valid JSON degrades to its raw text instead of
+                // rejecting the call, so the client harness can inspect or reject it.
+                NINFER_TC_TRACE("parameter", "key '" + key +
+                                                 "': JSON decode discarded -> raw string (len " +
+                                                 std::to_string(value.size()) + "): " +
+                                                 trace_json_error(value) + "; value '" +
+                                                 trace_snippet(value, 160) + "'");
+                args[key] = value;
+            } else {
+                NINFER_TC_TRACE("parameter", "key '" + key + "': Json decoded (len " +
+                                                 std::to_string(value.size()) + ")");
+                args[key] = std::move(parsed);
+            }
         }
     }
     pos = value_end + kParamClose.size();
@@ -201,21 +307,41 @@ bool parse_one_tool_call(std::string_view block, std::size_t max_name_length,
     constexpr std::string_view kFunctionClose = "</function>";
     std::size_t pos                           = 0;
     skip_ws(block, pos);
-    if (!starts_with_at(block, pos, kFunctionOpen)) { return false; }
-    const std::size_t name_begin = pos + kFunctionOpen.size();
-    const std::size_t name_end   = block.find('>', name_begin);
-    if (name_end == std::string_view::npos || name_end == name_begin) { return false; }
-    const std::string name = std::string(block.substr(name_begin, name_end - name_begin));
-    if (!valid_function_name(name, max_name_length) || !declares_tool(contracts, name)) {
+    if (!starts_with_at(block, pos, kFunctionOpen)) {
+        NINFER_TC_TRACE("function", "FAIL: expected '<function=' at offset " +
+                                        std::to_string(pos) + " of " +
+                                        std::to_string(block.size()) + ", found '" +
+                                        trace_snippet(block.substr(pos, 32), 32) + "'");
         return false;
     }
+    const std::size_t name_begin = pos + kFunctionOpen.size();
+    const std::size_t name_end   = block.find('>', name_begin);
+    if (name_end == std::string_view::npos || name_end == name_begin) {
+        NINFER_TC_TRACE("function", "FAIL: '<function=' without a name or '>' at offset " +
+                                        std::to_string(pos));
+        return false;
+    }
+    const std::string name = std::string(block.substr(name_begin, name_end - name_begin));
+    const bool valid_name  = valid_function_name(name, max_name_length);
+    const bool declared    = declares_tool(contracts, name);
+    NINFER_TC_TRACE("function", "name '" + name + "' (len " + std::to_string(name.size()) +
+                                    ") valid=" + (valid_name ? "1" : "0") + " declared=" +
+                                    (declared ? "1" : "0"));
+    if (!valid_name || !declared) { return false; }
     pos = name_end + 1;
 
-    const std::size_t function_end = block.find(kFunctionClose, pos);
-    if (function_end == std::string_view::npos) { return false; }
+    const std::size_t function_end = find_closing_tag(block, pos, kFunctionClose);
+    if (function_end == std::string_view::npos) {
+        NINFER_TC_TRACE("function", "FAIL: missing '</function>' after offset " +
+                                        std::to_string(pos));
+        return false;
+    }
     const std::string_view params = block.substr(pos, function_end - pos);
-    Json args                     = Json::object();
-    std::size_t param_pos         = 0;
+    NINFER_TC_TRACE("function", "body [" + std::to_string(pos) + ", " +
+                                    std::to_string(function_end) + ") len " +
+                                    std::to_string(params.size()));
+    Json args             = Json::object();
+    std::size_t param_pos = 0;
     for (;;) {
         skip_ws(params, param_pos);
         if (param_pos >= params.size()) { break; }
@@ -224,10 +350,17 @@ bool parse_one_tool_call(std::string_view block, std::size_t max_name_length,
 
     pos = function_end + kFunctionClose.size();
     skip_ws(block, pos);
-    if (pos != block.size()) { return false; }
+    if (pos != block.size()) {
+        NINFER_TC_TRACE("function", "FAIL: trailing non-whitespace after '</function>' at " +
+                                        std::to_string(pos) + ": '" +
+                                        trace_snippet(block.substr(pos, 32), 32) + "'");
+        return false;
+    }
 
     out.name           = name;
     out.arguments_json = args.dump();
+    NINFER_TC_TRACE("function", "OK: '" + name + "' arguments '" +
+                                    trace_snippet(out.arguments_json, 160) + "'");
     return true;
 }
 
@@ -241,16 +374,33 @@ ParsedToolCallOutput fallback(const std::string& text) {
 
 std::shared_ptr<const ToolCallOutputContract>
 build_tool_call_output_contract(std::span<const std::string> tool_jsons, bool enabled) {
-    if (!enabled) { return {}; }
+    if (!enabled) {
+        NINFER_TC_TRACE("contract", "disabled");
+        return {};
+    }
     auto contract                                   = std::make_shared<ToolCallOutputContract>();
     contract->argument_types.enforce_declared_names = true;
     contract->argument_types.tools.reserve(tool_jsons.size());
     for (const std::string& tool_json : tool_jsons) {
         const Json definition = Json::parse(tool_json, nullptr, false);
+        NINFER_TC_TRACE("contract", std::string("tool_json ") +
+                                        (definition.is_discarded() ? "discarded" : "parsed"));
         if (!definition.is_discarded()) {
             append_tool_contract(contract->argument_types, definition);
         }
     }
+#ifdef NINFER_TOOL_CALL_TRACE
+    for (const auto& tool : contract->argument_types.tools) {
+        std::string parameters;
+        for (const auto& parameter : tool.parameters) {
+            if (!parameters.empty()) { parameters += ", "; }
+            parameters += parameter.name + "=" + encoding_name(&parameter);
+        }
+        NINFER_TC_TRACE("contract", "tool '" + tool.name + "' unambiguous=" +
+                                        (tool.unambiguous ? "1" : "0") + " params=[" +
+                                        parameters + "]");
+    }
+#endif
     return contract;
 }
 
@@ -261,30 +411,64 @@ ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
     constexpr std::string_view kToolClose = "</tool_call>";
 
     const std::size_t first = text.find(kToolOpen);
-    if (first == std::string::npos) { return fallback(text); }
+    if (first == std::string::npos) {
+        NINFER_TC_TRACE("output", "FAIL: no '<tool_call>' marker in " +
+                                      std::to_string(text.size()) + " bytes -> fallback");
+        return fallback(text);
+    }
+    NINFER_TC_TRACE("output", "first '<tool_call>' at offset " + std::to_string(first) + " of " +
+                                  std::to_string(text.size()));
 
     ParsedToolCallOutput out;
     out.content = rtrim_ascii(std::string_view(text).substr(0, first));
+    NINFER_TC_TRACE("output", "content prefix len " + std::to_string(out.content.size()));
 
     std::size_t pos = first;
     while (pos < text.size()) {
-        skip_ws(text, pos);
-        if (pos >= text.size()) { break; }
-        if (!starts_with_at(text, pos, kToolOpen)) { return fallback(text); }
-        const std::size_t inner_begin = pos + kToolOpen.size();
-        const std::size_t close       = text.find(kToolClose, inner_begin);
-        if (close == std::string::npos) { return fallback(text); }
-        GeneratedToolCall call;
-        if (!parse_one_tool_call(std::string_view(text).substr(inner_begin, close - inner_begin),
-                                 max_tool_name_length, contracts, call)) {
-            return fallback(text);
+        const std::size_t open = text.find(kToolOpen, pos);
+        if (open == std::string::npos) {
+            // Ordinary text after the last block stays content.
+            const std::string_view tail = std::string_view(text).substr(pos);
+            if (has_non_whitespace(tail)) { out.content.append(tail); }
+            break;
         }
-        out.tool_calls.push_back(std::move(call));
+        if (open > pos) {
+            // Text between blocks is preserved as content instead of discarding every parsed call.
+            const std::string_view gap = std::string_view(text).substr(pos, open - pos);
+            if (has_non_whitespace(gap)) { out.content.append(gap); }
+        }
+        const std::size_t inner_begin = open + kToolOpen.size();
+        const std::size_t close       = find_closing_tag(text, inner_begin, kToolClose);
+        if (close == std::string::npos) {
+            // An unterminated block cannot be parsed; keep its raw text as content.
+            out.content.append(text, open, text.size() - open);
+            NINFER_TC_TRACE("output", "unterminated block at offset " + std::to_string(open) +
+                                          " -> degraded to content");
+            break;
+        }
+        NINFER_TC_TRACE("output", "block #" + std::to_string(out.tool_calls.size() + 1) +
+                                      " span [" + std::to_string(open) + ", " +
+                                      std::to_string(close) + "), inner len " +
+                                      std::to_string(close - inner_begin));
+        GeneratedToolCall call;
+        if (parse_one_tool_call(std::string_view(text).substr(inner_begin, close - inner_begin),
+                                max_tool_name_length, contracts, call)) {
+            out.tool_calls.push_back(std::move(call));
+        } else {
+            // Per-block isolation: a rejected block degrades to its raw text while the remaining
+            // blocks still produce tool calls.
+            out.content.append(text, open, close + kToolClose.size() - open);
+            NINFER_TC_TRACE("output", "block at offset " + std::to_string(open) +
+                                          " rejected -> degraded to content");
+        }
         pos = close + kToolClose.size();
     }
 
     if (out.tool_calls.empty()) { return fallback(text); }
     out.is_tool_call_response = true;
+    NINFER_TC_TRACE("output", "OK: " + std::to_string(out.tool_calls.size()) +
+                                  " tool call(s), content len " +
+                                  std::to_string(out.content.size()));
     return out;
 }
 
@@ -349,7 +533,9 @@ ToolCallOutputDecoder::Terminal ToolCallOutputDecoder::finish() {
         trailing_whitespace_.clear();
         tool_region_.clear();
         marker_prefix_bytes_ = 0;
-        return Terminal{.content = {}, .tool_calls = std::move(parsed.tool_calls)};
+        // Content carries any block that degraded to raw text; the remaining blocks stay calls.
+        return Terminal{.content    = std::move(parsed.content),
+                        .tool_calls = std::move(parsed.tool_calls)};
     }
 
     constexpr std::string_view kToolOpen = "<tool_call>";

@@ -92,7 +92,7 @@ int test_malformed_falls_back_to_text() {
     return failures;
 }
 
-int test_suffix_after_tool_falls_back_to_text() {
+int test_suffix_after_tool_keeps_call_and_text() {
     const std::string text = "<tool_call>\n"
                              "<function=get_weather>\n"
                              "<parameter=city>\nParis\n</parameter>\n"
@@ -102,8 +102,10 @@ int test_suffix_after_tool_falls_back_to_text() {
     const fi::ParsedToolCallOutput parsed =
         fi::parse_qwen_tool_call_output(text, 64, kNoTypeContracts);
     int failures = 0;
-    failures += check(!parsed.is_tool_call_response, "non-whitespace suffix falls back to text");
-    failures += check(parsed.content == text, "suffix fallback preserves text");
+    failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1,
+                      "suffix text after a closed block discarded the call");
+    failures += check(parsed.content.find("extra answer") != std::string::npos,
+                      "suffix text after a closed block was lost");
     return failures;
 }
 
@@ -254,10 +256,93 @@ int test_declared_type_mismatches_are_forwarded_without_coercion() {
     const std::string invalid =
         "<tool_call>\n<function=configure>\n<parameter=python_boolean>\nTrue\n</parameter>\n"
         "</function>\n</tool_call>";
-    const auto rejected = fi::parse_qwen_tool_call_output(invalid, 64, contracts);
-    failures += check(!rejected.is_tool_call_response && rejected.content == invalid &&
-                          rejected.tool_calls.empty(),
-                      "non-JSON value for a declared non-string parameter did not fall back");
+    const auto degraded = fi::parse_qwen_tool_call_output(invalid, 64, contracts);
+    failures += check(degraded.is_tool_call_response && degraded.tool_calls.size() == 1,
+                      "non-JSON value for a declared non-string parameter discarded the call");
+    const Json degraded_args = Json::parse(degraded.tool_calls.at(0).arguments_json);
+    failures += check(degraded_args.at("python_boolean").is_string() &&
+                          degraded_args.at("python_boolean") == "True",
+                      "non-JSON value was not preserved as raw text");
+    return failures;
+}
+
+int test_invalid_json_value_degrades_to_string() {
+    const auto contracts = contracts_for(
+        "edit", Json{{"path", Json{{"type", "string"}}}, {"edits", Json{{"type", "array"}}}});
+    const auto parsed =
+        fi::parse_qwen_tool_call_output("<tool_call>\n"
+                                        "<function=edit>\n"
+                                        "<parameter=path>\n/tmp/a\n</parameter>\n"
+                                        "<parameter=edits>\n[[\"x\",\"y\",\"z\"]] , [\"w\"]]\n"
+                                        "</parameter>\n"
+                                        "</function>\n"
+                                        "</tool_call>",
+                                        64, contracts);
+    int failures = 0;
+    failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1,
+                      "invalid JSON for a declared array parameter discarded the call");
+    const Json args = Json::parse(parsed.tool_calls.at(0).arguments_json);
+    failures += check(args.at("path") == "/tmp/a", "sibling string parameter was not parsed");
+    failures += check(args.at("edits").is_string() &&
+                          args.at("edits") == "[[\"x\",\"y\",\"z\"]] , [\"w\"]]",
+                      "invalid JSON value was not preserved as raw text");
+    return failures;
+}
+
+int test_embedded_tag_literals_do_not_truncate() {
+    const auto contracts =
+        contracts_for("compress", Json{{"content", Json{{"type", "array"}}},
+                                       {"topic", Json{{"type", "string"}}}});
+    const auto parsed =
+        fi::parse_qwen_tool_call_output(
+            "<tool_call>\n"
+            "<function=compress>\n"
+            "<parameter=topic>\nplan\n</parameter>\n"
+            "<parameter=content>\n"
+            "[{\"summary\":\"alpha </parameter> beta </function> gamma\"}]\n"
+            "</parameter>\n"
+            "</function>\n"
+            "</tool_call>",
+            64, contracts);
+    int failures = 0;
+    failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1,
+                      "embedded tag literals truncated the parameter value");
+    const Json args = Json::parse(parsed.tool_calls.at(0).arguments_json);
+    failures += check(args.at("topic") == "plan", "sibling parameter was not parsed");
+    failures += check(args.at("content").is_array() && args.at("content").size() == 1 &&
+                          args.at("content").at(0).at("summary") ==
+                              "alpha </parameter> beta </function> gamma",
+                      "embedded tag literals changed the decoded value");
+    return failures;
+}
+
+int test_failed_block_degrades_but_other_calls_survive() {
+    const auto contracts = contracts_for("good", Json{{"value", Json{{"type", "string"}}}});
+    const std::string text = "<tool_call>\n"
+                             "<function=good>\n"
+                             "<parameter=value>\nfirst\n</parameter>\n"
+                             "</function>\n"
+                             "</tool_call>\n"
+                             "<tool_call>\n"
+                             "<function=undeclared>\n"
+                             "<parameter=value>\nsecond\n</parameter>\n"
+                             "</function>\n"
+                             "</tool_call>\n"
+                             "<tool_call>\n"
+                             "<function=good>\n"
+                             "<parameter=value>\nthird\n</parameter>\n"
+                             "</function>\n"
+                             "</tool_call>";
+    const auto parsed = fi::parse_qwen_tool_call_output(text, 64, contracts);
+    int failures      = 0;
+    failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 2,
+                      "a rejected block discarded the surrounding calls");
+    failures += check(parsed.content.find("<function=undeclared>") != std::string::npos,
+                      "rejected block was not preserved as raw content");
+    const Json first  = Json::parse(parsed.tool_calls.at(0).arguments_json);
+    const Json second = Json::parse(parsed.tool_calls.at(1).arguments_json);
+    failures += check(first.at("value") == "first" && second.at("value") == "third",
+                      "surviving calls changed order or arguments");
     return failures;
 }
 
@@ -342,6 +427,26 @@ int test_incremental_filter_fallback() {
     return failures;
 }
 
+int test_incremental_filter_keeps_calls_next_to_degraded_block() {
+    auto contract            = std::make_shared<fi::ToolCallOutputContract>();
+    contract->argument_types = contracts_for("good", Json{{"value", Json{{"type", "string"}}}});
+    fi::ToolCallOutputDecoder decoder(std::move(contract), 64);
+    std::string streamed;
+    streamed += decoder.feed("Answer.  \n<tool_call>\n<function=good>\n<parameter=value>\nok\n"
+                             "</parameter>\n</function>\n</tool_call>\n<tool_call>\n"
+                             "<function=undeclared>\n<parameter=value>\nno\n</parameter>\n"
+                             "</function>\n</tool_call>");
+    auto terminal = decoder.finish();
+    int failures  = 0;
+    failures += check(streamed == "Answer.", "degraded block leaked into the streamed prefix");
+    failures +=
+        check(terminal.tool_calls.size() == 1 && terminal.tool_calls.front().name == "good",
+              "decoder dropped the valid call next to a rejected block");
+    failures += check(terminal.content.find("<function=undeclared>") != std::string::npos,
+                      "decoder did not publish the rejected block as raw content");
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -349,15 +454,19 @@ int main() {
     failures += test_single_call();
     failures += test_multiple_calls_and_json_values();
     failures += test_malformed_falls_back_to_text();
-    failures += test_suffix_after_tool_falls_back_to_text();
+    failures += test_suffix_after_tool_keeps_call_and_text();
     failures += test_configured_name_limit();
     failures += test_declared_strings_are_not_json_sniffed();
     failures += test_declared_non_string_values_are_json_decoded();
     failures += test_declared_type_mismatches_are_forwarded_without_coercion();
+    failures += test_invalid_json_value_degrades_to_string();
+    failures += test_embedded_tag_literals_do_not_truncate();
+    failures += test_failed_block_degrades_but_other_calls_survive();
     failures += test_unknown_schema_keeps_legacy_inference();
     failures += test_parser_enforces_active_tool_set();
     failures += test_incremental_filter_valid_tool();
     failures += test_incremental_filter_fallback();
+    failures += test_incremental_filter_keeps_calls_next_to_degraded_block();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

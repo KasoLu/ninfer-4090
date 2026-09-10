@@ -14,7 +14,8 @@ namespace ninfer::targets::qwen3_6::frontend_internal {
 
 // Qwen's tool syntax carries each top-level argument as text between parameter tags. This
 // contract records only whether an explicit JSON Schema type admits a string or requires JSON
-// decoding. It intentionally does not perform full Schema validation.
+// decoding. It intentionally does not perform full Schema validation; a declared non-string value
+// that fails JSON decoding degrades to raw text instead of rejecting the call.
 struct ToolArgumentTypeContracts {
     enum class Encoding : std::uint8_t {
         Json,
@@ -40,6 +41,8 @@ struct ToolCallOutputContract {
     ToolArgumentTypeContracts argument_types;
 };
 
+// Per-block isolation: `content` carries the text before the first block plus the raw text of any
+// block that could not be parsed; `tool_calls` carries every block that parsed.
 struct ParsedToolCallOutput {
     bool is_tool_call_response = false;
     std::string content;
@@ -54,8 +57,8 @@ parse_qwen_tool_call_output(const std::string& text, std::size_t max_tool_name_l
                             const ToolArgumentTypeContracts& contracts);
 
 // Incrementally publishes bytes that are provably outside a possible terminal Qwen tool-call
-// suffix. At terminal time, valid calls are retained structurally; malformed output is restored
-// verbatim.
+// suffix. At terminal time, valid calls are retained structurally, a rejected block degrades to
+// its raw text in content, and output without any valid call is restored verbatim.
 class ToolCallOutputDecoder {
 public:
     struct Terminal {
