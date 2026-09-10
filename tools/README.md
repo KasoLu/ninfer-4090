@@ -19,6 +19,7 @@ for the selected tool.
 | Measure external Serve TTFT | [`bench/ttft/`](bench/ttft/README.md) |
 | Exercise a resident HTTP server | [`smoke/serve_contract.py`](smoke/serve_contract.py) |
 | Exercise thinking preservation through a managed server | [`smoke/serve_thinking_preservation.py`](smoke/serve_thinking_preservation.py) |
+| Trace tool-call output parsing decisions | [`tool_call_trace/`](tool_call_trace/) |
 
 ## Artifact workflow
 
@@ -87,3 +88,11 @@ real server and consumes the repository fixture:
 python3 tools/smoke/serve_thinking_preservation.py \
   --artifact out/qwen3_6_27b.ninfer --backend mtp
 ```
+
+## Tool-call parse diagnostics
+
+`tools/tool_call_trace/main.cpp` compiles the production tool-call parser with
+`NINFER_TOOL_CALL_TRACE` defined and replays a capture file of model responses case by case,
+printing each parsing decision for the declared contract, the legacy contract, and the streaming
+decoder. It is a C++ diagnostic built ad hoc in the toolchain container; the exact command is in
+the file header. Use it to localize why a response degraded to plain text.
