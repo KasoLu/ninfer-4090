@@ -7,6 +7,7 @@
 #include "runtime/contract/types.h"
 #include "runtime/engine/causal_score_core.h"
 #include "runtime/engine/engine_core.h"
+#include <ninfer/targets/qwen3_6/prepared_prompt.h>
 #include "runtime/engine/slot_spill_guard.h"
 #include "targets/registry.h"
 
@@ -158,6 +159,12 @@ const PromptSummary& PreparedPrompt::summary() const noexcept {
 const PromptPreparationStats& PreparedPrompt::preparation_stats() const noexcept {
     static const PromptPreparationStats empty;
     return impl_ != nullptr ? impl_->prepare : empty;
+}
+
+const std::vector<TokenId>& PreparedPrompt::token_ids() const noexcept {
+    static const std::vector<TokenId> empty;
+    if (impl_ == nullptr) { return empty; }
+    return targets::qwen3_6::PreparedPromptAccess::view(impl_->value).token_ids;
 }
 
 PreparedPrompt::operator bool() const noexcept { return impl_ != nullptr; }

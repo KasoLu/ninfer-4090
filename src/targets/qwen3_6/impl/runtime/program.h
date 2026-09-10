@@ -425,6 +425,8 @@ struct SequenceState {
     bool tail_hidden_valid        = false;
     bool state_source_retained    = false;
     bool endpoint_valid           = false;
+    std::uint32_t endpoint_frontier = 0;  // V3 M1: endpoint key frontier, always = prompt boundary (set in finish())
+    std::uint32_t prompt_boundary   = 0;  // V3 M1: written once in start_sequence = staged prefill prompt_tokens
     RewriteCheckpoint rewrite_checkpoint;
     std::vector<LongAnchorCheckpoint> long_anchors;
     std::vector<std::uint32_t> shared_prefix_references;

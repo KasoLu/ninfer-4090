@@ -12,6 +12,8 @@
 #include <utility>
 #include <algorithm>
 #include <vector>
+#include <chrono>
+#include <thread>
 
 namespace {
 
@@ -2083,6 +2085,391 @@ int exercise_artifact(const char* artifact, std::string_view expected_target) {
     return exercise_auto_save_stale_copy_does_not_clobber(artifact);
 }
 
+// =====================================================================
+// PREFIX-V3 scenarios (R-V3-2 / R-V3-4a / R-V3-6). Opt-in through
+// NINFER_PREFIX_REAL_SCENARIO; they mirror the production shape:
+// v22_4 chat template, thinking + preserve_thinking, MTP, rk8v4 KV.
+
+ninfer::EngineOptions v3_engine_options(const char* artifact, bool concurrent) {
+    ninfer::EngineOptions options;
+    options.artifact_path                        = artifact;
+    options.max_context                          = 8192;
+    options.kv_capacity                          = ninfer::KvCapacityPolicy::explicit_capacity(8192);
+    options.prefill_chunk                        = 1024;
+    options.kv_cache                             =
+        ninfer::KvCacheStorage::RotatedInt8KeyInt4ValueGroup64; // production --kv-dtype rk8v4
+    options.chat_template_name                   = "v22_4";
+    options.speculative.backend                  = ninfer::SpeculativeBackend::Mtp;
+    options.speculative.draft_tokens             = 3;
+    options.speculative.proposal_head            = ninfer::ProposalHead::Optimized;
+    options.max_concurrency                      = concurrent ? 2 : 1;
+    options.max_pending_requests                 = concurrent ? 8 : 4;
+    options.context_cache.enabled                = true;
+    // C + H StateImage pool: 5 slots (concurrent) or the production 2-slot pool.
+    options.context_cache.device_state_slots     = concurrent ? 3 : 1;
+    options.context_cache.host_state_slots       = 0;
+    options.context_cache.host_kv_capacity_bytes = 0;
+    options.context_cache.max_private_continuations         = concurrent ? 4 : 2;
+    options.context_cache.max_shared_prefixes               = 0;
+    options.context_cache.max_long_anchors_per_continuation = 0;
+    return options;
+}
+
+ninfer::PromptInput v3_round1(std::string text, const std::string& session) {
+    ninfer::PromptInput input;
+    ninfer::ChatMessage user;
+    user.role = ninfer::ChatRole::User;
+    user.parts.push_back(ninfer::MessagePart{
+        .kind = ninfer::MessagePartKind::Text, .text = std::move(text), .media = {}});
+    input.messages.push_back(std::move(user));
+    input.options.enable_thinking   = true;
+    input.options.preserve_thinking = true;
+    input.context_cache.session_key = session;
+    input.context_cache.retention   = ninfer::CacheRetentionHint::LiveSession;
+    return input;
+}
+
+// Client-style re-serialization: identical first user message, the retained assistant
+// turns (content + reasoning preserved), then the new user turn.
+ninfer::PromptInput v3_followup(std::string followup, const std::string& session, std::string first_user,
+                                const std::vector<std::pair<std::string, std::string>>& history) {
+    ninfer::PromptInput input = v3_round1(std::move(first_user), session);
+    for (const auto& [content, reasoning] : history) {
+        ninfer::ChatMessage assistant;
+        assistant.role              = ninfer::ChatRole::Assistant;
+        assistant.reasoning_content = reasoning;
+        assistant.parts.push_back(ninfer::MessagePart{
+            .kind = ninfer::MessagePartKind::Text, .text = content, .media = {}});
+        input.messages.push_back(std::move(assistant));
+    }
+    ninfer::ChatMessage next;
+    next.role = ninfer::ChatRole::User;
+    next.parts.push_back(ninfer::MessagePart{
+        .kind = ninfer::MessagePartKind::Text, .text = std::move(followup), .media = {}});
+    input.messages.push_back(std::move(next));
+    return input;
+}
+
+std::optional<std::string> v3_exact_text(const ninfer::Engine& engine, std::uint32_t target,
+                                         std::string_view word, const std::string& session) {
+    const auto text = [word](std::uint32_t repetitions) {
+        std::string value;
+        value.reserve(static_cast<std::size_t>(repetitions) * (word.size() + 1U));
+        for (std::uint32_t index = 0; index < repetitions; ++index) {
+            value.push_back(' ');
+            value.append(word);
+        }
+        return value;
+    };
+    const auto count = [&](std::uint32_t repetitions) {
+        return engine.count_tokens(v3_round1(text(repetitions), session));
+    };
+
+    std::uint32_t low  = 0;
+    std::uint32_t high = target;
+    while (low <= high) {
+        const std::uint32_t middle = low + (high - low) / 2U;
+        const std::uint32_t tokens = count(middle);
+        if (tokens == target) { return text(middle); }
+        if (tokens < target) {
+            low = middle + 1U;
+        } else {
+            if (middle == 0) { break; }
+            high = middle - 1U;
+        }
+    }
+    return std::nullopt;
+}
+
+int exercise_v3_reuse_regression(const char* artifact) {
+    // R-V3-2: same session, client-style re-serialization (preserve_thinking), MTP,
+    // 2-slot pool. round2/round3 must reuse the previous round's prompt boundary.
+    ninfer::Engine engine(v3_engine_options(artifact, false));
+    const std::string session               = "v3-reuse-regression";
+    constexpr std::uint32_t kPromptTokens   = 2048;
+    constexpr std::uint32_t kOutputTokens   = 24;
+
+    const std::optional<std::string> text = v3_exact_text(engine, kPromptTokens, "regression", session);
+    if (!text) {
+        std::cerr << "v3-reuse-regression could not construct exact prompt geometry\n";
+        return 1;
+    }
+
+    const ninfer::GenerationResult round1 =
+        engine.generate(engine.prepare(v3_round1(*text, session)), fixed_output(kOutputTokens));
+    if (round1.prefix_reuse_path != ninfer::PrefixReusePath::Root ||
+        round1.prompt.prompt_tokens != kPromptTokens ||
+        round1.generated_token_ids.size() != kOutputTokens) {
+        std::cerr << "v3-reuse-regression round1 did not establish its full endpoint: path="
+                  << static_cast<int>(round1.prefix_reuse_path)
+                  << " prompt=" << round1.prompt.prompt_tokens << " output="
+                  << round1.generated_token_ids.size() << '\n';
+        return 1;
+    }
+
+    std::vector<std::pair<std::string, std::string>> history;
+    history.emplace_back(round1.content, round1.reasoning);
+    const ninfer::GenerationResult round2 = engine.generate(
+        engine.prepare(v3_followup("Continue. Summarize in one line.", session, *text, history)),
+        fixed_output(kOutputTokens));
+    if (round2.prefix_reuse_path != ninfer::PrefixReusePath::PrivateEndpoint ||
+        round2.reused_prompt_tokens != round1.prompt.prompt_tokens) {
+        std::cerr << "v3-reuse-regression round2 lost its boundary reuse: path="
+                  << static_cast<int>(round2.prefix_reuse_path)
+                  << " reused=" << round2.reused_prompt_tokens << " expected="
+                  << round1.prompt.prompt_tokens << '\n';
+        return 1;
+    }
+
+    history.emplace_back(round2.content, round2.reasoning);
+    const ninfer::GenerationResult round3 = engine.generate(
+        engine.prepare(v3_followup("Expand that line into three bullets.", session, *text, history)),
+        fixed_output(kOutputTokens));
+    if (round3.prefix_reuse_path != ninfer::PrefixReusePath::PrivateEndpoint ||
+        round3.reused_prompt_tokens != round2.prompt.prompt_tokens) {
+        std::cerr << "v3-reuse-regression round3 lost its boundary reuse: path="
+                  << static_cast<int>(round3.prefix_reuse_path)
+                  << " reused=" << round3.reused_prompt_tokens << " expected="
+                  << round2.prompt.prompt_tokens << '\n';
+        return 1;
+    }
+    if (!engine.healthy()) {
+        std::cerr << "v3-reuse-regression left the engine unhealthy\n";
+        return 1;
+    }
+    return 0;
+}
+
+int exercise_v3_boundary_key(const char* artifact) {
+    // R-V3-4a: the published endpoint key frontier is the prompt boundary, not the
+    // execution frontier. A partial replay (7 of 8 generated tokens) must reuse 1024
+    // tokens; V1's execution-frontier key misses and falls back to root.
+    ninfer::Engine engine(v3_engine_options(artifact, false));
+    constexpr std::uint32_t kBoundaryTokens = 1024;
+    constexpr std::uint32_t kOutputTokens   = 8;
+
+    std::vector<ninfer::TokenId> base(kBoundaryTokens, 198);
+    const ninfer::GenerationResult round1 =
+        engine.generate(engine.prepare_tokens(base), fixed_output(kOutputTokens));
+    if (round1.prefix_reuse_path != ninfer::PrefixReusePath::Root ||
+        round1.prompt.prompt_tokens != kBoundaryTokens ||
+        round1.generated_token_ids.size() < kOutputTokens) {
+        std::cerr << "v3-boundary-key round1 did not establish its full endpoint: path="
+                  << static_cast<int>(round1.prefix_reuse_path)
+                  << " prompt=" << round1.prompt.prompt_tokens << " output="
+                  << round1.generated_token_ids.size() << '\n';
+        return 1;
+    }
+
+    std::vector<ninfer::TokenId> partial = base;
+    for (std::size_t index = 0; index + 1 < round1.generated_token_ids.size() && index < 7;
+         ++index) {
+        partial.push_back(round1.generated_token_ids[index]);
+    }
+    const ninfer::GenerationResult round2 =
+        engine.generate(engine.prepare_tokens(std::move(partial)), fixed_output(1));
+    if (round2.prefix_reuse_path != ninfer::PrefixReusePath::PrivateEndpoint ||
+        round2.reused_prompt_tokens != kBoundaryTokens) {
+        std::cerr << "v3-boundary-key did not reuse the prompt boundary: path="
+                  << static_cast<int>(round2.prefix_reuse_path)
+                  << " reused=" << round2.reused_prompt_tokens << " expected="
+                  << kBoundaryTokens << '\n';
+        return 1;
+    }
+    if (!engine.healthy()) {
+        std::cerr << "v3-boundary-key left the engine unhealthy\n";
+        return 1;
+    }
+    return 0;
+}
+
+int exercise_v3_concurrent_borrow_window(const char* artifact) {
+    // (a) R-V3-6 borrow window: A round 2 is in-flight (its source endpoint slot is
+    // active/borrowed) while C probes A's published boundary. C must degrade to a root
+    // plan (or legally reuse once settled) and the engine must never fail-stop.
+    {
+        ninfer::Engine engine(v3_engine_options(artifact, true));
+        std::vector<ninfer::TokenId> prefix_a(1024, 198);
+        std::vector<ninfer::TokenId> prefix_b(1024, 203);
+
+        const ninfer::GenerationResult a1 =
+            engine.generate(engine.prepare_tokens(prefix_a), fixed_output(16));
+        const ninfer::GenerationResult b1 =
+            engine.generate(engine.prepare_tokens(prefix_b), fixed_output(16));
+        if (a1.prefix_reuse_path != ninfer::PrefixReusePath::Root ||
+            b1.prefix_reuse_path != ninfer::PrefixReusePath::Root ||
+            a1.generated_token_ids.size() != 16 || b1.generated_token_ids.size() != 16) {
+            std::cerr << "v3-concurrency setup did not establish root endpoints: a1="
+                      << static_cast<int>(a1.prefix_reuse_path)
+                      << " b1=" << static_cast<int>(b1.prefix_reuse_path) << '\n';
+            return 1;
+        }
+
+        std::vector<ninfer::TokenId> a2_prompt = prefix_a;
+        a2_prompt.insert(a2_prompt.end(), a1.generated_token_ids.begin(),
+                         a1.generated_token_ids.end());
+        auto a2 = engine.submit(engine.prepare_tokens(std::move(a2_prompt)), fixed_output(64));
+        if (!a2) {
+            std::cerr << "v3-concurrency could not submit the in-flight round\n";
+            return 1;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
+        bool probe_completed = false;
+        try {
+            const ninfer::GenerationResult probe = engine.generate(
+                engine.prepare_tokens(prefix_a), fixed_output(8));
+            probe_completed = true;
+            if (probe.prefix_reuse_path != ninfer::PrefixReusePath::Root &&
+                probe.prefix_reuse_path != ninfer::PrefixReusePath::PrivateEndpoint) {
+                std::cerr << "v3-concurrency probe used an unexpected path: "
+                          << static_cast<int>(probe.prefix_reuse_path) << '\n';
+                return 1;
+            }
+        } catch (const ninfer::RequestError&) {
+            // Infeasible-SKIP under borrow pressure is the graceful terminal (S-V3-5).
+        }
+
+        bool a2_completed = false;
+        try {
+            const ninfer::GenerationResult a2_result = a2.wait();
+            a2_completed = true;
+            if (a2_result.generated_token_ids.size() != 64) {
+                std::cerr << "v3-concurrency in-flight round completed short: output="
+                          << a2_result.generated_token_ids.size() << '\n';
+                return 1;
+            }
+        } catch (const ninfer::RequestError&) {
+            // In-flight abort (source became unavailable) is the graceful terminal.
+        }
+        if (!a2_completed && !probe_completed) {
+            std::cerr << "v3-concurrency: in-flight round and probe both failed; a single "
+                         "request conflict must not cascade\n";
+            return 1;
+        }
+        if (!engine.healthy()) {
+            std::cerr << "v3-concurrency borrow window left the engine unhealthy (fail-stop)\n";
+            return 1;
+        }
+    }
+
+    // (b) Interleaved two-stream: each stream keeps boundary reuse round after round.
+    {
+        ninfer::Engine engine(v3_engine_options(artifact, true));
+        std::vector<ninfer::TokenId> stream_a(1024, 198);
+        std::vector<ninfer::TokenId> stream_b(1024, 203);
+
+        const ninfer::GenerationResult a_seed =
+            engine.generate(engine.prepare_tokens(stream_a), fixed_output(8));
+        const ninfer::GenerationResult b_seed =
+            engine.generate(engine.prepare_tokens(stream_b), fixed_output(8));
+        if (a_seed.prefix_reuse_path != ninfer::PrefixReusePath::Root ||
+            b_seed.prefix_reuse_path != ninfer::PrefixReusePath::Root) {
+            std::cerr << "v3-interleave seeds did not establish root endpoints\n";
+            return 1;
+        }
+        stream_a.insert(stream_a.end(), a_seed.generated_token_ids.begin(),
+                        a_seed.generated_token_ids.end());
+        stream_b.insert(stream_b.end(), b_seed.generated_token_ids.begin(),
+                        b_seed.generated_token_ids.end());
+
+        for (std::uint32_t round = 2; round <= 4; ++round) {
+            const std::size_t expected_a = stream_a.size();
+            const std::size_t expected_b = stream_b.size();
+            const ninfer::GenerationResult a_next =
+                engine.generate(engine.prepare_tokens(stream_a), fixed_output(8));
+            if (a_next.prefix_reuse_path != ninfer::PrefixReusePath::PrivateEndpoint ||
+                a_next.reused_prompt_tokens != expected_a) {
+                std::cerr << "v3-interleave stream A round " << round
+                          << " lost its boundary reuse: path="
+                          << static_cast<int>(a_next.prefix_reuse_path) << " reused="
+                          << a_next.reused_prompt_tokens << " expected=" << expected_a << '\n';
+                return 1;
+            }
+            const ninfer::GenerationResult b_next =
+                engine.generate(engine.prepare_tokens(stream_b), fixed_output(8));
+            if (b_next.prefix_reuse_path != ninfer::PrefixReusePath::PrivateEndpoint ||
+                b_next.reused_prompt_tokens != expected_b) {
+                std::cerr << "v3-interleave stream B round " << round
+                          << " lost its boundary reuse: path="
+                          << static_cast<int>(b_next.prefix_reuse_path) << " reused="
+                          << b_next.reused_prompt_tokens << " expected=" << expected_b << '\n';
+                return 1;
+            }
+            stream_a.insert(stream_a.end(), a_next.generated_token_ids.begin(),
+                            a_next.generated_token_ids.end());
+            stream_b.insert(stream_b.end(), b_next.generated_token_ids.begin(),
+                            b_next.generated_token_ids.end());
+        }
+        if (!engine.healthy()) {
+            std::cerr << "v3-interleave left the engine unhealthy (fail-stop)\n";
+            return 1;
+        }
+    }
+
+    // (c) Production 2-slot pool pressure eviction: a boundary evicted by sibling
+    // traffic degrades to a full re-prefill; it must not fail-stop.
+    {
+        ninfer::Engine engine(v3_engine_options(artifact, false));
+        const std::vector<std::pair<std::uint32_t, std::string>> streams = {
+            {211, "v3-pressure-s1"}, {222, "v3-pressure-s2"}, {233, "v3-pressure-s3"}};
+        std::vector<std::vector<ninfer::TokenId>> history;
+        history.reserve(streams.size());
+        for (const auto& [token, label] : streams) {
+            std::vector<ninfer::TokenId> prompt(1024, static_cast<ninfer::TokenId>(token));
+            const ninfer::GenerationResult seed =
+                engine.generate(engine.prepare_tokens(prompt), fixed_output(8));
+            if (seed.prefix_reuse_path != ninfer::PrefixReusePath::Root) {
+                std::cerr << "v3-pressure seed " << label << " did not take root: path="
+                          << static_cast<int>(seed.prefix_reuse_path) << '\n';
+                return 1;
+            }
+            prompt.insert(prompt.end(), seed.generated_token_ids.begin(),
+                          seed.generated_token_ids.end());
+            history.push_back(std::move(prompt));
+        }
+        // Fill the pool with s2/s2-round-2 and s3/s3-round-2 so s1's boundary is
+        // the eviction victim, then ask for s1's follow-up.
+        for (int index : {1, 2}) {
+            std::vector<ninfer::TokenId> follow = history[index];
+            const ninfer::GenerationResult next =
+                engine.generate(engine.prepare_tokens(follow), fixed_output(8));
+            if (next.prefix_reuse_path != ninfer::PrefixReusePath::Root &&
+                next.prefix_reuse_path != ninfer::PrefixReusePath::PrivateEndpoint) {
+                std::cerr << "v3-pressure filler s" << index + 1 << " used an unexpected path: "
+                          << static_cast<int>(next.prefix_reuse_path) << '\n';
+                return 1;
+            }
+            follow.insert(follow.end(), next.generated_token_ids.begin(),
+                          next.generated_token_ids.end());
+            history[index] = std::move(follow);
+        }
+        bool s1_completed = false;
+        try {
+            const ninfer::GenerationResult s1_next =
+                engine.generate(engine.prepare_tokens(history[0]), fixed_output(8));
+            s1_completed = true;
+            if (s1_next.prefix_reuse_path != ninfer::PrefixReusePath::Root &&
+                s1_next.prefix_reuse_path != ninfer::PrefixReusePath::PrivateEndpoint) {
+                std::cerr << "v3-pressure s1 follow-up used an unexpected path: "
+                          << static_cast<int>(s1_next.prefix_reuse_path) << '\n';
+                return 1;
+            }
+        } catch (const ninfer::RequestError&) {
+            // Eviction-driven infeasible-SKIP is the graceful terminal (S-V3-5).
+        }
+        if (!s1_completed) {
+            std::cerr << "v3-pressure: evicted boundary made s1's follow-up fail with an error\n";
+            return 1;
+        }
+        if (!engine.healthy()) {
+            std::cerr << "v3-pressure left the engine unhealthy (fail-stop)\n";
+            return 1;
+        }
+    }
+    return 0;
+}
+
 int main() {
     const char* groupwise        = std::getenv("NINFER_QWEN3_6_27B_WEIGHTS");
     const char* nvfp4            = std::getenv("NINFER_QWEN3_6_27B_NVFP4_WEIGHTS");
@@ -2167,6 +2554,48 @@ int main() {
             return 1;
         }
         const int result = exercise_automatic_private_anchors(artifact);
+        if (result == 0) { std::cout << "ok\n"; }
+        return result;
+    }
+    if (scenario != nullptr && std::string_view(scenario) == "v3-reuse-regression") {
+        const char* artifact =
+            qwen38_nvfp4 != nullptr && *qwen38_nvfp4 != '\0' ? qwen38_nvfp4
+            : qwen38_groupwise != nullptr && *qwen38_groupwise != '\0' ? qwen38_groupwise
+            : nvfp4 != nullptr && *nvfp4 != '\0' ? nvfp4
+                                                 : groupwise;
+        if (artifact == nullptr || *artifact == '\0') {
+            std::cerr << "v3-reuse-regression requires a 27B artifact\n";
+            return 1;
+        }
+        const int result = exercise_v3_reuse_regression(artifact);
+        if (result == 0) { std::cout << "ok\n"; }
+        return result;
+    }
+    if (scenario != nullptr && std::string_view(scenario) == "v3-boundary-key") {
+        const char* artifact =
+            qwen38_nvfp4 != nullptr && *qwen38_nvfp4 != '\0' ? qwen38_nvfp4
+            : qwen38_groupwise != nullptr && *qwen38_groupwise != '\0' ? qwen38_groupwise
+            : nvfp4 != nullptr && *nvfp4 != '\0' ? nvfp4
+                                                 : groupwise;
+        if (artifact == nullptr || *artifact == '\0') {
+            std::cerr << "v3-boundary-key requires a 27B artifact\n";
+            return 1;
+        }
+        const int result = exercise_v3_boundary_key(artifact);
+        if (result == 0) { std::cout << "ok\n"; }
+        return result;
+    }
+    if (scenario != nullptr && std::string_view(scenario) == "v3-concurrency") {
+        const char* artifact =
+            qwen38_nvfp4 != nullptr && *qwen38_nvfp4 != '\0' ? qwen38_nvfp4
+            : qwen38_groupwise != nullptr && *qwen38_groupwise != '\0' ? qwen38_groupwise
+            : nvfp4 != nullptr && *nvfp4 != '\0' ? nvfp4
+                                                 : groupwise;
+        if (artifact == nullptr || *artifact == '\0') {
+            std::cerr << "v3-concurrency requires a 27B artifact\n";
+            return 1;
+        }
+        const int result = exercise_v3_concurrent_borrow_window(artifact);
         if (result == 0) { std::cout << "ok\n"; }
         return result;
     }

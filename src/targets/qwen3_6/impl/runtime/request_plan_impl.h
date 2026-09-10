@@ -1,5 +1,6 @@
 #include "targets/qwen3_6/impl/runtime/instance.h"
 #include "targets/qwen3_6/impl/runtime/program.h"
+#include "runtime/contract/admission_trace.h"
 #include "targets/qwen3_6/impl/runtime/rebuild_work.h"
 
 #include "targets/qwen3_6/impl/runtime/schedule.h"
@@ -12,6 +13,8 @@
 #include <tuple>
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
+using ninfer::runtime::admission_trace;
+using ninfer::runtime::prefix_reuse_path_name;
 namespace {
 
 void validate_sampling(const ResolvedSamplingParameters& sampling) {
@@ -263,6 +266,13 @@ RequestBasePlan ProgramImplCore::plan_request(const PreparedPromptData& prompt,
     base->allow_prefix_reuse             = options.allow_prefix_reuse;
     base->summary.publish_continuation =
         options.allow_prefix_reuse && prompt.identity.reusable && context_cache.enabled;
+    admission_trace("plan", "prompt=%u allow=%d reusable=%d cache=%d publish=%d backend=%s", base->summary.prompt_tokens,
+                    options.allow_prefix_reuse ? 1 : 0, prompt.identity.reusable ? 1 : 0,
+                    context_cache.enabled ? 1 : 0, base->summary.publish_continuation ? 1 : 0,
+                    speculative_backend == SpeculativeBackend::Mtp ? "mtp"
+                                                                  : speculative_backend == SpeculativeBackend::DFlash
+                                                                        ? "dflash"
+                                                                        : "none");
     const std::uint32_t reserved_context_tokens =
         base->summary.prompt_tokens + (base->summary.effective_output_tokens == 0
                                            ? 0U
@@ -498,11 +508,24 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
             if (selected.ordinal != 0) {
                 throw std::logic_error("private endpoint checkpoint ordinal is invalid");
             }
-            if (selected.frontier == 0 || selected.frontier != source->execution_frontier) {
+            if (selected.frontier == 0 ||
+                (selected.frontier != source->execution_frontier &&
+                 (source->endpoint_frontier == 0 || selected.frontier != source->endpoint_frontier))) {
                 throw std::logic_error("catalog endpoint summary disagrees with Program state");
             }
             if (!qwen3_6::detail::prefix_matches(prompt, source->ledger, source->prefix_identity,
                                                  selected.frontier)) {
+                return std::nullopt;
+            }
+            // V3 M3 (a1): the endpoint image can be borrowed or become stale
+            // while this lane is being inspected (another lane in flight, or
+            // the owning session advanced). A borrowed or stale image makes
+            // the private candidate infeasible: return std::nullopt so the
+            // engine plans an isolated root instead of treating the conflict
+            // as a failure (S-V3-5).
+            if (!source->endpoint_valid || !state_store->valid(source->state.read) ||
+                state_store->role(source->state.read) != StateImageRole::CheckpointImmutable) {
+                admission_trace("inspect", "lane=%u borrowed-stale-skip", lane);
                 return std::nullopt;
             }
             plan->reuse      = ReusePath::PrivateEndpoint;

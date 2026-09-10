@@ -1,6 +1,7 @@
 #include "targets/qwen3_6/impl/runtime/instance.h"
 #include "targets/qwen3_6/impl/runtime/program.h"
 #include "targets/qwen3_6/impl/runtime/rebuild_work.h"
+#include "runtime/contract/admission_trace.h"
 
 #include "core/nvtx.h"
 #include "core/startup.h"
@@ -15,6 +16,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <chrono>
 #include <cstdio>
@@ -29,7 +31,16 @@
 #include <utility>
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
+using ninfer::runtime::admission_trace;
+using ninfer::runtime::prefill_tripwire_enabled;
+using ninfer::runtime::prefix_reuse_path_name;
 namespace {
+
+class SourceUnavailableException final : public std::runtime_error {
+public:
+    SourceUnavailableException()
+        : std::runtime_error("materialization source became unavailable before publication") {}
+};
 
 std::uint32_t normalized_private_capacity(const ContextCacheOptions& options) {
     if (!options.max_private_continuations || *options.max_private_continuations == 0) {
@@ -1239,7 +1250,11 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_admission(
     const SequenceState* source_state = nullptr;
     if (source != nullptr) {
         if (!valid_continuation(*source)) {
-            throw std::logic_error("admission source continuation is stale");
+            // V3 M3 (a1): a borrowed or stale source slot makes this private
+            // candidate infeasible. Returning nullopt lets the engine plan an
+            // isolated root for the lane instead of failing the program.
+            admission_trace("inspect", "lane=%u source-stale-skip", lane);
+            return std::nullopt;
         }
         source_state = &continuation_states[ContractAccess::index(*source)];
     }
@@ -1309,6 +1324,9 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_admission(
     }
     mix(static_cast<std::uint8_t>(plan->impl_->identity_assessment.physical_status));
     plan->impl_->identity_assessment.assessment_digest = digest;
+    admission_trace("inspect", "lane=%u reuse_tokens=%u path=%s", lane,
+                    plan->summary().reusable_prompt_tokens,
+                    prefix_reuse_path_name(plan->summary().prefix_reuse_path));
     return plan;
 }
 
@@ -2813,11 +2831,17 @@ void ProgramImplCore::publish_checkpoint_drop(SequenceState& sequence,
     }
     StateImageHandle dropped_state;
     if (checkpoint.kind == runtime::CheckpointKind::SessionEndpoint) {
-        if (!sequence.endpoint_valid || sequence.execution_frontier != checkpoint.frontier) {
+        // V3 M1: the published endpoint key anchors min(endpoint_frontier, execution_frontier).
+        const std::uint32_t published_frontier =
+            (sequence.endpoint_frontier != 0 && sequence.endpoint_frontier < sequence.execution_frontier)
+                ? sequence.endpoint_frontier
+                : sequence.execution_frontier;
+        if (!sequence.endpoint_valid || published_frontier != checkpoint.frontier) {
             throw std::logic_error("endpoint checkpoint changed before drop");
         }
         dropped_state              = sequence.state.read;
         sequence.endpoint_valid    = false;
+        sequence.endpoint_frontier = 0;  // V3 M1: reset with endpoint_valid
         sequence.state             = {};
         sequence.tail_hidden       = {};
         sequence.tail_hidden_valid = false;
@@ -4187,9 +4211,21 @@ ProgramImplCore::revalidate_materialization(const AdmissionCandidate& plan,
 runtime::ContextTransactionReserveStatus
 ProgramImplCore::reserve_materialization(AdmissionCandidate&& plan, PreparedPromptData&& prompt,
                                          runtime::CancellationFlagView cancellation) {
-    if (cancellation.requested()) { return runtime::ContextTransactionReserveStatus::Aborted; }
+    if (cancellation.requested()) {
+        admission_trace("RESERVE", "result=aborted(cancelled)");
+        return runtime::ContextTransactionReserveStatus::Aborted;
+    }
     const runtime::PreflightStatus preflight = revalidate_materialization(plan, prompt);
     if (preflight != runtime::PreflightStatus::Ready) {
+        if (preflight == runtime::PreflightStatus::StalePolicyState) {
+            // V3 M3 (a1): the source slot may have been borrowed or the
+            // identity stale by the time the physical reservation runs. This
+            // is an admission-level outcome: the engine maps it to Stale
+            // (re-inspect next round) or to Aborted when cancelled, so a
+            // concurrent conflict never fail-stops the program (S-V3-5).
+            admission_trace("RESERVE", "result=aborted(stale-policy)");
+            return runtime::ContextTransactionReserveStatus::Aborted;
+        }
         throw std::logic_error("materialization changed after successful preflight");
     }
     if (has_context_transaction() || pending_transaction_) {
@@ -4527,6 +4563,7 @@ ProgramImplCore::reserve_materialization(AdmissionCandidate&& plan, PreparedProm
         }
         advance_resource_revision();
         context_transaction_.emplace<MaterializationTransaction>(std::move(transaction));
+        admission_trace("RESERVE", "lane=%u result=reserved", details.destination.value);
         return runtime::ContextTransactionReserveStatus::Reserved;
     } catch (...) {
         release_materialization_staging(transaction);
@@ -4621,13 +4658,22 @@ void ProgramImplCore::prepare_consumed_source(MaterializationTransaction& transa
     if (transaction.source_index >= continuation_capacity ||
         continuation_slots[transaction.source_index].role != ContinuationSlotRole::Catalogued ||
         continuation_slots[transaction.source_index].generation != transaction.source_generation) {
-        throw std::logic_error("materialization source changed before dependency release");
+        // V3 M3 (a2): the source slot can be released or borrowed between
+        // admission and physical preparation. Controlled abort: the engine
+        // completes the request as a detached cancellation (or re-inspects on
+        // Stale) instead of fail-stopping the program. The stale claim is
+        // dropped so source acknowledgement becomes a no-op.
+        transaction.cancel_pending = true;
+        transaction.has_source    = false;
+        return;
     }
     SequenceState& source = continuation_states[transaction.source_index];
     if (!source.kv || details.reuse == ReusePath::Root ||
         details.reuse == ReusePath::SharedStablePrefix) {
         throw std::logic_error("consumed materialization source is incomplete");
     }
+    admission_trace("prepare", "src_slot=%u reuse=%s mode=consume", transaction.source_index,
+                    prefix_reuse_path_name(details.reuse));
 
     const detail::PhysicalResources before = resident_resources(source);
     const auto retained_state              = [&](StateImageHandle handle) {
@@ -4647,13 +4693,23 @@ void ProgramImplCore::prepare_consumed_source(MaterializationTransaction& transa
         }
     };
 
-    if (source.endpoint_valid && source.execution_frontier > details.reuse_base) {
+    if (source.endpoint_valid && source.execution_frontier > details.reuse_base &&
+        details.reuse != ReusePath::PrivateEndpoint) {  // V3 M2: never drop the reuse vehicle itself
+        admission_trace("consume-source", "reuse=%s exec=%u reuse_base=%u endpoint_valid=1 ep_frontier=%u state_read_valid=%d mtp_kv_valid=%u action=drop",
+                        prefix_reuse_path_name(details.reuse), source.execution_frontier, details.reuse_base,
+                        source.endpoint_frontier, state_store->valid(source.state.read) ? 1 : 0, source.mtp_kv_valid);
         const StateImageHandle endpoint = source.state.read;
         source.endpoint_valid           = false;
+        source.endpoint_frontier         = 0;  // V3 M1: reset with endpoint_valid
         source.state                    = {};
         source.tail_hidden              = {};
         source.tail_hidden_valid        = false;
         release_if_unreferenced(endpoint);
+    }
+    if (source.endpoint_valid && details.reuse == ReusePath::PrivateEndpoint) {
+        admission_trace("consume-source", "reuse=private_endpoint exec=%u reuse_base=%u endpoint_valid=1 ep_frontier=%u state_read_valid=%d mtp_kv_valid=%u action=retain(M2-guard)",
+                        source.execution_frontier, details.reuse_base, source.endpoint_frontier,
+                        state_store->valid(source.state.read) ? 1 : 0, source.mtp_kv_valid);
     }
     for (std::size_t index = source.long_anchors.size(); index != 0; --index) {
         LongAnchorCheckpoint& anchor = source.long_anchors[index - 1U];
@@ -6301,6 +6357,8 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
 
     if (!transaction.prepared) {
         prepare_materialization(transaction);
+        admission_trace("materialize", "lane=%u has_source=%d reserved_states=%u", transaction.destination.value,
+                        transaction.has_source ? 1 : 0, transaction.reserved_state_count);
         enqueue_materialization_transfers(transaction);
         if (transaction.transfer_submitted) {
             out.status = runtime::ContextTransactionStatus::InProgress;
@@ -6319,6 +6377,23 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
         materialization_ledger_.clear();
         materialization_identity_.clear();
         materialization_prefix_digests_.clear();
+    } catch (const SourceUnavailableException&) {
+        admission_trace("start-seq", "a2-abort lane=%u", transaction.destination.value);
+        // V3 M3 (a2): the consumed source image was borrowed or became stale
+        // while this lane was in flight (e.g. another lane in flight).
+        // Controlled abort: the engine completes the request as a detached
+        // cancellation (infeasible-SKIP) instead of fail-stopping (S-V3-5).
+        // If the source slot itself is gone, drop the stale claim first so
+        // acknowledgement cannot throw.
+        if (transaction.has_source &&
+            (transaction.source_index >= continuation_capacity ||
+             continuation_slots[transaction.source_index].role != ContinuationSlotRole::Catalogued ||
+             continuation_slots[transaction.source_index].generation != transaction.source_generation)) {
+            transaction.has_source = false;
+        }
+        transaction.cancel_pending = true;
+        abort_transaction();
+        return out;
     } catch (...) {
         release_materialization_staging(transaction);
         throw;
@@ -6613,6 +6688,7 @@ void ProgramImplCore::retire_continuation_slot(std::uint32_t index) noexcept {
     sequence.mtp_draft_count         = 0;
     sequence.tail_hidden_valid       = false;
     sequence.endpoint_valid          = false;
+    sequence.endpoint_frontier       = 0;  // V3 M1: reset with endpoint_valid
     sequence.rewrite_checkpoint      = {};
     sequence.rebuild_work            = {};
     sequence.rebuild_tail_begin      = 0;
@@ -7116,6 +7192,9 @@ PrefillProgress ProgramImplCore::wrap_prefill(std::uint32_t lane, runtime::Prefi
         out.capture.emplace(
             ContractAccess::make_capture_offer(this, runtime::LaneId{lane}, lane_epochs[lane],
                                                requests[lane].prefill->pending_capture_offer));
+        admission_trace("offer", "lane=%u offer=%u base=%u cursor=%u", lane,
+                        requests[lane].prefill->pending_capture_offer, requests[lane].prefill->base,
+                        requests[lane].prefill->cursor);
     }
     return out;
 }
@@ -7171,6 +7250,7 @@ StartResult ProgramImplCore::start_request(MaterializationTransaction& transacti
         detail::PhysicalResources actual         = resident_resources(sequence);
         actual.device.active_lanes               = 1;
         const detail::PhysicalResources expected = active;
+        admission_trace("materialize", "entitlement lane=%u reuse=%s", lane, prefix_reuse_path_name(details.reuse));
         if (actual != expected) {
             throw std::logic_error("materialized sequence does not match its active entitlement");
         }
@@ -7273,13 +7353,25 @@ void ProgramImplCore::populate_continuation_summary(const SequenceState& sequenc
     summary.long_anchors.clear();
     summary.active_references = 0;
     if (sequence.endpoint_valid) {
+        // V3 M1: endpoint key frontier = min(endpoint_frontier, execution_frontier); the published
+        // boundary key must anchor the prompt boundary, never the generated tail.
+        const std::uint32_t endpoint_frontier =
+            (sequence.endpoint_frontier != 0 && sequence.endpoint_frontier < sequence.execution_frontier)
+                ? sequence.endpoint_frontier
+                : sequence.execution_frontier;
         const runtime::CheckpointRef endpoint{
             .kind     = runtime::CheckpointKind::SessionEndpoint,
-            .frontier = sequence.execution_frontier,
+            .frontier = endpoint_frontier,
         };
-        runtime::PrefillWork endpoint_work = sequence.rebuild_work;
+        const runtime::PrefillWork endpoint_work =
+            (endpoint_frontier < sequence.execution_frontier)
+                ? runtime::make_prefill_work(0, endpoint_frontier, sequence.rebuild_work.vision_items,
+                                             sequence.rebuild_work.vision_patches, prefill_chunk)
+                : sequence.rebuild_work;
         summary.endpoint =
             checkpoint_summary(sequence, endpoint, sequence.state.read, endpoint_work);
+        admission_trace("summary", "endpoint_valid=1 endpoint_frontier=%u exec=%u stored=%u", endpoint_frontier,
+                        sequence.execution_frontier, summary.endpoint->ref.frontier);
     }
     if (sequence.rewrite_checkpoint.valid) {
         if (!sequence.rewrite_state) {
@@ -9105,6 +9197,9 @@ CommitResult ProgramImplCore::commit(PendingBatch&& pending,
                 prefill.next_capture >= prefill.capture_groups.size() ||
                 prefill.capture_groups[prefill.next_capture].frontier != prefill.prompt_tokens ||
                 prefill.pending_capture_offer != 0) {
+                admission_trace("publish", "lane=%u inconsistent cursor=%u next=%u pending_offer=%u", lanes[row],
+                                prefill.cursor, prefill.capture_groups[prefill.next_capture].frontier,
+                                prefill.pending_capture_offer);
                 throw std::logic_error("prompt-frontier capture carrier is inconsistent");
             }
             if (++next_capture_offer_id_ == 0) { ++next_capture_offer_id_; }
@@ -9112,6 +9207,8 @@ CommitResult ProgramImplCore::commit(PendingBatch&& pending,
             out.captures[row].emplace(ContractAccess::make_capture_offer(
                 this, runtime::LaneId{lanes[row]}, lane_epochs[lanes[row]],
                 prefill.pending_capture_offer));
+            admission_trace("publish", "lane=%u offer=%u frontier=%u", lanes[row], prefill.pending_capture_offer,
+                            prefill.prompt_tokens);
         }
         if (released_resource) { advance_resource_revision(); }
         out.timing = timing.finish();
@@ -9193,6 +9290,9 @@ FinishResult ProgramImplCore::finish(SequenceHandle sequence) noexcept {
             return out;
         }
         state.endpoint_valid = true;
+        state.endpoint_frontier = state.prompt_boundary;  // V3 M1: single assignment, pinned before populate below
+        admission_trace("finish", "lane=%u endpoint_frontier=%u exec=%u fork_pending=%d", state.lane,
+                        state.endpoint_frontier, state.execution_frontier, state.state.fork_pending ? 1 : 0);
         refresh_state_views(state);
         text_kv_addresses->set_checkpoint_requirement(state.kv->text, state.execution_frontier);
         if (state.kv->backend) {
@@ -9458,6 +9558,9 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
         throw std::logic_error("staged prefill requires a free request lane");
     }
     auto& staged                           = *request.prefill;
+    sequence.prompt_boundary               = staged.prompt_tokens;  // V3 M1: single write point, all paths (Root/retain/consume)
+    admission_trace("start-seq", "lane=%u prompt=%u base=%u path=%s", lane, staged.prompt_tokens, staged.base,
+                    prefix_reuse_path_name(request_plan.reuse));
     const auto started                     = Clock::now();
     const std::uint32_t prompt_tokens      = staged.prompt_tokens;
     const std::uint32_t base               = staged.base;
@@ -9783,7 +9886,7 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
             if (!state_store->valid(sequence.state.read) ||
                 sequence.state.read != sequence.state.write || sequence.state.fork_pending ||
                 state_store->role(sequence.state.read) != StateImageRole::CheckpointImmutable) {
-                throw std::logic_error("resident endpoint StateImage is not movable");
+                throw SourceUnavailableException();
             }
             if (!preserve_rewrite && sequence.rewrite_state) {
                 const StateImageHandle dropped = *sequence.rewrite_state;
@@ -9801,17 +9904,17 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
                 throw std::logic_error("resident prefix has no KV allocation bundle");
             }
             if (sequence.text_kv_valid < base) {
-                throw std::logic_error("resident Text KV is shorter than the append frontier");
+                throw SourceUnavailableException();
             }
             if (speculative_backend == SpeculativeBackend::Mtp) {
                 const std::uint32_t mtp_base = base == 0 ? 0 : base - 1;
                 if (!request_plan.prepare_mtp || sequence.mtp_kv_valid < mtp_base) {
-                    throw std::logic_error("resident MTP KV is shorter than the bridge frontier");
+                    throw SourceUnavailableException();
                 }
                 sequence.mtp_kv_valid = mtp_base;
             } else if (speculative_backend == SpeculativeBackend::DFlash &&
                        sequence.dflash_context_frontier != base) {
-                throw std::logic_error("resident DFlash context is not at the append frontier");
+                throw SourceUnavailableException();
             }
             bind_sequence_kv(sequence);
             trim_sequence_kv(sequence, base, backend_kv_valid(sequence));
@@ -9824,7 +9927,7 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
             refresh_state_views(sequence);
         } else if (is_rewrite_checkpoint_restore(request_plan.reuse)) {
             if (!sequence.kv || sequence.text_kv_valid < base) {
-                throw std::logic_error("resident rewrite checkpoint has no complete KV allocation");
+                throw SourceUnavailableException();
             }
             if (!sequence.rewrite_state || !state_store->valid(*sequence.rewrite_state) ||
                 state_store->role(*sequence.rewrite_state) != StateImageRole::CheckpointImmutable ||
@@ -9832,7 +9935,7 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
                  (!state_store->valid(sequence.state.read) ||
                   sequence.state.read != sequence.state.write || sequence.state.fork_pending ||
                   state_store->role(sequence.state.read) != StateImageRole::CheckpointImmutable))) {
-                throw std::logic_error("resident rewrite StateImage is not movable");
+                throw SourceUnavailableException();
             }
             const StateImageHandle checkpoint = *sequence.rewrite_state;
             if (sequence.endpoint_valid && sequence.state.read == checkpoint) {
@@ -9874,7 +9977,8 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
             throw std::logic_error("request plan has an invalid prefix reuse path");
         }
 
-        sequence.endpoint_valid = false;
+    sequence.endpoint_valid = false;
+    sequence.endpoint_frontier = 0;  // V3 M1: reset with endpoint_valid
         if (!preserving_source) { trim_sequence_kv(sequence, base, backend_kv_valid(sequence)); }
         bind_sequence_kv(sequence);
         const std::uint32_t backend_materialized =
@@ -10436,6 +10540,8 @@ void ProgramImplCore::settle_state_fork(SequenceState& sequence) {
     const StateImageHandle source      = sequence.state.read;
     const StateImageHandle destination = sequence.state.write;
     state_store->commit_fork(source, destination);
+    admission_trace("fork-settle", "source_valid=%d dest_valid=%d", state_store->valid(source) ? 1 : 0,
+                    state_store->valid(destination) ? 1 : 0);
     sequence.state.read         = destination;
     sequence.state.write        = destination;
     sequence.state.fork_pending = false;
@@ -10516,6 +10622,7 @@ void ProgramImplCore::release_active_sequence_state_strict(SequenceState& sequen
     sequence.rewrite_state  = std::nullopt;
     sequence.reserved_state = std::nullopt;
     sequence.endpoint_valid = false;
+    sequence.endpoint_frontier = 0;  // V3 M1: reset with endpoint_valid
     sequence.long_anchors.clear();
     sequence.tail_hidden               = {};
     sequence.rewrite_checkpoint_hidden = {};
@@ -10586,6 +10693,7 @@ void ProgramImplCore::release_sequence_state_strict(SequenceState& sequence) noe
     sequence.rewrite_state  = std::nullopt;
     sequence.reserved_state = std::nullopt;
     sequence.endpoint_valid = false;
+    sequence.endpoint_frontier = 0;  // V3 M1: reset with endpoint_valid
     sequence.long_anchors.clear();
     sequence.tail_hidden               = {};
     sequence.rewrite_checkpoint_hidden = {};
@@ -10651,6 +10759,7 @@ void ProgramImplCore::release_sequence_state(SequenceState& sequence) noexcept {
     sequence.rewrite_state  = std::nullopt;
     sequence.reserved_state = std::nullopt;
     sequence.endpoint_valid = false;
+    sequence.endpoint_frontier = 0;  // V3 M1: reset with endpoint_valid
     sequence.long_anchors.clear();
     sequence.tail_hidden               = {};
     sequence.rewrite_checkpoint_hidden = {};
@@ -11377,6 +11486,38 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
     if (staged.pending_capture_offer != 0) {
         throw std::logic_error("prefill cannot advance while a capture offer is pending");
     }
+    if (staged.cursor == staged.base) {
+        // V3: start of a new prefill session. The tripwire is a canary for full
+        // re-prefill regression: two consecutive base==0 sessions with different
+        // prompts (the v2 client re-serialization failure) abort the run; a
+        // single base==0 round (e.g. a legal post-compression full round) is fine.
+        if (prefill_tripwire_enabled()) {
+            static std::atomic<std::uint32_t> session{0};
+            static std::atomic<std::uint32_t> previous_base{0};
+            static std::atomic<std::uint64_t> previous_prompt_hash{0};
+            static std::atomic<bool> previous_seen{false};
+            std::uint64_t prompt_hash = 1469598103934665603ULL;
+            for (const TokenId token : staged.prompt.token_ids) {
+                prompt_hash ^= static_cast<std::uint64_t>(token);
+                prompt_hash *= 1099511628211ULL;
+            }
+            const std::uint32_t current_session = ++session;
+            std::fprintf(stderr, "TRIPWIRE: prefill session=%u prompt=%u base=%u reuse=%s\n",
+                         current_session, staged.prompt_tokens, staged.base,
+                         prefix_reuse_path_name(staged.reuse));
+            std::fflush(stderr);
+            if (staged.base == 0 && previous_seen.load(std::memory_order_acquire) &&
+                previous_base.load(std::memory_order_acquire) == 0 &&
+                previous_prompt_hash.load(std::memory_order_acquire) != prompt_hash) {
+                throw std::logic_error(
+                    "prefill tripwire: two consecutive full re-prefills with different prompts "
+                    "(prefix reuse regressed)");
+            }
+            previous_base.store(staged.base);
+            previous_prompt_hash.store(prompt_hash);
+            previous_seen.store(true);
+        }
+    }
     const runtime::BeginSummary summary{.prompt_tokens        = staged.prompt_tokens,
                                         .reused_prompt_tokens = staged.base,
                                         .prefix_reuse_path    = staged.reuse};
@@ -11635,6 +11776,12 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
             staged.next_capture < staged.capture_groups.size() &&
             staged.capture_groups[staged.next_capture].frontier == prompt_tokens;
         if (!prompt_frontier_capture) { request.prefill.reset(); }
+        admission_trace("prefill-end", "prompt=%u base=%u path=%s next_frontier=%u", staged.prompt_tokens,
+                        staged.base, prefix_reuse_path_name(staged.reuse),
+                        prompt_frontier_capture ? staged.prompt_tokens
+                                                : (staged.next_capture < staged.capture_groups.size()
+                                                       ? staged.capture_groups[staged.next_capture].frontier
+                                                       : staged.prompt_tokens));
         request.pending   = PendingCandidate{.kind          = PendingKind::Begin,
                                              .base_E        = 0,
                                              .base_S        = 0,

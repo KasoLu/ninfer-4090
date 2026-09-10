@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
+#include <cstdio>
 #include <iterator>
 #include <mutex>
 #include <stdexcept>
@@ -38,6 +39,36 @@ struct RequestLifetime {
     std::chrono::steady_clock::time_point started;
     std::chrono::steady_clock::time_point deadline;
 };
+
+namespace {
+// Stable per-conversation identity: FNV-1a over the first non-system turn (role marker, text
+// parts, first tool-call name). Unlike session_digest (a per-round ledger digest that changes
+// every round) this identifies the same conversation across rounds, which is what "two
+// consecutive rounds" requires. Conversations whose opening turns are byte-identical share a
+// key; such twins are content-identical for prefix reuse anyway.
+std::string conversation_key_of(const GenerationRequest& request) {
+    std::string opening;
+    for (const auto& turn : request.messages) {
+        if (turn.role == ChatRole::System || turn.role == ChatRole::Developer) { continue; }
+        opening =
+            turn.role == ChatRole::User ? "U" : (turn.role == ChatRole::Assistant ? "A" : "T");
+        for (const auto& part : turn.content) {
+            if (part.kind == ContentKind::Text) { opening += part.text; }
+        }
+        if (!turn.tool_calls.empty()) { opening += "|call:" + turn.tool_calls.front().name; }
+        break;
+    }
+    if (opening.size() <= 1U) { return {}; }
+    std::uint64_t hash = 14695981039346656037ULL;
+    for (const char character : opening) {
+        hash ^= static_cast<std::uint8_t>(character);
+        hash *= 1099511628211ULL;
+    }
+    char buffer[17];
+    std::snprintf(buffer, sizeof(buffer), "%016llx", static_cast<unsigned long long>(hash));
+    return buffer;
+}
+} // namespace
 
 ApiError request_error_to_api_error(const ninfer::RequestError& exception) {
     ApiError error;
@@ -369,6 +400,8 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
         prepared.preparation   = prompt.preparation_stats();
         prepared.prepare_seconds =
             std::chrono::duration<double>(Clock::now() - prepared.lifetime->started).count();
+        prepared.conversation_key = conversation_key_of(request);
+        prepared.prompt_token_ids = prompt.token_ids();
         prepared.generation = engine_->submit(std::move(prompt), std::move(request_options),
                                               consumer_mode == GenerationConsumerMode::Streaming
                                                   ? ninfer::OutputConsumerMode::Streaming
@@ -470,6 +503,64 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
         std::move(result.speculative.accepted_per_position);
 
     outcome.tool_calls = std::move(result.tool_calls);
+    // V3 S-V3-4 + root-diag: per stable conversation identity (first non-system turn digest).
+    // Two consecutive root rounds mean endpoint boundary reuse regressed; a root round after
+    // any previous round additionally dumps 21 prompt tokens around the previous KV boundary
+    // (10 before the boundary, the boundary token, 10 after; fewer before when the boundary
+    // is closer to prompt start) so the operator can tell client-side prefix drift from an
+    // engine-side cache loss.
+    if (!prepared.conversation_key.empty()) {
+        std::lock_guard lock(prefix_path_mu_);
+        const auto previous = last_prefix_path_.find(prepared.conversation_key);
+        const bool current_root =
+            outcome.metrics.prefix_reuse_path == ninfer::PrefixReusePath::Root;
+        if (previous != last_prefix_path_.end()) {
+            if (current_root && previous->second.path == ninfer::PrefixReusePath::Root) {
+                std::fprintf(stderr,
+                             "[prefix-warn] conversation %s: two consecutive rounds used prefix "
+                             "path root (expected private-endpoint boundary reuse); prefix reuse "
+                             "regressed\n",
+                             prepared.conversation_key.c_str());
+                std::fflush(stderr);
+                if (logger_) {
+                    logger_->warn(
+                        "[prefix-warn] conversation {}: two consecutive rounds on prefix path "
+                        "root",
+                        prepared.conversation_key);
+                }
+            }
+            if (current_root) {
+                const std::vector<ninfer::TokenId>& tokens = prepared.prompt_token_ids;
+                const std::size_t boundary = previous->second.prompt_tokens;
+                const std::size_t before_begin = boundary >= 10U ? boundary - 10U : 0U;
+                std::string before, center, after;
+                for (std::size_t i = before_begin; i < boundary && i < tokens.size(); ++i) {
+                    before += std::to_string(tokens[i]) + ' ';
+                }
+                if (boundary < tokens.size()) { center = std::to_string(tokens[boundary]) + ' '; }
+                for (std::size_t i = boundary + 1U; i < boundary + 11U && i < tokens.size(); ++i) {
+                    after += std::to_string(tokens[i]) + ' ';
+                }
+                std::fprintf(stderr,
+                             "[root-diag] conversation %s lane=%d previous_boundary=%zu "
+                             "prompt_tokens=%d before10=[%s] center=[%s] after10=[%s]\n",
+                             prepared.conversation_key.c_str(), outcome.id_slot, boundary,
+                             prepared.prompt_tokens, before.c_str(), center.c_str(),
+                             after.c_str());
+                std::fflush(stderr);
+                if (logger_) {
+                    logger_->warn(
+                        "[root-diag] conversation {} full re-prefill after boundary {}; "
+                        "21-token window printed to stderr",
+                        prepared.conversation_key, boundary);
+                }
+            }
+        }
+        if (last_prefix_path_.size() > 8192) { last_prefix_path_.clear(); }
+        last_prefix_path_[prepared.conversation_key] =
+            {.path = outcome.metrics.prefix_reuse_path,
+             .prompt_tokens = static_cast<std::uint32_t>(prepared.prompt_tokens)};
+    }
     return outcome;
 }
 

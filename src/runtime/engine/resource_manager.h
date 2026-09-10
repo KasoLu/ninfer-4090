@@ -2,6 +2,7 @@
 
 #include "ninfer/types.h"
 #include "runtime/contract/types.h"
+#include "runtime/contract/admission_trace.h"
 #include "runtime/engine/context_cost.h"
 #include "runtime/engine/materialization_planner.h"
 #include "runtime/engine/shared_capture_planner.h"
@@ -313,6 +314,17 @@ public:
         }
         std::vector<Candidate> candidates;
         candidates.reserve(1U + prefix_index_.size());
+        // Root-diag gate bookkeeping: for every prefix-index entry, record why it did (or did
+        // not) become a candidate, so a root verdict can be audited against engine state:
+        // stale-entry = engine lost it, key-mismatch = client content diverged from cache.
+        struct RootGateNote {
+            std::uint32_t frontier = 0;
+            bool          shared   = false;
+            const char*   gate     = "candidate";
+            std::uint32_t reuse    = 0;
+        };
+        std::vector<RootGateNote> gates;
+        gates.reserve(prefix_index_.size());
         std::optional<AdmissionCandidate> root = program.inspect_admission(
             prompt, base, *destination, nullptr, nullptr, std::nullopt, false);
         if (!root) { throw std::logic_error("Program rejected isolated root planning"); }
@@ -320,15 +332,16 @@ public:
 
         if (cache_enabled_) {
             for (const PrefixIndexEntry& index : prefix_index_) {
-                if (!valid_prefix_index_entry(index)) { continue; }
+                if (!valid_prefix_index_entry(index)) { gates.push_back({index.key.frontier, index.shared, "stale-entry", 0U}); continue; }
                 const std::optional<PrefixShortlistKey> incoming =
                     base.prefix_shortlist_key(index.key.frontier);
-                if (!incoming || *incoming != index.key) { continue; }
+                if (!incoming || *incoming != index.key) { gates.push_back({index.key.frontier, index.shared, "key-mismatch", 0U}); continue; }
 
                 if (!index.shared) {
                     const CatalogEntry& entry = catalog_[index.slot];
                     if (entry.state != CatalogState::Catalogued || !entry.handle ||
                         private_has_active_edge(index.slot)) {
+                        gates.push_back({index.key.frontier, index.shared, "not-catalogued", 0U});
                         continue;
                     }
                     const bool retain =
@@ -338,7 +351,7 @@ public:
                     std::optional<AdmissionCandidate> plan =
                         program.inspect_admission(prompt, base, *destination, &*entry.handle,
                                                   nullptr, index.checkpoint, retain);
-                    if (!plan) { continue; }
+                    if (!plan) { gates.push_back({index.key.frontier, index.shared, "inspect-skip", 0U}); continue; }
                     if (plan->summary().reusable_prompt_tokens == 0 ||
                         (retain &&
                          plan->identity_assessment().source_mode != PrivateSourceMode::Retain)) {
@@ -350,6 +363,7 @@ public:
                         session_index_[*current_session_cell].owner_id == entry.id &&
                         session_index_[*current_session_cell].revision == entry.revision;
                     append_unique(provisional_demand.exact_resident_keys, index.key);
+                    gates.push_back({index.key.frontier, index.shared, "candidate", plan->summary().reusable_prompt_tokens});
                     candidates.push_back(Candidate{
                         .plan                    = std::move(*plan),
                         .current_session_binding = current_session_binding,
@@ -368,15 +382,16 @@ public:
                 }
 
                 const SharedCatalogEntry& entry = shared_catalog_[index.slot];
-                if (entry.state != SharedCatalogState::Catalogued || !entry.handle) { continue; }
+                if (entry.state != SharedCatalogState::Catalogued || !entry.handle) { gates.push_back({index.key.frontier, index.shared, "not-catalogued", 0U}); continue; }
                 std::optional<AdmissionCandidate> plan = program.inspect_admission(
                     prompt, base, *destination, nullptr, &*entry.handle, index.checkpoint, false);
-                if (!plan) { continue; }
+                if (!plan) { gates.push_back({index.key.frontier, index.shared, "inspect-skip", 0U}); continue; }
                 if (plan->summary().reusable_prompt_tokens == 0 ||
                     plan->identity_assessment().source_mode != PrivateSourceMode::Retain) {
                     throw std::logic_error("Program returned an invalid shared candidate");
                 }
                 append_unique(provisional_demand.exact_resident_keys, index.key);
+                gates.push_back({index.key.frontier, index.shared, "candidate", plan->summary().reusable_prompt_tokens});
                 candidates.push_back(Candidate{
                     .plan          = std::move(*plan),
                     .shared_source = shared_capability(index.slot),
@@ -396,7 +411,45 @@ public:
         std::optional<Choice> selected =
             plan_materialization(program, prompt, base, *destination, candidates, publication_order,
                                  planning_started, provisional_demand);
-        if (!selected) { return {.readiness = Readiness::TemporarilyBlocked}; }
+        if (!selected) {
+            admission_trace("verdict", "lane=%u candidates=%zu selected=none", destination->value, candidates.size());
+            if (gates.empty()) {
+                admission_trace("root-gate",
+                                "lane=%u prompt=%u selected=none entries=0 (no cached boundary)",
+                                destination->value,
+                                static_cast<std::uint32_t>(base.summary().prompt_tokens));
+            } else {
+                admission_trace("root-gate",
+                                "lane=%u prompt=%u selected=none entries=%zu",
+                                destination->value,
+                                static_cast<std::uint32_t>(base.summary().prompt_tokens),
+                                prefix_index_.size());
+                for (std::size_t i = 0; i < gates.size() && i < 8U; ++i) {
+                    admission_trace("root-gate-entry", "frontier=%u shared=%d gate=%s reuse=%u",
+                                    gates[i].frontier, gates[i].shared ? 1 : 0, gates[i].gate,
+                                    gates[i].reuse);
+                }
+            }
+            return {.readiness = Readiness::TemporarilyBlocked};
+        }
+        admission_trace("verdict", "lane=%u candidates=%zu dest=%u private=%d shared=%d mode=%d reuse_tokens=%u pub_slot=%u",
+                        destination->value, candidates.size(), selected->destination_.value,
+                        selected->private_source_ ? 1 : 0, selected->shared_source_ ? 1 : 0,
+                        static_cast<int>(selected->source_mode_), selected->plan_->summary().reusable_prompt_tokens,
+                        selected->publication_slot_);
+        if (selected->plan_->summary().reusable_prompt_tokens == 0 && !gates.empty()) {
+            admission_trace("root-gate",
+                            "lane=%u prompt=%u selected=root entries=%zu (cached boundary lost "
+                            "or content diverged)",
+                            destination->value,
+                            static_cast<std::uint32_t>(base.summary().prompt_tokens),
+                            prefix_index_.size());
+            for (std::size_t i = 0; i < gates.size() && i < 8U; ++i) {
+                admission_trace("root-gate-entry", "frontier=%u shared=%d gate=%s reuse=%u",
+                                gates[i].frontier, gates[i].shared ? 1 : 0, gates[i].gate,
+                                gates[i].reuse);
+            }
+        }
         return {
             .readiness = selected->needs_transfer() ? Readiness::NeedsTransfer : Readiness::Ready,
             .choice    = std::move(selected),
@@ -426,6 +479,7 @@ public:
             throw std::logic_error("resource choice is malformed");
         }
         if (choice.plan_->resource_revision() != resource_revision) {
+            admission_trace("RESERVE", "lane=%u result=stale(revision)", choice.destination_.value);
             return MaterializationReserveResult::Stale;
         }
         validate_choice(choice, resource_revision);
@@ -443,10 +497,15 @@ public:
         if (status == ContextTransactionReserveStatus::Aborted) {
             rollback_logical_materialization(open);
             transaction_.template emplace<std::monostate>();
-            return cancellation.requested() ? MaterializationReserveResult::Aborted
-                                            : MaterializationReserveResult::Stale;
+            const MaterializationReserveResult reserve_result =
+                cancellation.requested() ? MaterializationReserveResult::Aborted
+                                         : MaterializationReserveResult::Stale;
+            admission_trace("RESERVE", "lane=%u result=%s", choice.destination_.value,
+                            reserve_result == MaterializationReserveResult::Aborted ? "aborted" : "stale");
+            return reserve_result;
         }
         observe_planner_diagnostics(open.diagnostics);
+        admission_trace("RESERVE", "lane=%u result=reserved", choice.destination_.value);
         return MaterializationReserveResult::Reserved;
     }
 
@@ -1721,6 +1780,7 @@ private:
                 append(true, slot, entry.id, entry.revision, entry.summary.checkpoint);
             }
         }
+        admission_trace("index-rebuild", "entries=%zu", cursor);
     }
 
     [[nodiscard]] bool valid_prefix_index_entry(const PrefixIndexEntry& index) const noexcept {

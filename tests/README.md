@@ -134,6 +134,33 @@ NINFER_QWEN3_6_35B_A3B_WEIGHTS=$PWD/out/qwen3_6_35b_a3b.ninfer \
 Without the corresponding variable CTest marks each C++ integration test as skipped. Neither test
 uses another numerical/execution path's generated tokens as a golden.
 
+The PREFIX-V3 acceptance scenarios opt in through `NINFER_PREFIX_REAL_SCENARIO` and require a
+Qwen3.8 27B artifact variable: they exercise the v22_4 chat template, thinking +
+`preserve_thinking`, MTP, and the rk8v4 KV layout used by production serve.
+
+```bash
+NINFER_PREFIX_REAL_SCENARIO=v3-reuse-regression \
+  NINFER_QWEN3_8_27B_NVFP4_WEIGHTS=$PWD/out/qwen3_8_27b_nvfp4.ninfer \
+  ctest --test-dir build -R ninfer_qwen3_6_27b_prefix_real_test --output-on-failure
+
+NINFER_PREFIX_REAL_SCENARIO=v3-boundary-key \
+  NINFER_QWEN3_8_27B_NVFP4_WEIGHTS=$PWD/out/qwen3_8_27b_nvfp4.ninfer \
+  ctest --test-dir build -R ninfer_qwen3_6_27b_prefix_real_test --output-on-failure
+
+NINFER_PREFIX_REAL_SCENARIO=v3-concurrency \
+  NINFER_QWEN3_8_27B_NVFP4_WEIGHTS=$PWD/out/qwen3_8_27b_nvfp4.ninfer \
+  ctest --test-dir build -R ninfer_qwen3_6_27b_prefix_real_test --output-on-failure
+```
+
+- `v3-reuse-regression` (R-V3-2): same session for >= 2 rounds with client-style
+  re-serialization; rounds 2/3 must reuse with `path=private_endpoint` and
+  `reused_prompt_tokens` equal to the previous round's `prompt_tokens`.
+- `v3-boundary-key` (R-V3-4a): partial replay of a raw-token prompt; the reuse frontier
+  must be the prompt boundary (1024), not the execution frontier.
+- `v3-concurrency` (R-V3-6): two-lane borrow window (A round 2 in flight while C probes
+  A's boundary), interleaved two-stream rounds, and a 2-slot-pool pressure-eviction case;
+  conflicts must degrade to root or infeasible-SKIP, never fail-stop.
+
 The capability-evaluation coordinator has its own environment and unittest entry point:
 
 ```bash

@@ -24,6 +24,9 @@ public:
 
     [[nodiscard]] const PromptSummary& summary() const noexcept;
     [[nodiscard]] const PromptPreparationStats& preparation_stats() const noexcept;
+    // Rendered prompt tokens, retained for root-diag token-window dumps. Empty when the
+    // prepared prompt is default-constructed.
+    [[nodiscard]] const std::vector<TokenId>& token_ids() const noexcept;
     [[nodiscard]] explicit operator bool() const noexcept;
 
 private:

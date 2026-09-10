@@ -13,11 +13,14 @@ class logger;
 
 #include <chrono>
 #include <cstddef>
+#include <cstdio>
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace ninfer::serve {
@@ -88,6 +91,12 @@ struct PreparedRequest {
     double acquisition_seconds = 0.0;
     PromptPreparationStats preparation;
     int prompt_tokens    = 0;
+    // Retained rendered prompt tokens: root-diag prints a 21-token window around the
+    // previous round's KV boundary when a full re-prefill occurs unexpectedly.
+    std::vector<ninfer::TokenId> prompt_token_ids;
+    // Stable conversation identity (digest of the first non-system turn); the key S-V3-4
+    // tracking uses. Empty when the request carries no usable opening turn.
+    std::string conversation_key;
     bool enable_thinking = true;
     std::optional<std::uint32_t> thinking_budget;
     std::optional<ninfer::ReasoningEffort> effective_reasoning_effort;
@@ -192,6 +201,16 @@ private:
     std::uint32_t automatic_private_anchors_ = 0;
     ninfer::PromptCapabilities prompt_capabilities_;
     std::shared_ptr<RequestCapacity> request_capacity_;
-};
 
+    // V3 S-V3-4 diagnostic: per stable conversation identity (first non-system turn digest),
+    // the last prefix reuse path and prompt size. Two consecutive root rounds mean endpoint
+    // boundary reuse regressed; a root round after any previous round additionally dumps a
+    // 21-token window around the previous KV boundary (root-diag) to the stderr log.
+    struct PrefixPathRecord {
+        ninfer::PrefixReusePath path = ninfer::PrefixReusePath::Root;
+        std::uint32_t prompt_tokens  = 0;
+    };
+    std::mutex prefix_path_mu_;
+    std::unordered_map<std::string, PrefixPathRecord> last_prefix_path_;
+};
 } // namespace ninfer::serve
