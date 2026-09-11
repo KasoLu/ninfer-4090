@@ -4,6 +4,7 @@
 #include "targets/qwen3_6/impl/runtime/workspace_recipe.h"
 
 #include "core/device.h"
+#include "core/kv_cache_mode.h"
 #include "ninfer/ops/gated_delta_net.h"
 #include "ninfer/ops/gdn_gating_proj.h"
 #include "ninfer/ops/gdn_input_proj.h"
@@ -78,6 +79,7 @@ TargetKVCacheProfile target_kv_cache_profile(KvCacheStorage storage) {
     case KvCacheStorage::RotatedInt4KeyInt4ValueGroup64:
     case KvCacheStorage::RK4V4E8:
     case KvCacheStorage::RK2V4E8:
+    case KvCacheStorage::RK6V4E8:
         return {DType::I8, qwen3_6::kKvInt8QuantGroup};
     }
     throw std::invalid_argument("unknown KV-cache storage profile");
@@ -149,6 +151,7 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                      .kv_packed_k               = plan.kv_packed_k,
                      .kv_e8_lattice             = plan.kv_e8_lattice,
                      .kv_e8_root                = plan.kv_e8_root,
+                     .kv_k6_bit                 = plan.kv_k6_bit,
                      .enable_mtp                = plan.features.mtp(),
                      .kv_table_rows             = static_cast<std::int32_t>(plan.max_concurrency),
                      .text_physical_page_groups = physical_pages,
@@ -702,6 +705,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->kv_packed_k         = inputs.kv_packed_k;
     impl->kv_e8_lattice       = inputs.kv_e8_lattice;
     impl->kv_e8_root          = inputs.kv_e8_root;
+    impl->kv_k6_bit           = inputs.kv_k6_bit;
     impl->persistent          = persistent_layout(*impl);
     impl->workspace           = build_workspace_plan(*impl);
     if (impl->use_cuda_graph) {
@@ -770,6 +774,8 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
     validate_target_options(device, options);
     const TargetKVCacheProfile kv_profile = target_kv_cache_profile(options.kv_cache);
 
+    const auto mode_flags = kv_cache_mode::flags_for(options.kv_cache);
+
     SequencePlanningInputs inputs{
         .weights_profile     = weights_profile,
         .capacity            = options.max_context,
@@ -780,22 +786,13 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .speculative_backend = options.speculative.backend,
         .kv_dtype            = kv_profile.dtype,
         .kv_quant_group      = kv_profile.quant_group,
-        .kv_packed_v = options.kv_cache == KvCacheStorage::RotatedInt8KeyInt4ValueGroup64 ||
-                       options.kv_cache == KvCacheStorage::RotatedInt4KeyInt4ValueGroup64 ||
-                       options.kv_cache == KvCacheStorage::RK4V4E8 ||
-                       options.kv_cache == KvCacheStorage::RK2V4E8,
-        .kv_rotate_k = options.kv_cache == KvCacheStorage::RotatedInt8KeyInt4ValueGroup64 ||
-                       options.kv_cache == KvCacheStorage::RotatedInt4KeyInt4ValueGroup64 ||
-                       options.kv_cache == KvCacheStorage::RK4V4E8 ||
-                       options.kv_cache == KvCacheStorage::RK2V4E8,
-        .kv_rotate_v = options.kv_cache == KvCacheStorage::RotatedInt8KeyInt4ValueGroup64 ||
-                       options.kv_cache == KvCacheStorage::RotatedInt4KeyInt4ValueGroup64 ||
-                       options.kv_cache == KvCacheStorage::RK4V4E8 ||
-                       options.kv_cache == KvCacheStorage::RK2V4E8,
-        .kv_packed_k = options.kv_cache == KvCacheStorage::RotatedInt4KeyInt4ValueGroup64 ||
-                       options.kv_cache == KvCacheStorage::RK4V4E8,
-        .kv_e8_lattice = options.kv_cache == KvCacheStorage::RK4V4E8,
-        .kv_e8_root    = options.kv_cache == KvCacheStorage::RK2V4E8,
+        .kv_packed_v   = mode_flags.packed_v,
+        .kv_rotate_k   = mode_flags.rotate_k,
+        .kv_rotate_v   = mode_flags.rotate_v,
+        .kv_packed_k   = mode_flags.packed_k,
+        .kv_e8_lattice = mode_flags.e8_lattice,
+        .kv_e8_root    = mode_flags.e8_root,
+        .kv_k6_bit     = mode_flags.k6_bit,
         .proposal_head       = options.speculative.proposal_head,
         .features            = qwen3_6::startup_features(options),
         .use_cuda_graph      = options.use_cuda_graph,

@@ -168,4 +168,100 @@ __device__ __forceinline__ void kv_cache_unpack_i4x16(const std::uint8_t* src8,
     }
 }
 
+// ---------------------------------------------------------------------------
+// RK6V4E8: 6-bit E8-lattice key codec. Four codes pack into one 24-bit word
+// (three bytes); a 16-dimension block is 12 bytes (three aligned u32), a 64-d
+// group is 48 bytes, and one (token, kv_head) row is 192 bytes. The stored u6
+// code is value & 0x3F (two's complement mod 64, value in [-32, +31]);
+// unpacking mirrors the i4 xor-shift convention: (code ^ 32) - 32.
+// ---------------------------------------------------------------------------
+
+inline constexpr int kKVCacheI6HeadExtent = kKVCacheInt8HeadDim * 3 / 4;
+
+template <typename Geometry>
+__device__ __forceinline__ std::int64_t kv_cache_i6_code_index(int physical_page, int kv_head,
+                                                               int d, int page_offset) {
+    // d must be a multiple of 16 so the 3/4 byte offset stays 4-byte aligned.
+    return paged_kv_page_head_offset<kKVCacheI6HeadExtent, Geometry::KVHeads>(physical_page, kv_head) +
+           static_cast<std::int64_t>(kKVCacheI6HeadExtent) * page_offset +
+           (static_cast<std::int64_t>(d) * 3) / 4;
+}
+
+__device__ __forceinline__ std::uint8_t kv_cache_i6_code_from_int(int value) {
+    return static_cast<std::uint8_t>(max(-32, min(31, value))) & 0x3Fu;
+}
+
+__device__ __forceinline__ std::uint8_t kv_cache_i6_quant_code(float x, float inv_scale) {
+    if (inv_scale == 0.0f) { return static_cast<std::uint8_t>(0); }
+    return kv_cache_i6_code_from_int(static_cast<int>(__float2int_rn(x * inv_scale)));
+}
+
+__device__ __forceinline__ std::int8_t kv_cache_unpack_i6(std::uint8_t code) {
+    return static_cast<std::int8_t>((static_cast<int>(code) ^ 32) - 32);
+}
+
+__device__ __forceinline__ void kv_cache_pack_i6_quad(const std::uint8_t* codes4, std::uint8_t* out3) {
+    const std::uint32_t word = static_cast<std::uint32_t>(codes4[0]) |
+                               (static_cast<std::uint32_t>(codes4[1]) << 6) |
+                               (static_cast<std::uint32_t>(codes4[2]) << 12) |
+                               (static_cast<std::uint32_t>(codes4[3]) << 18);
+    out3[0] = static_cast<std::uint8_t>(word & 0xFFu);
+    out3[1] = static_cast<std::uint8_t>((word >> 8) & 0xFFu);
+    out3[2] = static_cast<std::uint8_t>((word >> 16) & 0xFFu);
+}
+
+// RK6V4E8: warp-wide 24-bit quad gather and write. Four consecutive lanes hold
+// one 24-bit quad (3 bytes); every lane converges on each full-mask shuffle
+// read from an explicit source lane, and the 4-lane leader writes the packed
+// d0 quad at `row` and the d1 quad at `row + 24`. All lanes of the warp must
+// call this together. The explicit-source full-mask gather (not a
+// __shfl_down_sync over a per-quad sub-mask) is the only mask form this
+// codebase relies on: the sub-mask variant made the group's non-leader lanes
+// read source lanes outside their mask — undefined behavior that deadlocked
+// sm_89 (4090 hang 2026-09-04).
+template <typename CacheK>
+__device__ __forceinline__ void kv_cache_lanes_write_i6_quad(std::uint8_t code0, std::uint8_t code1,
+                                                             int lane, unsigned full_mask,
+                                                             std::int64_t row, CacheK cache_k) {
+    const int c0i   = static_cast<int>(code0);
+    const int c1i   = static_cast<int>(code1);
+    const int qbase = lane & ~3;
+    const std::uint8_t quad0[4] = {
+        static_cast<std::uint8_t>(__shfl_sync(full_mask, c0i, qbase)),
+        static_cast<std::uint8_t>(__shfl_sync(full_mask, c0i, qbase + 1)),
+        static_cast<std::uint8_t>(__shfl_sync(full_mask, c0i, qbase + 2)),
+        static_cast<std::uint8_t>(__shfl_sync(full_mask, c0i, qbase + 3))};
+    const std::uint8_t quad1[4] = {
+        static_cast<std::uint8_t>(__shfl_sync(full_mask, c1i, qbase)),
+        static_cast<std::uint8_t>(__shfl_sync(full_mask, c1i, qbase + 1)),
+        static_cast<std::uint8_t>(__shfl_sync(full_mask, c1i, qbase + 2)),
+        static_cast<std::uint8_t>(__shfl_sync(full_mask, c1i, qbase + 3))};
+    if ((lane & 3) == 0) {
+        const std::int64_t quad_off = static_cast<std::int64_t>(lane >> 2) * 3;
+        auto* k_bytes = reinterpret_cast<std::uint8_t*>(cache_k);
+        kv_cache_pack_i6_quad(quad0, &k_bytes[row + quad_off]);
+        kv_cache_pack_i6_quad(quad1, &k_bytes[row + 24 + quad_off]);
+    }
+}
+
+__device__ __forceinline__ void kv_cache_unpack_i6x16(const std::uint8_t* src12, std::int8_t* dst16) {
+    const std::uint32_t* w3 = reinterpret_cast<const std::uint32_t*>(src12);
+    const std::uint32_t b0 = w3[0];
+    const std::uint32_t b1 = w3[1];
+    const std::uint32_t b2 = w3[2];
+    const std::uint32_t q0 = b0 & 0xffffffu;
+    const std::uint32_t q1 = ((b0 >> 24) & 0xffu) | ((b1 & 0xffffu) << 8);
+    const std::uint32_t q2 = ((b1 >> 16) & 0xffffu) | ((b2 & 0xffu) << 16);
+    const std::uint32_t q3 = (b2 >> 8) & 0xffffffu;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const std::uint32_t word = j == 0 ? q0 : (j == 1 ? q1 : (j == 2 ? q2 : q3));
+#pragma unroll
+        for (int m = 0; m < 4; ++m) {
+            dst16[j * 4 + m] =
+                kv_cache_unpack_i6(static_cast<std::uint8_t>((word >> (6 * m)) & 0x3Fu));
+        }
+    }
+}
+
 } // namespace ninfer::ops
