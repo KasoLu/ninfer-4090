@@ -87,6 +87,9 @@ target_include_directories(ninfer_cli_options_test PRIVATE ${PROJECT_SOURCE_DIR}
 ninfer_add_test(ninfer_kv_cache_test
   SOURCES test_kv_cache.cpp
   LIBRARIES ninfer_core)
+ninfer_add_test(ninfer_kv_mode_test
+  SOURCES test_kv_mode.cpp
+  LIBRARIES ninfer_core)
 ninfer_add_test(ninfer_state_store_test
   SOURCES test_state_store.cpp
   LIBRARIES ninfer_core)
@@ -384,6 +387,19 @@ set_target_properties(ninfer_test_e8_codec PROPERTIES CUDA_ARCHITECTURES "89")
 # the shipped codec. ninfer_e8_root_codec_test below drives the production header.
 add_test(NAME ninfer_test_e8_codec COMMAND ninfer_test_e8_codec)
 set_tests_properties(ninfer_test_e8_codec PROPERTIES SKIP_RETURN_CODE 77)
+
+# rk6v4e8 codec-level cosine benchmark (synthetic data; reproduces production
+# append-kernel arithmetic, so it must compile against the shipped headers).
+add_executable(ninfer_test_kv6_cosine
+  ${PROJECT_SOURCE_DIR}/tools/test_kv/test_kv6_cosine.cu)
+target_include_directories(ninfer_test_kv6_cosine PRIVATE
+  ${PROJECT_SOURCE_DIR}/tools/test_kv
+  ${PROJECT_SOURCE_DIR}/src
+  ${PROJECT_SOURCE_DIR}/include)
+target_link_libraries(ninfer_test_kv6_cosine PRIVATE CUDA::cudart)
+set_target_properties(ninfer_test_kv6_cosine PROPERTIES CUDA_ARCHITECTURES "89")
+add_test(NAME ninfer_test_kv6_cosine COMMAND ninfer_test_kv6_cosine)
+set_tests_properties(ninfer_test_kv6_cosine PROPERTIES SKIP_RETURN_CODE 77)
 
 # These tests deliberately compile against the exact target's internal contracts; the target does
 # not export impl/ to ordinary consumers.
