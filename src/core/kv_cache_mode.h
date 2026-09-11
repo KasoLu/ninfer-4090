@@ -47,4 +47,16 @@ struct Flags {
     return f;
 }
 
+// Dispatch-arm display name for a flag combination, following the kernel
+// selection precedence used by the append, prompt, and decode dispatch sites
+// (used by the NINFER_KV_TRACE dispatch lines).
+[[nodiscard]] inline const char* dispatch_path_name(const Flags& f) {
+    if (f.e8_root) { return "e8-root"; }
+    if (f.k6_bit) { return "k6"; }
+    if (f.e8_lattice) { return "e8-lattice"; }
+    if (f.packed_k) { return "packed-k"; }
+    if (f.packed_v) { return "packed-v"; }
+    return "int8";
+}
+
 }  // namespace ninfer::kv_cache_mode

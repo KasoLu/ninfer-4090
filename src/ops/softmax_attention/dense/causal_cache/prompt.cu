@@ -7,6 +7,8 @@
 #include "ops/softmax_attention/dense/causal_cache/prompt_bf16.cuh"
 #include "ops/softmax_attention/dense/causal_cache/prompt_i8.cuh"
 #include "core/device.h" // CUDA_CHECK
+#include "core/kv_cache_mode.h"
+#include "core/kv_trace.h"
 
 #include <cstdint>
 
@@ -28,6 +30,17 @@ void causal_attention_prompt_attention_launch_for(const Tensor& q, const Tensor&
 
     const auto tokens = static_cast<std::int32_t>(q.ne[2]);
     if (cache.dtype == DType::I8) {
+        const auto kmode = kv_cache_mode::dispatch_path_name(
+            {.packed_v = cache.packed_v, .rotate_k = cache.rotate_k, .rotate_v = cache.rotate_v,
+             .packed_k = cache.packed_k, .e8_lattice = cache.e8_lattice, .e8_root = cache.e8_root,
+             .k6_bit = cache.k6_bit});
+        if (kv_trace_once((static_cast<std::uint64_t>(Geometry::QHeads) << 40) |
+                          (cache.k6_bit ? 0x80ULL : 0) | (cache.e8_root ? 0x40ULL : 0) |
+                          (cache.e8_lattice ? 0x20ULL : 0) | (cache.packed_k ? 0x10ULL : 0) |
+                          (cache.packed_v ? 0x08ULL : 0))) {
+            kv_trace("prompt.dispatch", "q_heads=%d tokens=%d path=%s", Geometry::QHeads, tokens,
+                     kmode);
+        }
         const dim3 attention_grid(static_cast<unsigned>(div_up(tokens, kCausalPromptI8Br)),
                                   static_cast<unsigned>(Geometry::QHeads), 1u);
         const Tensor& cache_k_scale = cache.k_scale_pages;

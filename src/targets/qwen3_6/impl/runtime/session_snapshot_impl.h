@@ -1,5 +1,6 @@
 #include "targets/qwen3_6/impl/runtime/instance.h"
 #include "targets/qwen3_6/impl/runtime/program.h"
+#include "core/kv_trace.h"
 
 #include <algorithm>
 #include <array>
@@ -432,6 +433,11 @@ ProgramImplCore::save_continuation(const ContinuationHandle& continuation,
                       (kv_packed_k ? kKvFlagPackedK : 0U) |
                       (kv_e8_lattice ? kKvFlagE8Lattice : 0U) | (kv_e8_root ? kKvFlagE8Root : 0U) |
                       (kv_k6_bit ? kKvFlagK6Bit : 0U);
+    if (config.kv_flags != 0 && kv_trace_once((0x5355ULL << 48) | (config.kv_dtype << 8) |
+                                              config.kv_flags)) {
+        kv_trace("snapshot.save", "kv_flags=0x%02x kv_dtype=%u quant_group=%d", config.kv_flags,
+                 config.kv_dtype, config.kv_quant_group);
+    }
     config.speculative_backend = static_cast<std::uint32_t>(speculative_backend);
     config.draft_window        = draft_window;
     config.page_size           = static_cast<std::uint32_t>(kPagedKVPageSize);
@@ -633,6 +639,11 @@ ProgramImplCore::restore_continuation(std::span<const std::uint8_t> snapshot,
         (kv_rotate_v ? kKvFlagRotateV : 0U) | (kv_packed_k ? kKvFlagPackedK : 0U) |
         (kv_e8_lattice ? kKvFlagE8Lattice : 0U) | (kv_e8_root ? kKvFlagE8Root : 0U) |
         (kv_k6_bit ? kKvFlagK6Bit : 0U);
+    if (expected_flags != 0 && kv_trace_once((0x5253ULL << 48) | (config.kv_dtype << 8) |
+                                             config.kv_flags)) {
+        kv_trace("snapshot.restore", "kv_flags=0x%02x expected=0x%02x kv_dtype=%u",
+                 config.kv_flags, expected_flags, config.kv_dtype);
+    }
     if (config.kv_dtype != static_cast<std::uint32_t>(kv_dtype) ||
         config.kv_quant_group != kv_quant_group || config.kv_flags != expected_flags ||
         config.page_size != static_cast<std::uint32_t>(kPagedKVPageSize) ||

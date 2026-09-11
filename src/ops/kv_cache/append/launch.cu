@@ -1,6 +1,8 @@
 #include "ops/kv_cache/append/launch.h"
 
 #include "core/device.h"
+#include "core/kv_cache_mode.h"
+#include "core/kv_trace.h"
 #include "ops/common/math.h"
 #include "ops/kv_cache/append/kernel.cuh"
 
@@ -52,6 +54,18 @@ void launch_full(const Tensor& k, const Tensor& v, const Tensor& positions, Cach
         return;
     }
     if (cache.dtype == DType::I8) {
+        const auto kmode = kv_cache_mode::dispatch_path_name(
+            {.packed_v = cache.packed_v, .rotate_k = cache.rotate_k, .rotate_v = cache.rotate_v,
+             .packed_k = cache.packed_k, .e8_lattice = cache.e8_lattice, .e8_root = cache.e8_root,
+             .k6_bit = cache.k6_bit});
+        if (kv_trace_once((static_cast<std::uint64_t>(Geometry::KVHeads) << 40) |
+                          (static_cast<std::uint64_t>(tokens) << 8) |
+                          (cache.k6_bit ? 0x80ULL : 0) | (cache.e8_root ? 0x40ULL : 0) |
+                          (cache.e8_lattice ? 0x20ULL : 0) | (cache.packed_k ? 0x10ULL : 0) |
+                          (cache.packed_v ? 0x08ULL : 0))) {
+            kv_trace("append.dispatch", "kv_heads=%d tokens=%d path=%s", Geometry::KVHeads,
+                     tokens, kmode);
+        }
         Tensor& cache_k_scale = cache.k_scale_pages;
         Tensor& cache_v_scale = cache.v_scale_pages;
         const auto launch_fill = [&]<bool PackedV, bool RotateK, bool RotateV, bool PackedK,

@@ -7,6 +7,8 @@
 #include "ops/softmax_attention/dense/causal_cache/small_t_bf16.cuh"
 #include "ops/softmax_attention/dense/causal_cache/small_t_i8.cuh"
 #include "core/device.h" // CUDA_CHECK
+#include "core/kv_cache_mode.h"
+#include "core/kv_trace.h"
 #include "ninfer/ops/softmax_attention.h"
 
 #include <cstdint>
@@ -269,6 +271,20 @@ void causal_attention_small_t_launch_for(const Tensor& q, CacheInput input, cons
     const auto implementation_window = static_cast<std::int32_t>(envelope.max_visible_keys);
     const auto splits =
         causal_small_t_launch_capacity<Geometry>(envelope, invocation.width, cache.dtype);
+    if (cache.dtype == DType::I8 &&
+        kv_trace_once((static_cast<std::uint64_t>(Geometry::QHeads) << 40) |
+                      (static_cast<std::uint64_t>(invocation.width) << 32) |
+                      (cache.k6_bit ? 0x80ULL : 0) | (cache.e8_root ? 0x40ULL : 0) |
+                      (cache.e8_lattice ? 0x20ULL : 0) | (cache.packed_k ? 0x10ULL : 0) |
+                      (cache.packed_v ? 0x08ULL : 0) | (cache.rotate_k ? 0x04ULL : 0) |
+                      (cache.rotate_v ? 0x02ULL : 0))) {
+        const auto kmode = kv_cache_mode::dispatch_path_name(
+            {.packed_v = cache.packed_v, .rotate_k = cache.rotate_k, .rotate_v = cache.rotate_v,
+             .packed_k = cache.packed_k, .e8_lattice = cache.e8_lattice, .e8_root = cache.e8_root,
+             .k6_bit = cache.k6_bit});
+        kv_trace("decode.dispatch", "q_heads=%d width=%d path=%s splits=%d", Geometry::QHeads,
+                 invocation.width, kmode, splits);
+    }
 
     // BF16 keeps its row-tile warp count; INT8 selects its producer/consumer
     // geometry inside launch_tc_partial_i8.

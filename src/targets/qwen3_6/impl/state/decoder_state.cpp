@@ -1,4 +1,6 @@
 #include <ninfer/targets/qwen3_6/decoder_state.h>
+#include "core/kv_cache_mode.h"
+#include "core/kv_trace.h"
 
 #include <limits>
 #include <stdexcept>
@@ -53,6 +55,25 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers,
     const std::int32_t v_head_extent = packed_v ? head_dim / 2 : head_dim;
     const DType k_plane_dtype = (packed_k || e8_root || k6_bit) ? DType::U8 : dtype;
     const DType v_plane_dtype = packed_v ? DType::U8 : dtype;
+    if (packed_v || rotate_k || rotate_v || packed_k || e8_lattice || e8_root || k6_bit) {
+        const std::uint64_t key =
+            (static_cast<std::uint64_t>(layers) << 48) |
+            ((static_cast<std::uint64_t>(capacity) & 0xffffffULL) << 16) |
+            (k6_bit ? 0x80ULL : 0) | (e8_root ? 0x40ULL : 0) | (e8_lattice ? 0x20ULL : 0) |
+            (packed_k ? 0x10ULL : 0) | (packed_v ? 0x08ULL : 0) | (rotate_k ? 0x04ULL : 0) |
+            (rotate_v ? 0x02ULL : 0);
+        if (kv_trace_once(key)) {
+            kv_trace("plan_cache",
+                     "layers=%u capacity=%u kv_heads=%d head_dim=%d dtype=%d k_extent=%d v_extent=%d "
+                     "mode=%s",
+                     layers, capacity, kv_heads, head_dim, static_cast<int>(dtype), k_head_extent,
+                     v_head_extent,
+                     kv_cache_mode::dispatch_path_name(
+                         {.packed_v = packed_v, .rotate_k = rotate_k, .rotate_v = rotate_v,
+                          .packed_k = packed_k, .e8_lattice = e8_lattice, .e8_root = e8_root,
+                          .k6_bit = k6_bit}));
+        }
+    }
     KVPageGeometry geometry;
     geometry.planes.reserve(static_cast<std::size_t>(layers) * (scaled ? 4ULL : 2ULL));
     for (std::uint32_t i = 0; i < layers; ++i) {
