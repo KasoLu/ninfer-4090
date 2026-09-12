@@ -196,11 +196,12 @@
         {%- if ns_state.thinking %}
             {{- '<think>\nBrief explanation of tool call\n</think>\n' }}
         {%- endif %}
-        {{- '<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n' }}
+        {{- '<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n<parameter=example_parameter_3>\n<array>\n<item>\n<array>\n<item>element_1</item>\n<item>element_1</item>\n<item>\nAny text, including code, is written exactly as it is.\nQuotes " and brackets ] } [ { need no escaping.\n</item>\n</array>\n</item>\n<item>\n<array>\n<item>element_2</item>\n<item>element_2</item>\n<item>a second element with the same shape</item>\n</array>\n</item>\n</array>\n</parameter>\n<parameter=example_parameter_4>\n<array>\n<item>\n<name>example_name</name>\n<options>\n<retries>3</retries>\n<labels>\n<array>\n<item>fast</item>\n<item>safe</item>\n</array>\n</labels>\n</options>\n</item>\n</array>\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n' }}
         {%- if ns_state.thinking %}
             {{- '- You can use the <think></think> block to plan your next tool call OR to synthesize data and formulate your final response to the user.\n- ALL explanation and reasoning MUST be placed strictly inside the <think></think> block.\n' }}
         {%- endif %}
         {{- '- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags.\n' }}
+        {{- '- A parameter whose declared type is an array MUST be written as an <array> block with one <item> element per array element (never as JSON brackets); an element that is itself an array contains its own <array> block.\n- A parameter whose declared type is an object MUST be written as one tag per property, named exactly like the property; a property that is itself an array or an object nests the same way.\n- Text inside a leaf tag is taken exactly as written: no JSON syntax and no escaping; it ends at its closing tag.\n' }}
         {%- if ns_state.thinking %}
             {{- '- If you choose to call a tool, you MUST output the <tool_call> block IMMEDIATELY after thinking, with NO conversational text before it.\n' }}
         {%- else %}
