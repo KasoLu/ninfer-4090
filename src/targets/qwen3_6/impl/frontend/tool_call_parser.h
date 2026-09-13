@@ -8,23 +8,42 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace ninfer::targets::qwen3_6::frontend_internal {
 
 // Qwen's tool syntax carries each top-level argument as text between parameter tags. This
 // contract records only whether an explicit JSON Schema type admits a string or requires JSON
-// decoding. It intentionally does not perform full Schema validation; a declared non-string value
-// that fails JSON decoding degrades to raw text instead of rejecting the call.
+// decoding, plus the recursive shape the v22.4 template's nested tag form needs. It intentionally
+// does not perform full Schema validation; a declared non-string value that decodes as neither
+// JSON nor the nested form degrades to raw text instead of rejecting the call.
 struct ToolArgumentTypeContracts {
     enum class Encoding : std::uint8_t {
         Json,
         String,
     };
 
+    // Recursive shape of a declared parameter. It carries structure and leaf kind only.
+    struct Schema {
+        enum class Kind : std::uint8_t {
+            String,
+            Integer,
+            Number,
+            Boolean,
+            Array,
+            Object,
+        };
+
+        Kind kind = Kind::String;
+        std::vector<std::pair<std::string, Schema>> properties; // Object members.
+        std::vector<Schema> element;                            // Array: exactly one entry.
+    };
+
     struct Parameter {
         std::string name;
         Encoding encoding = Encoding::Json;
+        Schema schema;
     };
 
     struct Tool {

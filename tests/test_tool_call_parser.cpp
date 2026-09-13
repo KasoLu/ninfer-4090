@@ -447,6 +447,198 @@ int test_incremental_filter_keeps_calls_next_to_degraded_block() {
     return failures;
 }
 
+int test_nested_array_values_decode() {
+    const auto contracts = contracts_for(
+        "edit", Json{{"path", Json{{"type", "string"}}},
+                     {"edits", Json{{"type", "array"},
+                                    {"items", Json{{"type", "array"},
+                                                   {"items", Json{{"type", "string"}}}}}}}});
+    const auto parsed =
+        fi::parse_qwen_tool_call_output("<tool_call>\n"
+                                        "<function=edit>\n"
+                                        "<parameter=path>\n/tmp/a\n</parameter>\n"
+                                        "<parameter=edits>\n"
+                                        "<array>\n"
+                                        "<item>\n"
+                                        "<array>\n"
+                                        "<item>a1</item>\n"
+                                        "<item>a1</item>\n"
+                                        "<item>\n"
+                                        "def f():\n"
+                                        "    return \"x ] } [ {\"\n"
+                                        "</item>\n"
+                                        "</array>\n"
+                                        "</item>\n"
+                                        "<item>\n"
+                                        "<array>\n"
+                                        "<item>b2</item>\n"
+                                        "<item>b2</item>\n"
+                                        "<item>return {\"ok\": True}</item>\n"
+                                        "</array>\n"
+                                        "</item>\n"
+                                        "</array>\n"
+                                        "</parameter>\n"
+                                        "</function>\n"
+                                        "</tool_call>",
+                                        64, contracts);
+    int failures    = 0;
+    failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1,
+                      "nested array value discarded the call");
+    const Json args = Json::parse(parsed.tool_calls.at(0).arguments_json);
+    failures += check(args.at("path") == "/tmp/a", "sibling string parameter was not parsed");
+    const Json edits = args.at("edits");
+    failures += check(edits.is_array() && edits.size() == 2 && edits.at(0).is_array() &&
+                          edits.at(0).size() == 3,
+                      "nested array shape was not rebuilt");
+    failures += check(edits.at(0).at(0) == "a1" && edits.at(0).at(1) == "a1" &&
+                          edits.at(0).at(2) == "def f():\n    return \"x ] } [ {\"",
+                      "multi-line leaf text changed");
+    failures +=
+        check(edits.at(1).at(2) == "return {\"ok\": True}", "inline leaf text changed");
+    return failures;
+}
+
+int test_nested_object_scalar_leaves_decode() {
+    const auto contracts = contracts_for(
+        "deploy",
+        Json{{"service", Json{{"type", "string"}}},
+             {"config",
+              Json{{"type", "object"},
+                   {"properties",
+                    Json{{"replicas", Json{{"type", "integer"}}},
+                         {"labels",
+                          Json{{"type", "array"}, {"items", Json{{"type", "string"}}}}},
+                         {"rollout",
+                          Json{{"type", "object"},
+                               {"properties",
+                                Json{{"batch_size", Json{{"type", "integer"}}},
+                                     {"paused", Json{{"type", "boolean"}}}}}}}}}}}});
+    const auto parsed =
+        fi::parse_qwen_tool_call_output("<tool_call>\n"
+                                        "<function=deploy>\n"
+                                        "<parameter=service>\ncheckout\n</parameter>\n"
+                                        "<parameter=config>\n"
+                                        "<replicas>4</replicas>\n"
+                                        "<labels>\n"
+                                        "<array>\n"
+                                        "<item>blue</item>\n"
+                                        "<item>stable</item>\n"
+                                        "</array>\n"
+                                        "</labels>\n"
+                                        "<rollout>\n"
+                                        "<batch_size>2</batch_size>\n"
+                                        "<paused>false</paused>\n"
+                                        "</rollout>\n"
+                                        "</parameter>\n"
+                                        "</function>\n"
+                                        "</tool_call>",
+                                        64, contracts);
+    int failures    = 0;
+    failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1,
+                      "nested object value discarded the call");
+    const Json config = Json::parse(parsed.tool_calls.at(0).arguments_json).at("config");
+    failures += check(config.at("replicas").is_number_integer() && config.at("replicas") == 4,
+                      "nested integer leaf was not decoded");
+    failures += check(config.at("labels").is_array() && config.at("labels").size() == 2 &&
+                          config.at("labels").at(1) == "stable",
+                      "nested array member was not decoded");
+    failures += check(config.at("rollout").at("batch_size") == 2 &&
+                          config.at("rollout").at("paused").is_boolean() &&
+                          config.at("rollout").at("paused") == false,
+                      "nested object member was not decoded");
+    return failures;
+}
+
+int test_nested_scalar_mismatch_keeps_raw_text() {
+    const auto contracts = contracts_for(
+        "deploy", Json{{"config", Json{{"type", "object"},
+                                       {"properties",
+                                        Json{{"replicas", Json{{"type", "integer"}}},
+                                             {"paused", Json{{"type", "boolean"}}}}}}}});
+    const auto parsed =
+        fi::parse_qwen_tool_call_output("<tool_call>\n"
+                                        "<function=deploy>\n"
+                                        "<parameter=config>\n"
+                                        "<replicas>four</replicas>\n"
+                                        "<paused>False</paused>\n"
+                                        "</parameter>\n"
+                                        "</function>\n"
+                                        "</tool_call>",
+                                        64, contracts);
+    int failures    = 0;
+    failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1,
+                      "scalar kind mismatch discarded the call");
+    const Json config = Json::parse(parsed.tool_calls.at(0).arguments_json).at("config");
+    failures += check(config.at("replicas") == "four" && config.at("paused") == "False",
+                      "scalar leaves were coerced instead of keeping their raw text");
+    return failures;
+}
+
+int test_nested_malformed_degrades_to_raw_text() {
+    const auto contracts = contracts_for("edit", Json{{"edits", Json{{"type", "array"}}}});
+    const auto parsed =
+        fi::parse_qwen_tool_call_output("<tool_call>\n"
+                                        "<function=edit>\n"
+                                        "<parameter=edits>\n"
+                                        "<array>\n"
+                                        "<item>a1</item>\n"
+                                        "</parameter>\n"
+                                        "</function>\n"
+                                        "</tool_call>",
+                                        64, contracts);
+    int failures    = 0;
+    failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1,
+                      "malformed nested value discarded the call");
+    const Json args = Json::parse(parsed.tool_calls.at(0).arguments_json);
+    failures += check(args.at("edits").is_string() &&
+                          args.at("edits") == "<array>\n<item>a1</item>",
+                      "malformed nested value was not preserved as raw text");
+    return failures;
+}
+
+int test_nested_form_skipped_for_declared_strings() {
+    const auto contracts = contracts_for("note", Json{{"payload", Json{{"type", "string"}}}});
+    const auto parsed =
+        fi::parse_qwen_tool_call_output("<tool_call>\n"
+                                        "<function=note>\n"
+                                        "<parameter=payload>\n"
+                                        "<array>\n"
+                                        "<item>x</item>\n"
+                                        "</array>\n"
+                                        "</parameter>\n"
+                                        "</function>\n"
+                                        "</tool_call>",
+                                        64, contracts);
+    int failures    = 0;
+    const Json args = Json::parse(parsed.tool_calls.at(0).arguments_json);
+    failures += check(args.at("payload").is_string() &&
+                          args.at("payload") == "<array>\n<item>x</item>\n</array>",
+                      "declared string value was parsed as the nested form");
+    return failures;
+}
+
+int test_nested_unknown_property_is_preserved() {
+    const auto contracts = contracts_for(
+        "configure", Json{{"config", Json{{"type", "object"},
+                                          {"properties",
+                                           Json{{"known", Json{{"type", "string"}}}}}}}});
+    const auto parsed =
+        fi::parse_qwen_tool_call_output("<tool_call>\n"
+                                        "<function=configure>\n"
+                                        "<parameter=config>\n"
+                                        "<known>a</known>\n"
+                                        "<extra>b</extra>\n"
+                                        "</parameter>\n"
+                                        "</function>\n"
+                                        "</tool_call>",
+                                        64, contracts);
+    int failures    = 0;
+    const Json config = Json::parse(parsed.tool_calls.at(0).arguments_json).at("config");
+    failures += check(config.at("known") == "a" && config.at("extra") == "b",
+                      "undeclared object property was dropped or misdecoded");
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -467,6 +659,12 @@ int main() {
     failures += test_incremental_filter_valid_tool();
     failures += test_incremental_filter_fallback();
     failures += test_incremental_filter_keeps_calls_next_to_degraded_block();
+    failures += test_nested_array_values_decode();
+    failures += test_nested_object_scalar_leaves_decode();
+    failures += test_nested_scalar_mismatch_keeps_raw_text();
+    failures += test_nested_malformed_degrades_to_raw_text();
+    failures += test_nested_form_skipped_for_declared_strings();
+    failures += test_nested_unknown_property_is_preserved();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

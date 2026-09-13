@@ -352,17 +352,24 @@ schema。拒绝项：`strict: true` → `400 strict_tools_not_supported`；
 
 `src/targets/qwen3_6/impl/frontend/tool_call_parser.{h,cpp}`，命名空间
 `ninfer::targets::qwen3_6::frontend_internal`。头文件用途注释
-（`tool_call_parser.h:15-18`）：Qwen 语法把每个顶层参数作为 `parameter` 标签间的
-文本承载；契约只记录显式 JSON Schema 类型是“接受字符串”还是“需要 JSON 解码”
-——“有意不做完整 Schema 校验”；声明为非 string 的值若 JSON 解码失败，退化为
-原始文本而不是拒绝调用。
+（`tool_call_parser.h:16-20`）：Qwen 语法把每个顶层参数作为 `parameter` 标签间的
+文本承载；契约记录显式 JSON Schema 类型是“接受字符串”还是“需要 JSON 解码”，
+以及数组/对象参数的递归形状（嵌套标签形式，见 §8.2）——“有意不做完整 Schema
+校验”；声明为非 string 的值若既不是合法 JSON、也不是嵌套标签形式，退化为原始
+文本而不是拒绝调用。
 
-### 8.1 契约类型（`tool_call_parser.h:19-50`）
+### 8.1 契约类型（`tool_call_parser.h:16-58`）
 
 ```cpp
 struct ToolArgumentTypeContracts {
     enum class Encoding : uint8_t { Json, String };
-    struct Parameter { std::string name; Encoding encoding = Json; };
+    struct Schema {
+        enum class Kind : uint8_t { String, Integer, Number, Boolean, Array, Object };
+        Kind kind = Kind::String;
+        std::vector<std::pair<std::string, Schema>> properties;
+        std::vector<Schema> element;
+    };
+    struct Parameter { std::string name; Encoding encoding = Json; Schema schema; };
     struct Tool { std::string name; std::vector<Parameter> parameters;
                   bool unambiguous = true; };
     std::vector<Tool> tools;
@@ -377,9 +384,9 @@ struct ParsedToolCallOutput {
 ```
 
 `build_tool_call_output_contract(tool_jsons, enabled)`
-（`tool_call_parser.cpp:375-405`）：禁用时返回 `nullptr`；否则设置
+（`tool_call_parser.cpp:647-676`）：禁用时返回 `nullptr`；否则设置
 `enforce_declared_names = true`，并对每个 `tool_json` 做
-`compile_tool_contract`（146–168 行）—— 要求 OpenAI 形式：带字符串 `name` 的
+`compile_tool_contract`（190–211 行）—— 要求 OpenAI 形式：带字符串 `name` 的
 `function` 对象 + 含 `properties` 对象的 `parameters` 对象。对每个属性，
 `explicit_parameter_encoding`（120–145 行）决定 `Encoding`：
 
@@ -390,14 +397,17 @@ struct ParsedToolCallOutput {
 | schema 类型数组（所有成员均合法） | 任一成员为 `"string"` 则 `String`，否则 `Json` |
 | 缺 `type`、类型不合规范、属性非对象 | **跳过** → 该参数回退到 legacy 推断 |
 
-`append_tool_contract`（181–196 行）：同一工具名以首个契约为准；若**重名**工具
-带着*不同*的参数契约到来（`same_contract`，169–180 行），则清空已有工具的参数
-并置 `unambiguous = false` —— 该工具随后对每个参数都回退到 legacy 逐参数推断。
-`find_parameter_contract`（197–209 行）仅在工具 `unambiguous` 时返回契约；
-`declares_tool`（210–214 行）：除非 `enforce_declared_names` 且名称不在已声明
-集合中，否则恒为真。
+每个参数的递归 `Schema` 由 `compile_schema`（146–188 行）从 JSON Schema 的
+`type`/`items`/`properties` 编译：数组成员取 `items` 形状，对象成员取
+`properties`，`integer`/`number`/`boolean` 记录叶子类型，其余按 string。
+`append_tool_contract`（244–260 行）：同一工具名以首个契约为准；若**重名**工具
+带着*不同*的参数契约到来（`same_contract`，231–243 行，含 `same_schema` 递归
+比较），则清空已有工具的参数并置 `unambiguous = false` —— 该工具随后对每个
+参数都回退到 legacy 逐参数推断。`find_parameter_contract`（261–272 行）仅在
+工具 `unambiguous` 时返回契约；`declares_tool`（273–278 行）：除非
+`enforce_declared_names` 且名称不在已声明集合中，否则恒为真。
 
-### 8.2 一次性解析：`parse_qwen_tool_call_output`（407–477 行）
+### 8.2 一次性解析：`parse_qwen_tool_call_output`（678–748 行）
 
 ```
 文本中不含 "<tool_call>" 标记
@@ -415,11 +425,11 @@ struct ParsedToolCallOutput {
     否则 is_tool_call_response = true（content 可能同时非空）
 ```
 
-`parse_one_tool_call`（304–365 行）：
+`parse_one_tool_call`（575–637 行）：
 
 1. 跳过空白；块必须以 `<function=` 开头；
 2. 函数名到下一个 `>` 为止，必须非空，通过 `valid_function_name`
-   （107–113 行：非空、`<= max_tool_name_length`、字符限 `[A-Za-z0-9_-]`），
+   （107–119 行：非空、`<= max_tool_name_length`、字符限 `[A-Za-z0-9_-]`），
    且通过 `declares_tool`（调用**未声明**工具视为不合法 —— 已声明工具集被强制）；
 3. 必须有 `</function>` 闭标签（缺失 → 不合法）；
 4. 参数区（名称行与 `</function>` 之间）是 `skip_ws` + `parse_parameter` 的循环；
@@ -428,23 +438,33 @@ struct ParsedToolCallOutput {
 5. `out.name = name; out.arguments_json = args.dump()`（nlohmann JSON 对象，
    插入顺序 = 参数顺序）。
 
-`parse_parameter`（232–302 行）：必须以 `<parameter=` 开头；键到 `>` 为止
-（非空）；值到 `</parameter>` 为止。闭标签查找走 `find_closing_tag`（97–105 行）：
+`parse_parameter`（477–574 行）：必须以 `<parameter=` 开头；键到 `>` 为止
+（非空）；值到 `</parameter>` 为止。闭标签查找走 `find_closing_tag`（97–106 行）：
 优先取行首出现（`\n</parameter>`），找不到才退回第一个普通出现 —— 值内部不在
 行首的字面标签文本（例如 summary 里内嵌的 `</parameter>`）不会提前截断值；
 `</function>`、`</tool_call>` 用同一规则。值解码规则：
 
 | 参数情形 | 解码方式 |
 |---|---|
-| 契约为 `String` | 剥掉**一个**前导 + **一个**尾随框架换行（`remove_parameter_framing_newlines`，216–230 行，兼容 CRLF 与 LF），值按**纯字符串**保留 —— 绝不做 JSON 嗅探 |
-| 契约为 `Json` | 剥框架换行后 JSON 解析；解析失败则**退化为裁剪后的原始字符串**（不做类型强转，也不拒绝调用） |
+| 契约为 `String` | 剥掉**一个**前导 + **一个**尾随框架换行（`remove_parameter_framing_newlines`，279–305 行，兼容 CRLF 与 LF），值按**纯字符串**保留 —— 绝不做 JSON 嗅探 |
+| 契约为 `Json` | 剥框架换行后先按 JSON 解析；失败且首个非空白字符是 `<` 时改按**嵌套标签形式**解析（下段）；两者都失败才**退化为裁剪后的原始字符串**（不做类型强转，也不拒绝调用） |
 | 无契约条目（legacy） | `trim_ascii` 后 JSON 解析；解析被丢弃则保留裁剪后的**原始字符串** |
+
+**嵌套标签形式**（v22.4 模板在 XML 模式下教授的数组/对象写法）：数组写作
+`<array>` + 若干 `<item>`；对象写作“属性名即标签名”的 `<name>…</name>`；
+叶子文本原样保留、不做转义、到闭标签为止。解析器按契约 `Schema` 递归下降
+（`parse_nested_value`，362–475 行）：数组元素按 `items` 形状、对象成员按
+`properties` 形状、叶子按声明类型 —— `integer`/`number`/`boolean` 用
+`Json::parse` 校验并保留原始 JSON 类型，不匹配时该叶子保留为字符串；嵌套深度
+上限 32；未知对象属性保留为字符串叶子。该形式与 JSON 形式并存，声明为
+数组/对象的参数两种写法都能解码；嵌套值的内层闭标签用普通首次出现匹配
+（`parse_nested_leaf`，348–360 行），以便支持 `<item>x</item>` 这类行内叶子。
 
 隔离粒度是逐块：结构性违规（坏标记、坏名称、未声明工具、缺闭标签、坏参数、
 尾部垃圾）只让**该块**退化为逐字原文并留在 `content`，其余块照常产出调用；
 只有**零调用**时才回退为整段原文（`is_tool_call_response = false`）。
 
-### 8.3 流式过滤器：`ToolCallOutputDecoder`（头文件 62–83 行；`feed` 位于 `tool_call_parser.cpp:479-523`，`finish` 位于 525–548 行）
+### 8.3 流式过滤器：`ToolCallOutputDecoder`（头文件 78–102 行；`feed` 位于 `tool_call_parser.cpp:750-795`，`finish` 位于 796–812 行）
 
 状态：`contract_`、`trailing_whitespace_`、`tool_region_`、`marker_prefix_bytes_`、
 `saw_tool_marker_`、`finished_`。
@@ -608,6 +628,12 @@ Anthropic **128** —— 这正是输出 parser 对模型发出名称所应用�
 | `test_declared_non_string_values_are_json_decoded` | 非 string 类型按 JSON 解码 |
 | `test_declared_type_mismatches_are_forwarded_without_coercion` | 布尔类型参数收到字符串 True → 值退化为原始字符串，调用保留 |
 | `test_invalid_json_value_degrades_to_string` | 数组参数收到坏 JSON → 调用保留，值退化为原始字符串，兄弟参数不受影响 |
+| `test_nested_array_values_decode` | 数组参数写成 `<array>`/`<item>` 嵌套标签 → 解码为 JSON 数组；多行叶子（含引号与 `] } [ {`）与行内叶子均原样保留 |
+| `test_nested_object_scalar_leaves_decode` | 对象参数按“属性名标签”解码；`integer`/`boolean` 叶子保留原始 JSON 类型 |
+| `test_nested_scalar_mismatch_keeps_raw_text` | 声明为数字/布尔的叶子收到不匹配文本 → 该叶子保留为字符串（不强转） |
+| `test_nested_malformed_degrades_to_raw_text` | 嵌套形式残缺（缺 `</array>`）→ 值退化为原始字符串，调用保留 |
+| `test_nested_form_skipped_for_declared_strings` | 声明为 string 的参数即使形如标签也逐字保留 |
+| `test_nested_unknown_property_is_preserved` | 对象里的未声明属性保留为字符串叶子 |
 | `test_embedded_tag_literals_do_not_truncate` | 值内嵌 `</parameter>`/`</function>` 字面量（不在行首）→ 不截断，正常解码 |
 | `test_failed_block_degrades_but_other_calls_survive` | 未声明工具块退化为 content 原文，前后两个合法调用保留 |
 | `test_incremental_filter_keeps_calls_next_to_degraded_block` | 流式：可见前缀不受影响；终端同时给出有效调用与降级块原文 |
@@ -635,9 +661,10 @@ Anthropic **128** —— 这正是输出 parser 对模型发出名称所应用�
    `content`，其余块照常产出调用；值解码失败退化为原始字符串而不拒绝调用。
    只有零调用时才回退为整段文本。流式过滤器在整段回退时精确还原字节，客户端
    不会因单个字节错而丢掉整轮工具调用。
-3. **契约驱动的解码。** 已声明的参数类型决定字符串 vs JSON 解码；未声明/有歧义
-   的参数回退到 legacy 的“裁剪后嗅探”推断。不做 schema 校验、不做类型强转，
-   因此类型不匹配表现为原始字符串，而不是静默强转的值。
+3. **契约驱动的解码。** 已声明的参数类型决定字符串 vs JSON 解码；数组/对象参数
+   还可以写成模板教授的嵌套标签形式，解析器按递归 `Schema` 还原为 JSON 结构。
+   未声明/有歧义的参数回退到 legacy 的“裁剪后嗅探”推断。不做 schema 校验、
+   不做类型强转，因此类型不匹配表现为原始字符串，而不是静默强转的值。
 4. **已声明名称强制。** 工具激活时，对未声明函数的调用被视为不合法（prompt
    已告知模型存在哪些工具），防止幻觉工具名被当作结构化调用浮出。
 5. **流式只扣住模糊部分。** 只有“仍可能构成 `<tool_call>` 标记”或“属于工具区”

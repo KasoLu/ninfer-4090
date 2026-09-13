@@ -143,6 +143,50 @@ bool explicit_parameter_encoding(const Json& property,
     return true;
 }
 
+ToolArgumentTypeContracts::Schema compile_schema(const Json& property) {
+    ToolArgumentTypeContracts::Schema schema;
+    if (!property.is_object()) { return schema; }
+    const auto type = property.find("type");
+    if (type == property.end()) { return schema; }
+
+    std::string name;
+    if (type->is_string()) {
+        name = type->get<std::string>();
+    } else if (type->is_array()) {
+        for (const Json& member : *type) {
+            if (!member.is_string()) { continue; }
+            const std::string& candidate = member.get_ref<const std::string&>();
+            if (candidate != "null" && is_json_schema_type(candidate)) {
+                name = candidate;
+                break;
+            }
+        }
+    }
+
+    if (name == "array") {
+        schema.kind      = ToolArgumentTypeContracts::Schema::Kind::Array;
+        const auto items = property.find("items");
+        schema.element.push_back(items != property.end() && items->is_object()
+                                     ? compile_schema(*items)
+                                     : ToolArgumentTypeContracts::Schema{});
+    } else if (name == "object") {
+        schema.kind           = ToolArgumentTypeContracts::Schema::Kind::Object;
+        const auto properties = property.find("properties");
+        if (properties != property.end() && properties->is_object()) {
+            for (const auto& [member_name, member] : properties->items()) {
+                schema.properties.emplace_back(member_name, compile_schema(member));
+            }
+        }
+    } else if (name == "integer") {
+        schema.kind = ToolArgumentTypeContracts::Schema::Kind::Integer;
+    } else if (name == "number") {
+        schema.kind = ToolArgumentTypeContracts::Schema::Kind::Number;
+    } else if (name == "boolean") {
+        schema.kind = ToolArgumentTypeContracts::Schema::Kind::Boolean;
+    }
+    return schema;
+}
+
 ToolArgumentTypeContracts::Tool compile_tool_contract(const Json& definition) {
     ToolArgumentTypeContracts::Tool contract;
     if (!definition.is_object()) { return contract; }
@@ -160,10 +204,28 @@ ToolArgumentTypeContracts::Tool compile_tool_contract(const Json& definition) {
     for (const auto& [parameter_name, property] : properties->items()) {
         ToolArgumentTypeContracts::Encoding encoding;
         if (explicit_parameter_encoding(property, encoding)) {
-            contract.parameters.push_back({parameter_name, encoding});
+            contract.parameters.push_back({parameter_name, encoding, compile_schema(property)});
         }
     }
     return contract;
+}
+
+bool same_schema(const ToolArgumentTypeContracts::Schema& lhs,
+                 const ToolArgumentTypeContracts::Schema& rhs) {
+    if (lhs.kind != rhs.kind || lhs.element.size() != rhs.element.size() ||
+        lhs.properties.size() != rhs.properties.size()) {
+        return false;
+    }
+    for (std::size_t i = 0; i < lhs.element.size(); ++i) {
+        if (!same_schema(lhs.element[i], rhs.element[i])) { return false; }
+    }
+    for (std::size_t i = 0; i < lhs.properties.size(); ++i) {
+        if (lhs.properties[i].first != rhs.properties[i].first ||
+            !same_schema(lhs.properties[i].second, rhs.properties[i].second)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 bool same_contract(const ToolArgumentTypeContracts::Tool& lhs,
@@ -171,7 +233,8 @@ bool same_contract(const ToolArgumentTypeContracts::Tool& lhs,
     if (lhs.parameters.size() != rhs.parameters.size()) { return false; }
     for (std::size_t i = 0; i < lhs.parameters.size(); ++i) {
         if (lhs.parameters[i].name != rhs.parameters[i].name ||
-            lhs.parameters[i].encoding != rhs.parameters[i].encoding) {
+            lhs.parameters[i].encoding != rhs.parameters[i].encoding ||
+            !same_schema(lhs.parameters[i].schema, rhs.parameters[i].schema)) {
             return false;
         }
     }
@@ -229,6 +292,188 @@ std::string_view remove_parameter_framing_newlines(std::string_view text) {
     return text.substr(begin, end - begin);
 }
 
+// ---------------------------------------------------------------------------
+// Nested tag value form (v22.4 template): a declared array/object value may be written with tags
+// instead of JSON. <array> holds <item> elements, an object holds one tag per property named
+// exactly like the property, and a leaf carries raw text taken verbatim. The declared schema types
+// the leaves; structural errors degrade the value to raw text like any other undecodable JSON
+// value.
+// ---------------------------------------------------------------------------
+struct NestedValueParse {
+    std::string_view text;
+    std::size_t pos = 0;
+    std::string error;
+    bool failed = false;
+};
+
+void nested_fail(NestedValueParse& state, std::string message) {
+    if (!state.failed) {
+        state.failed = true;
+        state.error  = std::move(message);
+    }
+}
+
+bool read_nested_tag_name(NestedValueParse& state, std::string& name) {
+    const std::size_t begin = state.pos;
+    while (state.pos < state.text.size()) {
+        const unsigned char character = static_cast<unsigned char>(state.text[state.pos]);
+        if (std::isalnum(character) != 0 || character == '_' || character == '-' ||
+            character == '.') {
+            ++state.pos;
+        } else {
+            break;
+        }
+    }
+    if (state.pos == begin) {
+        nested_fail(state, "empty tag name at offset " + std::to_string(state.pos));
+        return false;
+    }
+    name.assign(state.text.substr(begin, state.pos - begin));
+    return true;
+}
+
+const ToolArgumentTypeContracts::Schema*
+find_schema_property(const ToolArgumentTypeContracts::Schema& schema, std::string_view name) {
+    for (const auto& [property_name, property] : schema.properties) {
+        if (property_name == name) { return &property; }
+    }
+    return nullptr;
+}
+
+// Reads a leaf as the raw bytes up to `close` (or to the end of the span when `close` is empty),
+// removing the framing newlines the format writes around multi-line leaves. The nested form writes
+// element and property closes inline (e.g. "<item>value</item>"), so the first occurrence ends the
+// leaf; the line-anchored preference of the outer tags would skip an inline close whenever a later
+// line starts one.
+bool parse_nested_leaf(NestedValueParse& state, std::string_view close, Json& out) {
+    const std::size_t end =
+        close.empty() ? state.text.size() : state.text.find(close, state.pos);
+    if (end == std::string_view::npos) {
+        nested_fail(state, "missing '" + std::string(close) + "' at offset " +
+                               std::to_string(state.pos));
+        return false;
+    }
+    out = std::string(
+        remove_parameter_framing_newlines(state.text.substr(state.pos, end - state.pos)));
+    state.pos = end;
+    return true;
+}
+
+bool parse_nested_value(NestedValueParse& state, std::string_view close,
+                        const ToolArgumentTypeContracts::Schema& schema, std::size_t depth,
+                        Json& out) {
+    using Schema = ToolArgumentTypeContracts::Schema;
+    constexpr std::string_view kArrayOpen  = "<array>";
+    constexpr std::string_view kArrayClose = "</array>";
+    constexpr std::string_view kItemOpen   = "<item>";
+    constexpr std::string_view kItemClose  = "</item>";
+    if (state.failed) { return false; }
+    if (depth > 32) {
+        nested_fail(state, "nesting deeper than 32");
+        return false;
+    }
+    switch (schema.kind) {
+    case Schema::Kind::Array: {
+        skip_ws(state.text, state.pos);
+        if (!starts_with_at(state.text, state.pos, kArrayOpen)) {
+            nested_fail(state, "expected '<array>' at offset " + std::to_string(state.pos));
+            return false;
+        }
+        state.pos += kArrayOpen.size();
+        const Schema& element = schema.element.empty() ? Schema{} : schema.element.front();
+        Json array            = Json::array();
+        for (;;) {
+            skip_ws(state.text, state.pos);
+            if (starts_with_at(state.text, state.pos, kArrayClose)) {
+                state.pos += kArrayClose.size();
+                break;
+            }
+            if (!starts_with_at(state.text, state.pos, kItemOpen)) {
+                nested_fail(state, "expected '<item>' or '</array>' at offset " +
+                                       std::to_string(state.pos));
+                return false;
+            }
+            state.pos += kItemOpen.size();
+            Json item;
+            if (!parse_nested_value(state, kItemClose, element, depth + 1, item)) { return false; }
+            skip_ws(state.text, state.pos);
+            if (!starts_with_at(state.text, state.pos, kItemClose)) {
+                nested_fail(state, "expected '</item>' at offset " + std::to_string(state.pos));
+                return false;
+            }
+            state.pos += kItemClose.size();
+            array.push_back(std::move(item));
+        }
+        out = std::move(array);
+        return true;
+    }
+    case Schema::Kind::Object: {
+        Json object = Json::object();
+        for (;;) {
+            skip_ws(state.text, state.pos);
+            if (close.empty() ? state.pos >= state.text.size()
+                              : starts_with_at(state.text, state.pos, close)) {
+                break;
+            }
+            if (!starts_with_at(state.text, state.pos, "<")) {
+                nested_fail(state, "expected '<' at offset " + std::to_string(state.pos));
+                return false;
+            }
+            ++state.pos;
+            std::string name;
+            if (!read_nested_tag_name(state, name)) { return false; }
+            if (!starts_with_at(state.text, state.pos, ">")) {
+                nested_fail(state, "expected '>' at offset " + std::to_string(state.pos));
+                return false;
+            }
+            ++state.pos;
+            const std::string member_close = "</" + name + ">";
+            const Schema* property         = find_schema_property(schema, name);
+            Json member;
+            if (!parse_nested_value(state, member_close,
+                                    property == nullptr ? Schema{} : *property, depth + 1,
+                                    member)) {
+                return false;
+            }
+            skip_ws(state.text, state.pos);
+            if (!starts_with_at(state.text, state.pos, member_close)) {
+                nested_fail(state, "expected '" + member_close + "' at offset " +
+                                       std::to_string(state.pos));
+                return false;
+            }
+            state.pos += member_close.size();
+            object[name] = std::move(member);
+        }
+        out = std::move(object);
+        return true;
+    }
+    case Schema::Kind::String:
+        return parse_nested_leaf(state, close, out);
+    case Schema::Kind::Integer:
+    case Schema::Kind::Number:
+    case Schema::Kind::Boolean: {
+        Json leaf;
+        if (!parse_nested_leaf(state, close, leaf)) { return false; }
+        const Json scalar = Json::parse(leaf.get<std::string>(), nullptr, false);
+        const bool matches =
+            !scalar.is_discarded() &&
+            ((schema.kind == Schema::Kind::Integer && scalar.is_number_integer()) ||
+             (schema.kind == Schema::Kind::Number && scalar.is_number()) ||
+             (schema.kind == Schema::Kind::Boolean && scalar.is_boolean()));
+        // A leaf that does not match its declared scalar kind keeps its raw text: the engine does
+        // not coerce, and the client owns schema validation.
+        if (matches) {
+            out = scalar;
+        } else {
+            out = std::move(leaf);
+        }
+        return true;
+    }
+    }
+    nested_fail(state, "unsupported schema kind");
+    return false;
+}
+
 bool parse_parameter(std::string_view inner, std::size_t& pos, Json& args,
                      std::string_view tool_name, const ToolArgumentTypeContracts& contracts) {
     constexpr std::string_view kParamOpen  = "<parameter=";
@@ -281,19 +526,45 @@ bool parse_parameter(std::string_view inner, std::size_t& pos, Json& args,
             args[key] = value;
         } else {
             Json parsed = Json::parse(value, nullptr, false);
-            if (parsed.is_discarded()) {
-                // Best-effort: a value that is not valid JSON degrades to its raw text instead of
-                // rejecting the call, so the client harness can inspect or reject it.
-                NINFER_TC_TRACE("parameter", "key '" + key +
-                                                 "': JSON decode discarded -> raw string (len " +
-                                                 std::to_string(value.size()) + "): " +
-                                                 trace_json_error(value) + "; value '" +
-                                                 trace_snippet(value, 160) + "'");
-                args[key] = value;
-            } else {
+            if (!parsed.is_discarded()) {
                 NINFER_TC_TRACE("parameter", "key '" + key + "': Json decoded (len " +
                                                  std::to_string(value.size()) + ")");
                 args[key] = std::move(parsed);
+            } else {
+                // The v22.4 template teaches the nested tag form for declared array/object
+                // values. Try that form before degrading; a value that decodes as neither keeps
+                // its raw text so the client harness can inspect or reject it.
+                NestedValueParse nested_state{value, 0, "value is neither JSON nor a tag-led form",
+                                              false};
+                skip_ws(value, nested_state.pos);
+                bool nested_ok = false;
+                Json nested;
+                if (starts_with_at(value, nested_state.pos, "<")) {
+                    nested_state.error.clear();
+                    nested_ok = parse_nested_value(nested_state, {}, contract->schema, 0, nested);
+                    if (nested_ok) {
+                        skip_ws(value, nested_state.pos);
+                        if (nested_state.pos != value.size()) {
+                            nested_ok = false;
+                            nested_fail(nested_state, "trailing bytes after the value at offset " +
+                                                          std::to_string(nested_state.pos));
+                        }
+                    }
+                }
+                if (nested_ok) {
+                    NINFER_TC_TRACE("parameter",
+                                    "key '" + key + "': nested tag form decoded (len " +
+                                        std::to_string(value.size()) + ")");
+                    args[key] = std::move(nested);
+                } else {
+                    NINFER_TC_TRACE("parameter", "key '" + key +
+                                                     "': decode discarded -> raw string (len " +
+                                                     std::to_string(value.size()) + "): " +
+                                                     nested_state.error + " [json: " +
+                                                     trace_json_error(value) + "]; value '" +
+                                                     trace_snippet(value, 160) + "'");
+                    args[key] = value;
+                }
             }
         }
     }
